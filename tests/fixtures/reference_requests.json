@@ -15,6 +15,22 @@
   "method": "PUT",
   "path": "/v0/asks/{offer_id}/"
  },
+ "gate": {
+  "remote_prefix": "python3 - ",
+  "want": {
+   "capability": [
+    12,
+    0
+   ],
+   "gpu": "RTX 5090",
+   "min_vram_mib": 30000,
+   "must_reach": [
+    "https://github.com/",
+    "https://pypi.org/simple/pip/"
+   ],
+   "num_gpus": 2
+  }
+ },
  "search": {
   "body": {
    "allocated_storage": 40,

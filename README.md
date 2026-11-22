@@ -10,7 +10,7 @@ export VASTAI_API_KEY=...
 gpubox up --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 \
     --image tridao/quack-kernels:cu13.2-DATE --namespace quack-ci --name "$RUN-$ATTEMPT"
 gpubox run --script remote.sh --env SHA=$SHA --timeout-min 40
-gpubox down                      # always; exit 75 means "run me again"
+gpubox down                      # always; exit 75 means something is unresolved: read the output
 gpubox reap --namespace quack-ci --max-age-min 90            # report
 gpubox reap --namespace quack-ci --max-age-min 90 --destroy  # only if every box in the namespace is disposable
 ```
@@ -21,16 +21,22 @@ cache this file between CI runs, and nothing else).
 
 ## What it guarantees, and what it does not
 
-- A box is used only after it passed the health gate and its id is durably
-  journalled. Until then any failure destroys everything the launch rented.
-- `down` destroys by journalled id. A label is only used to find a box whose
-  create request got no usable answer, and then only a single instance on the
+- A box is used only after it passed the health gate, every other candidate
+  is confirmed gone, and its id is durably journalled as the winner. Until
+  then any failure or signal destroys everything the launch rented.
+- `down` destroys every instance id in the journal. A label is only used to
+  find a box whose create request got no usable answer, and then only if the
+  provider's listing shows exactly one instance with that label, on the
   expected machine, with our image, started after the attempt.
 - At most `1 + --spare` boxes exist at once. A failed box keeps its slot until
   the provider confirms it is gone; a create with an unclear outcome keeps its
   slot too.
-- Every box carries a timer that destroys it after `--ttl-min`, whatever
-  happens to the launcher.
+- A create whose box never shows up cannot be proven to have rented nothing.
+  `down` then keeps exiting 75 until you have looked at the provider and run
+  `down --abandon-unseen`.
+- Every create request carries a timer that destroys the box after
+  `--ttl-min`. It starts once the container runs, so it does not cover a box
+  stuck before that.
 - Not guaranteed: a cap across separate runs; cleanup of a box whose code
   relabelled it and killed its timer when the launcher's state is also lost
   (use a provider account of its own for CI to close that).
@@ -42,7 +48,7 @@ recording of its requests in `tests/fixtures/reference_requests.json`):
 
 ```
 --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 --capability 12.0
---min-vram-gb 29.3 --min-cuda 13.2 --ttl-min 60
+--min-vram-mib 30000 --min-cuda 13.2 --ttl-min 60
 --must-reach https://github.com/ --must-reach https://pypi.org/simple/pip/
 ```
 
@@ -53,5 +59,5 @@ sweep boxes labelled by the old launcher.
 
 ```bash
 python3 -m pytest          # fake provider and fake SSH; rents nothing
-python3 tests/mutations.py # breaks each safety property in turn; the suite must notice
+python3 tests/mutations.py # breaks each safety property in turn; a test named for it must fail
 ```

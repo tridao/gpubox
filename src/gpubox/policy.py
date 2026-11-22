@@ -13,6 +13,7 @@ minutes.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -63,7 +64,7 @@ class Observations:
         self.rows: list[dict] = []
         self.added = 0
         if self.path and self.path.exists():
-            for raw in self.path.read_text().splitlines():
+            for raw in self.path.read_text(errors="replace").splitlines():
                 try:
                     row = json.loads(raw)
                 except ValueError:
@@ -72,21 +73,27 @@ class Observations:
                     self.rows.append(row)
 
     def add(self, row: dict) -> None:
-        self.rows.append(row)
-        self.added += 1
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a") as f:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
+        self.rows.append(row)
+        self.added += 1  # counted only once it is on disk
 
 
 def _valid(row) -> bool:
     """Is this a row the policy can use? The file is a cache: anything else is skipped."""
+    if not isinstance(row, dict):
+        return False
+    kind, reason = row.get("kind"), row.get("reason_code")
     return (
-        isinstance(row, dict)
-        and type(row.get("machine_id")) is int
+        type(row.get("machine_id")) is int
         and type(row.get("ts")) in (int, float)
-        and row.get("kind") in KINDS
+        and math.isfinite(row["ts"])
+        and isinstance(kind, str)
+        and kind in KINDS
+        and (reason is None or isinstance(reason, str))
+        and (row.get("id") is None or isinstance(row["id"], str))
         and type(row.get("policy_version", 1)) is int
     )
 

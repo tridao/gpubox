@@ -1,5 +1,7 @@
 """A fake Vast and fake SSH for the launcher tests. No network, no GPU."""
 
+import fcntl
+import json
 import threading
 import time
 
@@ -7,9 +9,11 @@ from gpubox import vast as v
 from gpubox.journal import Journal
 from gpubox.launch import Launch, Policy, Spec
 
+RUN_ID = "quack-ci.test.0123abcd"
 FOREIGN = ("vast-5090-4x-ca", None, "quack-ci-old.x.12345678.a1", "quack-ci.other.89abcdef.a1")
 FAST = Policy(
     poll=0.01,
+    tick=0.01,
     startup_timeout=0.3,
     overall_timeout=5,
     cleanup_reserve=0,
@@ -54,7 +58,7 @@ class FakeVast:
         self._offers = offers if offers is not None else [offer(m) for m in behaviour]
         self.live, self.destroyed, self._next = {}, [], 1
         self.creates = self.peak = 0
-        self.fail_destroy = {}  # machine -> number of destroy calls that raise first
+        self.fail_destroy = {}  # machine -> number of destroy calls that raise VastError first
         self.sticky = set()  # machines whose box survives a destroy
         self.listings_until_visible = {}
         self.revealed = False
@@ -62,6 +66,8 @@ class FakeVast:
         self.release = threading.Event()  # lets "hold" boxes through the gate
         self.in_gate = {}  # machine -> Event, set when its gate starts
         self.list_fails = 0  # number of listing calls that raise first
+        self.on_destroy = None  # called with the instance id before each destroy
+        self.queries, self.payloads = [], []  # what was asked of the provider
         self.lock = threading.Lock()
         for i, label in enumerate(FOREIGN):
             self.live[9000 + i] = {"id": 9000 + i, "label": label, "machine": None}
@@ -69,7 +75,12 @@ class FakeVast:
     def ours(self):
         return sorted(i for i, b in self.live.items() if b["machine"] is not None)
 
+    def gate_started(self, machine):
+        with self.lock:
+            return self.in_gate.setdefault(machine, threading.Event())
+
     def offers(self, query):
+        self.queries.append(query)
         return list(self._offers)
 
     def create(self, offer_id, payload):
@@ -79,6 +90,7 @@ class FakeVast:
             raise v.CreateRefused(400, "offer no longer available")
         if kind == "ghost":
             raise v.CreateUnknown(0, "timed out")
+        self.payloads.append(payload)
         with self.lock:
             iid, self._next = self._next, self._next + 1
             self.live[iid] = {
@@ -140,6 +152,8 @@ class FakeVast:
         self.revealed = True
 
     def destroy(self, iid):
+        if self.on_destroy:
+            self.on_destroy(iid)
         with self.lock:
             box = self.live.get(iid)
             if box is None:
@@ -154,11 +168,57 @@ class FakeVast:
             self.destroyed.append(iid)
 
 
+class FileVast(FakeVast):
+    """A FakeVast whose boxes live in a file, so they outlive a killed process."""
+
+    def __init__(self, path, behaviour):
+        super().__init__(behaviour)
+        self.path = path
+        self.live = {}
+        if not path.exists():
+            path.write_text(json.dumps({"next": 1, "live": {}}))
+
+    def _load(self):
+        data = json.loads(self.path.read_text())
+        self._next = data["next"]
+        self.live = {int(k): b for k, b in data["live"].items()}
+
+    def _save(self):
+        self.path.write_text(json.dumps({"next": self._next, "live": self.live}))
+
+    def _with_file(self, fn, *args):
+        with open(str(self.path) + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._load()
+            try:
+                return fn(*args)
+            finally:
+                self._save()
+
+    def create(self, offer_id, payload):
+        return self._with_file(super().create, offer_id, payload)
+
+    def instance(self, iid):
+        return self._with_file(super().instance, iid)
+
+    def instances(self):
+        return self._with_file(super().instances)
+
+    def destroy(self, iid):
+        return self._with_file(super().destroy, iid)
+
+    def on_disk(self):
+        """The ids of our boxes as another process would find them."""
+        self._load()
+        return self.ours()
+
+
 class FakeProber:
     pubkey = "ssh-ed25519 AAAAtest gpubox"
 
     def __init__(self, vast):
         self.vast = vast
+        self.wants = []  # the spec each gate was asked to check
 
     def ready(self, ep):
         return True, ""
@@ -166,7 +226,8 @@ class FakeProber:
     def gate(self, ep, spec):
         machine = int(ep[0].rsplit(".", 1)[1])
         kind = self.vast.behaviour[machine]
-        self.vast.in_gate.setdefault(machine, threading.Event()).set()
+        self.wants.append(spec)
+        self.vast.gate_started(machine).set()
         if kind == "hold":
             self.vast.release.wait(5)
         if kind == "bad_gpu":
@@ -181,7 +242,7 @@ class FakeProber:
             return False, "unreachable", "ssh dropped during gate", {}
         if kind == "slow":
             time.sleep(self.vast.slow_secs)
-        return True, None, "", {"gpus": ["RTX 5090"]}
+        return True, None, "", {"gpus": ["RTX 5090"], "cpus": 32, "driver": "1", "torch": "2"}
 
 
 def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, **policy_kw):
@@ -190,10 +251,13 @@ def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, **policy_kw
         policy = Policy(**{**policy.__dict__, **policy_kw})
     vast = vast or FakeVast(behaviour)
     journal = Journal(tmp_path)
-    run_id = "quack-ci.test.0123abcd"
-    journal.append("run", run_id=run_id, namespace="quack-ci", image=spec.image, gpu=spec.gpu)
-    return Launch(vast, spec, policy, journal, FakeProber(vast), run_id), vast, journal
+    journal.append("run", run_id=RUN_ID, namespace="quack-ci", image=spec.image, gpu=spec.gpu)
+    return Launch(vast, spec, policy, journal, FakeProber(vast), RUN_ID), vast, journal
 
 
 def foreign_untouched(vast):
     return all(9000 + i in vast.live for i in range(len(FOREIGN)))
+
+
+def statuses(journal):
+    return {a.seq: a.status for a in journal.state().attempts.values()}

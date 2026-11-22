@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 
 API_BASE = "https://console.vast.ai/api"
+MAX_PAGES = 400  # 10,000 instances; a listing longer than this is a loop
 
 # status_msg substrings. An image problem is ours and identical on every host;
 # a runtime problem belongs to the machine.
@@ -75,7 +76,12 @@ class Vast:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read() or b"{}")
             except urllib.error.HTTPError as exc:
-                text = exc.read().decode(errors="replace").strip()[:500]
+                # The status is the answer; the body is only a description and
+                # reading it may fail too.
+                try:
+                    text = exc.read().decode(errors="replace").strip()[:500]
+                except Exception:
+                    text = "<unreadable error body>"
                 if (exc.code == 429 or exc.code >= 500) and attempt < retries:
                     time.sleep(2**attempt)
                     continue
@@ -93,7 +99,16 @@ class Vast:
         offers = data.get("offers") if isinstance(data, dict) else None
         if not isinstance(offers, list):
             raise VastError(200, f"unexpected answer to the offer search: {str(data)[:200]}")
-        return [o for o in offers if isinstance(o, dict)]
+        # An offer we cannot identify or price is simply not a candidate.
+        return [
+            o
+            for o in offers
+            if isinstance(o, dict)
+            and type(o.get("id")) is int
+            and type(o.get("machine_id")) is int
+            and type(o.get("dph_total")) in (int, float)
+            and 0 < o["dph_total"] < float("inf")
+        ]
 
     def create(self, offer_id: int, payload: dict) -> int:
         """Rent a box. Sent exactly once: a retry could rent a second one.
@@ -133,25 +148,40 @@ class Vast:
             row = data["instances"]
             if row is None:
                 return None
-            if isinstance(row, dict) and row.get("id") == instance_id:
+            if isinstance(row, dict) and type(row.get("id")) is int and row["id"] == instance_id:
                 return row
         raise VastError(200, f"unexpected answer for instance {instance_id}: {str(data)[:200]}")
 
     def instances(self) -> list[dict]:
+        """Every instance of the account, or an error: never a partial list.
+
+        Callers conclude "no box carries this label" from this, so a page or a
+        row that cannot be read fails the whole listing.
+        """
         rows, query = [], {"select_filters": {}, "order_by": [{"col": "id", "dir": "asc"}]}
         query["limit"] = 25
-        while True:
+        seen_tokens = set()
+        for _ in range(MAX_PAGES):
             data = self._call("GET", "/v1/instances/", query=query)
             page = data.get("instances") if isinstance(data, dict) else None
             if not isinstance(page, list) or data.get("success") is False:
-                # A page we cannot read is not an empty inventory.
                 raise VastError(
                     200, f"unexpected answer to the instance listing: {str(data)[:200]}"
                 )
-            rows.extend(r for r in page if isinstance(r, dict))
-            if not data.get("next_token"):
+            for row in page:
+                if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0:
+                    raise VastError(
+                        200, f"unreadable row in the instance listing: {str(row)[:200]}"
+                    )
+            rows.extend(page)
+            token = data.get("next_token")
+            if not token:
                 return rows
-            query["after_token"] = data["next_token"]
+            if not isinstance(token, str) or token in seen_tokens:
+                raise VastError(200, f"instance listing does not advance (token {token!r})")
+            seen_tokens.add(token)
+            query["after_token"] = token
+        raise VastError(200, f"instance listing has more than {MAX_PAGES} pages")
 
     def destroy(self, instance_id: int) -> None:
         """Ask for destruction. An instance that is already gone is not an error."""

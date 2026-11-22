@@ -82,53 +82,67 @@ if util > 20 or used > 512:
     done("busy_gpu", "GPU busy before our first CUDA context: util %d%%, %d MiB used, %s W"
          % (util, used, watts))
 
-with warnings.catch_warnings(record=True) as caught:
-    warnings.simplefilter("always")
-    import torch
-    available = torch.cuda.is_available()
-out["torch"] = torch.__version__
-if not available:
-    done("cuda_init", "CUDA unavailable: " + "; ".join(str(w.message) for w in caught)[:300])
-if torch.cuda.device_count() != want["num_gpus"]:
-    done("cuda_init", "torch sees %d GPUs, expected %d"
-         % (torch.cuda.device_count(), want["num_gpus"]))
+# From here on a failure we did not foresee (an import that dies on a broken
+# driver, a CUDA error) is still a statement about this box, so it becomes a
+# verdict instead of a traceback. done() leaves through SystemExit, untouched.
+try:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        import torch
+        available = torch.cuda.is_available()
+    out["torch"] = torch.__version__
+    if not available:
+        done("cuda_init", "CUDA unavailable: " + "; ".join(str(w.message) for w in caught)[:300])
+    if torch.cuda.device_count() != want["num_gpus"]:
+        done("cuda_init", "torch sees %d GPUs, expected %d"
+             % (torch.cuda.device_count(), want["num_gpus"]))
 
-gen = torch.Generator().manual_seed(0)
-a, b = torch.randn(1024, 1024, generator=gen), torch.randn(1024, 1024, generator=gen)
-ref = a.double() @ b.double()
-for i in range(want["num_gpus"]):
-    dev = "cuda:%d" % i
-    cap = list(torch.cuda.get_device_capability(i))
-    if want["capability"] and cap != want["capability"]:
-        done("compute_mismatch", "%s has compute capability %s, expected %s"
-             % (dev, cap, want["capability"]))
-    err = ((a.to(dev) @ b.to(dev)).cpu().double() - ref).abs().max().item()
-    if not err < 1e-2:
-        done("runtime_error", "%s: matmul differs from the CPU reference by %g" % (dev, err))
-    # Most of the free VRAM must be allocatable and writable.
-    free, _ = torch.cuda.mem_get_info(i)
-    x = torch.empty(int(free * 0.8), dtype=torch.uint8, device=dev)
-    x.fill_(7)
-    if int(x[-1]) != 7 or int(x[0]) != 7:
-        done("runtime_error", "%s: memory read-back failed" % dev)
-    del x
-    torch.cuda.empty_cache()
+    gen = torch.Generator().manual_seed(0)
+    a, b = torch.randn(1024, 1024, generator=gen), torch.randn(1024, 1024, generator=gen)
+    ref = a.double() @ b.double()
+    for i in range(want["num_gpus"]):
+        dev = "cuda:%d" % i
+        cap = list(torch.cuda.get_device_capability(i))
+        if want["capability"] and cap != want["capability"]:
+            done("compute_mismatch", "%s has compute capability %s, expected %s"
+                 % (dev, cap, want["capability"]))
+        err = ((a.to(dev) @ b.to(dev)).cpu().double() - ref).abs().max().item()
+        if not err < 1e-2:
+            done("runtime_error", "%s: matmul differs from the CPU reference by %g" % (dev, err))
+        # Most of the free VRAM must be allocatable and writable.
+        free, _ = torch.cuda.mem_get_info(i)
+        x = torch.empty(int(free * 0.8), dtype=torch.uint8, device=dev)
+        x.fill_(7)
+        if int(x[-1]) != 7 or int(x[0]) != 7:
+            done("runtime_error", "%s: memory read-back failed" % dev)
+        del x
+        torch.cuda.empty_cache()
+except Exception as exc:
+    done("runtime_error", "%s: %s" % (type(exc).__name__, str(exc)[:300]))
 done()
 """
 
 
-class Prober:
-    """SSH to candidate boxes with a throwaway key generated for this state directory."""
+def _clean_report(raw: dict) -> dict:
+    """The fields of the gate's report that callers print, in known types."""
+    gpus = raw.get("gpus")
+    text = lambda x: x if isinstance(x, str) else None
+    return {
+        "gpus": [g for g in gpus if isinstance(g, str)] if isinstance(gpus, list) else [],
+        "cpus": raw.get("cpus") if type(raw.get("cpus")) is int else None,
+        "driver": text(raw.get("driver")),
+        "torch": text(raw.get("torch")),
+    }
 
-    def __init__(self, state_dir: Path, fresh: bool = False):
-        self.key = Path(state_dir) / "id_ed25519"
-        self.known_hosts = Path(state_dir) / "known_hosts"
-        if fresh:
-            # A new run may be given an address an earlier run's box had, with
-            # a different host key; the old entry would make it look unreachable.
-            self.known_hosts.unlink(missing_ok=True)
+
+class Prober:
+    """SSH to candidate boxes with a throwaway key that belongs to one run."""
+
+    def __init__(self, key_dir: Path):
+        self.key = Path(key_dir) / "id_ed25519"
+        self.known_hosts = Path(key_dir) / "known_hosts"
         if not self.key.exists():
-            Path(state_dir).mkdir(parents=True, exist_ok=True)
+            Path(key_dir).mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpubox", "-f", self.key],
                 check=True,
@@ -167,7 +181,13 @@ class Prober:
         return r.returncode == 0, r.stderr.strip()[-200:]
 
     def gate(self, ep: tuple[str, int], spec) -> tuple[bool, str | None, str, dict]:
-        """Returns (ok, reason_code, detail, report)."""
+        """Returns (ok, reason_code, detail, report).
+
+        A box is admitted only on a clean exit with an explicit `ok: true`.
+        A reason code is returned only for a verdict the script itself gave;
+        output we cannot read (a crash, garbage, an unknown code) fails the
+        box without a reason, so nobody is blamed for our own bugs.
+        """
         want = {
             "num_gpus": spec.num_gpus,
             "gpu": spec.gpu,
@@ -188,16 +208,16 @@ class Prober:
         if r.returncode == 255:
             return False, "unreachable", f"ssh dropped during gate: {r.stderr.strip()[-200:]}", {}
         try:
-            report = json.loads(r.stdout.strip().splitlines()[-1])
+            raw = json.loads(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
-            report = None
-        if not isinstance(report, dict) or not isinstance(report.get("ok"), bool):
+            raw = None
+        if r.returncode != 0 or not isinstance(raw, dict) or type(raw.get("ok")) is not bool:
             tail = (r.stderr or r.stdout).strip()[-300:]
-            return False, "runtime_error", f"health gate crashed (rc={r.returncode}): {tail}", {}
-        if report["ok"]:
+            return False, None, f"health gate gave no verdict (rc={r.returncode}): {tail}", {}
+        report = _clean_report(raw)
+        if raw["ok"]:
             return True, None, "", report
-        reason, detail = report.get("reason"), str(report.get("detail") or "")
-        if reason not in REASONS:
-            # A verdict we do not understand is our bug, not the machine's.
+        reason, detail = raw.get("reason"), str(raw.get("detail") or "")[:400]
+        if not isinstance(reason, str) or reason not in REASONS:
             return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
         return False, reason, detail, report

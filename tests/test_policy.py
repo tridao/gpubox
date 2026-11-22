@@ -182,3 +182,36 @@ def test_malformed_cached_rows_are_skipped_everywhere(tmp_path, row):
     path = tmp_path / "observations.jsonl"
     path.write_text(json.dumps(row) + "\n")
     assert pol.Observations(path).rows == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"id": []}, {"id": {"a": 1}}, {"id": 7}, {"reason_code": ["cuda_init"]}, {"ts": float("nan")}],
+)
+def test_rows_with_fields_of_the_wrong_type_are_skipped_not_fatal(tmp_path, extra):
+    import json
+
+    row = {**failed(5, 1, "cuda_init"), **extra}
+    assert pol.blocklist([row], 2) == {}
+    path = tmp_path / "observations.jsonl"
+    path.write_text(json.dumps(row).replace("NaN", "1e999") + "\n")
+    assert pol.blocklist(pol.Observations(path).rows, 2) == {}
+
+
+def test_a_cache_that_is_not_text_is_read_as_far_as_it_goes(tmp_path):
+    import json
+
+    path = tmp_path / "observations.jsonl"
+    path.write_bytes(
+        b"\xff\xfe\x00garbage\n" + json.dumps(failed(5, 1, "cuda_init")).encode() + b"\n"
+    )
+    assert [r["machine_id"] for r in pol.Observations(path).rows] == [5]
+
+
+def test_an_observation_that_could_not_be_written_is_not_counted(tmp_path):
+    store = pol.Observations(tmp_path / "missing-dir" / "file-in-the-way" / "obs.jsonl")
+    (tmp_path / "missing-dir").mkdir()
+    (tmp_path / "missing-dir" / "file-in-the-way").write_text("")  # mkdir will fail
+    with pytest.raises(OSError):
+        store.add(failed(5, 1, "cuda_init"))
+    assert store.added == 0 and store.rows == []

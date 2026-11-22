@@ -20,6 +20,7 @@ import argparse
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,11 +31,23 @@ from . import policy as pol
 from . import vast as v
 from .gate import GATE_VERSION, Prober
 from .journal import Journal, StateError, new_run_id, state_lock
-from .launch import ConfigError, Launch, Policy, Result, Spec, down, log, observe, reap
+from .launch import (
+    ConfigError,
+    Launch,
+    Policy,
+    Result,
+    Spec,
+    compile_legacy,
+    down,
+    log,
+    observe,
+    reap,
+)
 
 EXIT_CONFIG = 2
 EXIT_INFRA = 75
 EXIT_TIMEOUT = 124
+EXIT_INTERRUPTED = 130
 DEFAULTS = Policy()
 LOCAL_KEYS_FILE = "~/.config/gpu-cloud-query/keys.env"
 
@@ -97,7 +110,7 @@ def spec_from(args, image: str = "") -> Spec:
         gpu=args.gpu,
         num_gpus=args.num_gpus,
         capability=cap,
-        min_vram_mib=int(args.min_vram_gb * 1024),
+        min_vram_mib=args.min_vram_mib,
         min_cuda=args.min_cuda,
         disk_gb=args.disk_gb,
         max_dph_per_gpu=args.max_dph_per_gpu,
@@ -120,6 +133,13 @@ def advisory(what: str, fn, *a, **kw) -> None:
         log(f"WARNING: {what} failed: {exc!r}")
 
 
+def key_dir(state_dir: Path, run_id: str) -> Path:
+    """Where a run keeps its SSH key and known hosts. Never shared between runs:
+    a command still holding an earlier run's endpoint must not be able to log
+    in to a later run's box that happens to get the same address."""
+    return Path(state_dir) / "keys" / run_id
+
+
 def cmd_up(args) -> int:
     state_dir = Path(args.state_dir)
     spec = spec_from(args, args.image)
@@ -134,9 +154,14 @@ def cmd_up(args) -> int:
         journal = Journal(state_dir)
         if journal.exists():
             old = journal.state()
-            if old.live():
+            if old.is_live():
                 raise StateError(
                     f"run {old.run_id} in {state_dir} still has boxes; run `gpubox down` first"
+                )
+            if old.problems:
+                raise StateError(
+                    f"the journal in {state_dir} is damaged ({old.problems[0]}); check the "
+                    "provider for leftover boxes, then remove the directory"
                 )
             journal.rotate()
         run_id = new_run_id(args.namespace, args.name)
@@ -148,29 +173,34 @@ def cmd_up(args) -> int:
             gpu=spec.gpu,
             num_gpus=spec.num_gpus,
         )
-        github_output(run_id=run_id)
+        advisory("writing outputs", github_output, run_id=run_id)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
-        launch = Launch(v.Vast(key), spec, policy, journal, Prober(state_dir, fresh=True), run_id)
+        prober = Prober(key_dir(state_dir, run_id))
+        launch = Launch(v.Vast(key), spec, policy, journal, prober, run_id)
         result = launch.run(pol.blocklist(obs.rows, time.time()))
-    # From here on the box is ours and recorded; nothing below may fail the launch.
+    # The outcome is decided and journalled; nothing below may change it.
     advisory("recording observations", observe, result, spec, run_id, obs)
     advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
     advisory("writing the summary", write_summary, spec, result)
+    advisory("reporting", report_result, spec, result)
+    return 0 if result.winner else EXIT_INFRA
+
+
+def report_result(spec: Spec, result: Result) -> None:
     for a in result.unresolved:
         where = f"instance {a.instance_id}" if a.instance_id else f"label {a.label}"
         log(f"::warning::attempt {a.seq} may have left a box ({where}); `gpubox down` retries")
     w = result.winner
     if not w:
         log(f"::error::no healthy {spec.num_gpus}x {spec.gpu} box")
-        return EXIT_INFRA
+        return
     r = w.report
     log(
         f"READY in {result.seconds:.0f}s: instance {w.instance_id} on machine {w.machine_id} "
-        f"(${w.dph:.2f}/hr, {w.geo}); {len(r.get('gpus', []))}x GPU, {r.get('cpus')} CPUs, "
+        f"(${w.dph:.2f}/hr, {w.geo}); {len(r.get('gpus') or [])}x GPU, {r.get('cpus')} CPUs, "
         f"driver {r.get('driver')}, torch {r.get('torch')}"
     )
-    return 0
 
 
 # Provider states that mean the box is over, as opposed to missing or in transition.
@@ -180,10 +210,7 @@ DEAD_STATUSES = ("exited", "offline")
 def _ours_to_blame(journal: Journal, run_id: str, instance_id: int) -> bool:
     """False if this run (or its teardown) is why the box went away."""
     state = journal.state()
-    if state.run_id != run_id or state.closed:
-        return False
-    attempt = state.by_instance(instance_id)
-    return bool(attempt) and attempt.status == "created"
+    return state.run_id == run_id and state.boxes.get(instance_id) == "created"
 
 
 def cmd_run(args) -> int:
@@ -191,9 +218,9 @@ def cmd_run(args) -> int:
     journal = Journal(state_dir)
     state = journal.state()
     w = state.winner
-    box = state.by_instance(w["instance_id"]) if w else None
-    if state.closed or not box or box.status != "created":
+    if not w or state.boxes.get(w["instance_id"]) != "created":
         raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
+    box = state.attempt_of(w["instance_id"])
     exports = []
     for item in args.env:
         name, sep, value = item.partition("=")
@@ -204,7 +231,11 @@ def cmd_run(args) -> int:
     # Store the script first, under a name of its own, so nothing it runs can
     # swallow it from stdin and a second `run` cannot overwrite it.
     remote = 'f=$(mktemp /tmp/gpubox-script.XXXXXX) && cat > "$f" && exec bash "$f" </dev/null'
-    argv = Prober(state_dir).ssh((w["host"], w["port"]), remote)
+    # The key belongs to this run: it is gone once the run is torn down.
+    keys = key_dir(state_dir, state.run_id)
+    if not (keys / "id_ed25519").exists():
+        raise StateError(f"run {state.run_id} has no SSH key in {state_dir} (torn down?)")
+    argv = Prober(keys).ssh((w["host"], w["port"]), remote)
     try:
         rc = subprocess.run(argv, input=script.encode(), timeout=args.timeout_min * 60).returncode
     except subprocess.TimeoutExpired:
@@ -234,8 +265,8 @@ def cmd_run(args) -> int:
             pol.Observations(observations_path(args)).add(
                 pol.observation(
                     "died_after_admission",
-                    box.machine_id,
-                    box.host_id,
+                    box.machine_id if box else None,
+                    box.host_id if box else None,
                     state.run_id,
                     reason="died",
                     gate_version=GATE_VERSION,
@@ -255,19 +286,25 @@ def cmd_down(args) -> int:
         if not journal.exists():
             log(f"no run in {state_dir}: nothing to destroy")
             return 0
-        left = down(v.Vast(api_key(args)), journal, Policy())
+        run_id = journal.state().run_id
+        left = down(v.Vast(api_key(args)), journal, Policy(), abandon_unseen=args.abandon_unseen)
+        if not left and run_id:
+            # Nothing of this run is left to log in to.
+            shutil.rmtree(key_dir(state_dir, run_id), ignore_errors=True)
     if left:
-        log(f"::error::{left} attempt(s) unresolved; run `gpubox down` again")
+        log(f"::error::{left} thing(s) unresolved; see above, then run `gpubox down` again")
     return EXIT_INFRA if left else 0
 
 
 def cmd_reap(args) -> int:
+    legacy = compile_legacy(args.legacy_pattern)  # before anything is touched
     failed = reap(
         v.Vast(api_key(args)),
         args.namespace,
         args.max_age_min,
+        Policy(),
         destroy=args.destroy and not args.dry_run,
-        legacy=args.legacy_pattern,
+        legacy=legacy,
     )
     return EXIT_INFRA if failed else 0
 
@@ -276,8 +313,7 @@ def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
     blocked = pol.blocklist(obs.rows, time.time())
-    found = [o for o in v.Vast(api_key(args)).offers(v.offer_query(spec)) if o.get("dph_total")]
-    offers = pol.select_offers(found, blocked, 2)
+    offers = pol.select_offers(v.Vast(api_key(args)).offers(v.offer_query(spec)), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
         note = blocked.get(o.get("machine_id"), {}).get("reason", "")
@@ -329,7 +365,7 @@ def main(argv=None) -> int:
             help="price cap, $/GPU/hr",
         )
         s.add_argument("--capability", help="required CUDA compute capability, e.g. 12.0")
-        s.add_argument("--min-vram-gb", type=number(float, 0), default=0)
+        s.add_argument("--min-vram-mib", type=number(int, 0), default=0)
         s.add_argument("--min-cuda", type=number(float, 0), default=12.0)
         s.add_argument("--disk-gb", type=number(int, 1), default=40)
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
@@ -365,6 +401,11 @@ def main(argv=None) -> int:
     s.add_argument(
         "--run-id",
         help="the run to tear down (printed by `up`); without it, the directory's current run",
+    )
+    s.add_argument(
+        "--abandon-unseen",
+        action="store_true",
+        help="declare that attempts with no visible box rented nothing (after checking the provider)",
     )
     s.set_defaults(fn=cmd_down)
 
@@ -406,6 +447,10 @@ def main(argv=None) -> int:
     except OSError as exc:
         log(f"::error::state directory: {exc}")
         return EXIT_INFRA
+    except KeyboardInterrupt:
+        # `up` has rolled back by now; anything a killed `down` left is in the journal.
+        log("::error::interrupted")
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

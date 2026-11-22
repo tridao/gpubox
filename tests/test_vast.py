@@ -1,0 +1,291 @@
+"""The Vast client: what it sends, and how little it trusts what comes back."""
+
+import http.client
+import io
+import json
+import shlex
+import subprocess
+import sys
+import urllib.error
+from pathlib import Path
+
+import pytest
+
+from gpubox import vast as v
+from gpubox.launch import Spec
+
+REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
+SPEC = Spec(
+    image="tridao/quack-kernels:cu13.2-26.11.22",
+    gpu="RTX 5090",
+    num_gpus=2,
+    max_dph_per_gpu=1.25,
+    min_cuda=13.2,
+    ttl_min=60,
+)
+
+
+class Wire:
+    """Stands in for urllib: answers each request from a script and records it.
+
+    An int is an HTTP error status, an exception is raised as is, a dict is a
+    200 with that JSON body.
+    """
+
+    def __init__(self, answers):
+        self.answers, self.requests = list(answers), []
+
+    def __call__(self, req, timeout=None):
+        self.requests.append((req.get_method(), req.full_url, req.data))
+        answer = self.answers.pop(0)
+        if isinstance(answer, int):
+            raise urllib.error.HTTPError(
+                req.full_url, answer, "err", {}, io.BytesIO(b'{"msg":"x"}')
+            )
+        if isinstance(answer, Exception):
+            raise answer
+        return io.BytesIO(json.dumps(answer).encode())  # BytesIO is a context manager
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    def make(*answers):
+        w = Wire(answers)
+        monkeypatch.setattr(v.urllib.request, "urlopen", w)
+        monkeypatch.setattr(v.time, "sleep", lambda s: None)
+        return w
+
+    return make
+
+
+def test_create_returns_the_contract_id(wire):
+    w = wire({"success": True, "new_contract": 42})
+    assert v.Vast("k").create(7, {"label": "x"}) == 42
+    method, url, body = w.requests[0]
+    assert (method, url) == ("PUT", "https://console.vast.ai/api/v0/asks/7/")
+    assert json.loads(body) == {"label": "x"}
+
+
+@pytest.mark.parametrize("status", [400, 404, 410])
+def test_a_4xx_on_create_means_no_box(wire, status):
+    w = wire(status)
+    with pytest.raises(v.CreateRefused):
+        v.Vast("k").create(7, {})
+    assert len(w.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [500, 502, 503, TimeoutError("timed out"), urllib.error.URLError("reset"), {"success": True}],
+)
+def test_no_usable_answer_on_create_is_unknown_and_never_retried(wire, answer):
+    # A 5xx, a timeout or a success without an id: the box may exist. Sending
+    # the request again could rent a second one.
+    w = wire(answer, {"success": True, "new_contract": 1})
+    with pytest.raises(v.CreateUnknown):
+        v.Vast("k").create(7, {})
+    assert len(w.requests) == 1
+
+
+def test_an_explicit_refusal_in_a_200_is_refused(wire):
+    wire({"success": False, "msg": "no_such_ask"})
+    with pytest.raises(v.CreateRefused):
+        v.Vast("k").create(7, {})
+
+
+def test_reads_are_retried_and_listing_follows_pages(wire):
+    w = wire(503, {"instances": [{"id": 1}], "next_token": "t"}, {"instances": [{"id": 2}]})
+    assert [i["id"] for i in v.Vast("k").instances()] == [1, 2]
+    assert "after_token" in w.requests[2][1] and "/v1/instances/" in w.requests[2][1]
+
+
+def test_instance_distinguishes_gone_from_an_error(wire):
+    wire({"instances": None})
+    assert v.Vast("k").instance(5) is None
+    wire(404)
+    assert v.Vast("k").instance(5) is None
+    wire(500, 500, 500)
+    with pytest.raises(v.VastError):  # an outage is not evidence that the box is gone
+        v.Vast("k").instance(5)
+
+
+def test_destroying_something_already_gone_is_fine(wire):
+    wire(404)
+    v.Vast("k").destroy(5)
+
+
+@pytest.mark.parametrize(
+    "msg,kind",
+    [
+        ("Error response from daemon: manifest unknown", "image"),
+        ("pull access denied for tridao/nope", "image"),
+        ("failed to create shim task: OCI runtime create failed", "machine"),
+        ("unresolvable CDI devices nvidia.com/gpu=GPU-1", "machine"),
+        ("success, running tridao/quack-kernels:cu13.2", None),
+        ("Pulling fs layer cdi5f3a", None),
+    ],
+)
+def test_status_messages_are_attributed(msg, kind):
+    assert v.classify_status(msg) == kind
+
+
+def test_bootstrap_command_is_one_valid_shell_line():
+    cmd = v.bootstrap_command("ssh-ed25519 AAAA'tricky gpubox", ttl_min=90)
+    assert "\n" not in cmd
+    bash, flag, script = shlex.split(cmd)
+    assert (bash, flag) == ("bash", "-c")
+    assert subprocess.run(["bash", "-n", "-c", script]).returncode == 0
+    # The self-destruct timer starts before sshd replaces the shell, so it runs
+    # even if nobody ever connects.
+    timer, sshd = script.rsplit(" & ", 1)
+    assert "sleep 90m; until python3 -c" in timer and "CONTAINER_API_KEY" in timer
+    assert sshd.startswith("exec /usr/sbin/sshd -D")
+    compile(v.SELF_DESTROY, "self_destroy", "exec")
+
+
+def test_the_pinned_recording_still_matches_the_reference_launcher_if_present():
+    """Optional: only meaningful in a checkout that sits next to QuACK."""
+    old_dir = Path(__file__).resolve().parents[2] / "cute-kernels/tools/ci/vast"
+    if not (old_dir / "vast_ci.py").exists():
+        pytest.skip("reference launcher not checked out next to this repository")
+    sys.path.insert(0, str(old_dir))
+    import vast_ci as old
+
+    ref = old.Spec(image=SPEC.image, label="LABEL", num_gpus=2, ttl_min=60)
+    assert REFERENCE["search"]["body"] == old.offer_query(ref)
+    assert REFERENCE["create"]["body"] == old.create_payload(ref, "KEY")
+
+
+# ----------------------------------------------------- answers we cannot trust
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {},  # an empty 2xx body
+        [],
+        {"new_contract": 7},  # an id without an explicit success
+        {"success": True, "new_contract": True},
+        {"success": True, "new_contract": 1.5},
+        {"success": True, "new_contract": "7"},
+        {"success": True, "new_contract": 0},
+        {"success": "yes", "new_contract": 7},
+        408,
+        http.client.IncompleteRead(b"{"),
+    ],
+)
+def test_anything_but_an_explicit_yes_or_no_on_create_is_unknown(wire, answer):
+    w = wire(answer)
+    with pytest.raises(v.CreateUnknown):
+        v.Vast("k").create(7, {})
+    assert len(w.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, [], {"success": False, "msg": "x"}, {"instances": {"id": 6}}, {"instances": [1]}],
+)
+def test_a_malformed_answer_is_never_read_as_the_instance_being_gone(wire, answer):
+    wire(answer)
+    with pytest.raises(v.VastError):
+        v.Vast("k").instance(5)
+
+
+def test_instance_returns_the_row_when_it_is_the_one_asked_for(wire):
+    wire({"instances": {"id": 5, "actual_status": "running"}})
+    assert v.Vast("k").instance(5)["actual_status"] == "running"
+
+
+@pytest.mark.parametrize("second_page", [{}, {"instances": None}, {"success": False}, []])
+def test_a_listing_with_an_unreadable_page_is_an_error_not_a_short_list(wire, second_page):
+    wire({"instances": [{"id": 1}], "next_token": "t"}, second_page)
+    with pytest.raises(v.VastError):
+        v.Vast("k").instances()
+
+
+def test_an_explicitly_refused_destroy_is_an_error(wire):
+    wire({"success": False, "msg": "nope"})
+    with pytest.raises(v.VastError):
+        v.Vast("k").destroy(5)
+    wire({"success": True})
+    v.Vast("k").destroy(5)
+
+
+def test_the_wire_requests_equal_the_reference_launchers(wire):
+    """What goes over HTTP for the QuACK CI spec, against a pinned recording."""
+    ref = REFERENCE
+    w = wire({"offers": []}, {"success": True, "new_contract": 9})
+    vast = v.Vast("k")
+    vast.offers(v.offer_query(SPEC))
+    vast.create(123, v.create_payload(SPEC, "LABEL", "KEY"))
+    (m1, u1, b1), (m2, u2, b2) = w.requests
+    assert (m1, u1) == ("POST", v.API_BASE + ref["search"]["path"])
+    assert json.loads(b1) == ref["search"]["body"]
+    assert (m2, u2) == ("PUT", v.API_BASE + ref["create"]["path"].format(offer_id=123))
+    assert json.loads(b2) == ref["create"]["body"]
+
+
+def test_offer_query_scales_with_gpu_count():
+    q = v.offer_query(Spec(image="i", gpu="RTX 5090", num_gpus=4, max_dph_per_gpu=1.25))
+    assert q["num_gpus"] == {"eq": 4} and q["dph_total"] == {"lte": 5.0}
+    assert q["cpu_cores_effective"] == {"gte": 32} and q["cpu_ram"] == {"gte": 4 * 32 * 1024}
+
+
+class BrokenBody(io.BytesIO):
+    def read(self, *a):
+        raise http.client.IncompleteRead(b"")
+
+
+@pytest.mark.parametrize("status,kind", [(503, v.CreateUnknown), (400, v.CreateRefused)])
+def test_an_unreadable_error_body_does_not_change_what_the_status_means(monkeypatch, status, kind):
+    # The status line arrived; only its description could not be read.
+    calls = []
+
+    def urlopen(req, timeout=None):
+        calls.append(req)
+        raise urllib.error.HTTPError(req.full_url, status, "err", {}, BrokenBody())
+
+    monkeypatch.setattr(v.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(v.time, "sleep", lambda s: None)
+    with pytest.raises(kind):
+        v.Vast("k").create(7, {})
+    assert len(calls) == 1
+    with pytest.raises(v.VastError):
+        v.Vast("k").destroy(5)
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {"instances": [None]},
+        {"instances": [{"label": "no id"}]},
+        {"instances": [{"id": "7"}]},
+        {"instances": [{"id": True}]},
+        {"instances": [{"id": 0}]},
+        {"instances": [{"id": 1}, "text"]},
+    ],
+)
+def test_a_listing_with_an_unreadable_row_is_an_error_not_a_shorter_list(wire, page):
+    wire(page)
+    with pytest.raises(v.VastError):
+        v.Vast("k").instances()
+
+
+def test_a_listing_that_does_not_advance_is_an_error_not_a_loop(wire):
+    wire(*[{"instances": [{"id": 1}], "next_token": "same"}] * 3)
+    with pytest.raises(v.VastError, match="does not advance"):
+        v.Vast("k").instances()
+
+
+def test_offers_we_cannot_identify_or_price_are_not_candidates(wire):
+    good = {"id": 1, "machine_id": 2, "dph_total": 0.5}
+    bad = [
+        {**good, "dph_total": None}, {**good, "dph_total": 0}, {**good, "dph_total": "0.5"},
+        {**good, "dph_total": float("inf")}, {**good, "id": "1"}, {**good, "machine_id": None},
+        "text", None,
+    ]  # fmt: skip
+    wire({"offers": [good, *bad]})
+    assert v.Vast("k").offers({}) == [good]
+    wire({"offers": None})
+    with pytest.raises(v.VastError):
+        v.Vast("k").offers({})
