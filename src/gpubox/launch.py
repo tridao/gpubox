@@ -373,8 +373,8 @@ def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> N
 def down(vast, journal: Journal, policy: Policy) -> int:
     """Destroy everything the journalled run rented. Returns the number left."""
     state = journal.state()
-    if state.run_id is None:
-        log("no run in this state directory: nothing to destroy")
+    if state.run_id is None or state.closed:
+        log("nothing to destroy")
         return 0
     left, listing = 0, None
     for a in sorted(state.attempts.values(), key=lambda a: a.seq):
