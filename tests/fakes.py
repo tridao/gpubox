@@ -1,0 +1,185 @@
+"""A fake Vast and fake SSH for the launcher tests. No network, no GPU."""
+
+import threading
+import time
+
+from gpubox import vast as v
+from gpubox.journal import Journal
+from gpubox.launch import Launch, Policy, Spec
+
+FOREIGN = ("vast-5090-4x-ca", None, "quack-ci-old.x.12345678.a1", "quack-ci.other.89abcdef.a1")
+FAST = Policy(
+    poll=0.01,
+    startup_timeout=0.3,
+    overall_timeout=5,
+    cleanup_reserve=0,
+    reconcile_timeout=0.15,
+    confirm_timeout=0.15,
+    confirm_poll=0.01,
+)
+SPEC = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25)
+
+
+def offer(machine, host=None, dph=1.0):
+    return {
+        "id": 1000 + machine,
+        "machine_id": machine,
+        "host_id": host or machine,
+        "dph_total": dph,
+    }
+
+
+class FakeVast:
+    """`behaviour` maps machine_id to how a box rented on it behaves.
+
+    ok        comes up and passes the gate
+    bad_gpu   comes up, gate reports cuda_init
+    busy      comes up, gate reports busy_gpu
+    stuck     never leaves "loading"
+    cdi       status message blames the machine's container runtime
+    image     status message says the image cannot be pulled
+    exited    container exits during bootstrap
+    stale     create is refused (offer gone)
+    ghost     create times out and no box exists
+    lost      create times out but the box exists; listed after two listings
+    lost_late as lost, but listed only once `reveal()` is called
+    late      still in the gate when another candidate wins
+    slow      passes the gate, but only after `slow_secs`
+    """
+
+    def __init__(self, behaviour, offers=None, slow_secs=0.5):
+        self.behaviour = behaviour
+        self._offers = offers if offers is not None else [offer(m) for m in behaviour]
+        self.live, self.destroyed, self._next = {}, [], 1
+        self.creates = self.peak = 0
+        self.fail_destroy = {}  # machine -> number of destroy calls that raise first
+        self.sticky = set()  # machines whose box survives a destroy
+        self.listings_until_visible = {}
+        self.revealed = False
+        self.slow_secs = slow_secs
+        self.lock = threading.Lock()
+        for i, label in enumerate(FOREIGN):
+            self.live[9000 + i] = {"id": 9000 + i, "label": label, "machine": None}
+
+    def ours(self):
+        return sorted(i for i, b in self.live.items() if b["machine"] is not None)
+
+    def offers(self, query):
+        return list(self._offers)
+
+    def create(self, offer_id, payload):
+        machine = offer_id - 1000
+        kind = self.behaviour[machine]
+        if kind == "stale":
+            raise v.CreateRefused(400, "offer no longer available")
+        if kind == "ghost":
+            raise v.CreateUnknown(0, "timed out")
+        with self.lock:
+            iid, self._next = self._next, self._next + 1
+            self.live[iid] = {
+                "id": iid,
+                "label": payload["label"],
+                "machine": machine,
+                "start_date": time.time(),
+                "born": time.monotonic(),
+            }
+            self.creates += 1
+            self.peak = max(self.peak, len(self.ours()))
+        if kind in ("lost", "lost_late"):
+            self.listings_until_visible[iid] = 2
+            raise v.CreateUnknown(0, "timed out")
+        return iid
+
+    def instance(self, iid):
+        box = self.live.get(iid)
+        if box is None:
+            return None
+        kind = self.behaviour.get(box["machine"], "ok")
+        row = {"id": iid, "label": box["label"], "actual_status": "loading", "status_msg": ""}
+        if kind == "cdi":
+            row["status_msg"] = (
+                "Error response from daemon: unresolvable CDI devices nvidia.com/gpu"
+            )
+        elif kind == "image":
+            row["status_msg"] = "Error response from daemon: manifest unknown"
+        elif kind == "exited":
+            row["actual_status"] = "exited"
+        elif kind != "stuck":
+            row.update(
+                actual_status="running",
+                public_ipaddr=f"10.0.0.{box['machine']}",
+                ports={"22/tcp": [{"HostPort": "2222"}]},
+            )
+        return row
+
+    def instances(self):
+        rows = []
+        with self.lock:
+            for iid, box in self.live.items():
+                kind = self.behaviour.get(box["machine"])
+                if kind == "lost_late" and not self.revealed:
+                    continue
+                if kind == "lost" and self.listings_until_visible.get(iid, 0) > 0:
+                    self.listings_until_visible[iid] -= 1
+                    continue
+                rows.append({k: box.get(k) for k in ("id", "label", "start_date")})
+        return rows
+
+    def reveal(self):
+        self.revealed = True
+
+    def destroy(self, iid):
+        with self.lock:
+            box = self.live.get(iid)
+            if box is None:
+                return
+            machine = box["machine"]
+            if self.fail_destroy.get(machine, 0) > 0:
+                self.fail_destroy[machine] -= 1
+                raise v.VastError(500, "internal error")
+            if machine in self.sticky:
+                return
+            self.live.pop(iid)
+            self.destroyed.append(iid)
+
+
+class FakeProber:
+    pubkey = "ssh-ed25519 AAAAtest gpubox"
+
+    def __init__(self, vast):
+        self.vast = vast
+
+    def ready(self, ep):
+        return True, ""
+
+    def gate(self, ep, spec):
+        machine = int(ep[0].rsplit(".", 1)[1])
+        kind = self.vast.behaviour[machine]
+        if kind == "bad_gpu":
+            return False, "cuda_init", "CUDA unavailable", {}
+        if kind == "busy":
+            return False, "busy_gpu", "util 100%", {}
+        if kind == "late":
+            # Still in the gate when another candidate wins: the box is
+            # destroyed under it and the SSH call fails.
+            while any(b["machine"] == machine for b in list(self.vast.live.values())):
+                time.sleep(0.01)
+            return False, "unreachable", "ssh dropped during gate", {}
+        if kind == "slow":
+            time.sleep(self.vast.slow_secs)
+        return True, None, "", {"gpus": ["RTX 5090"]}
+
+
+def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, **policy_kw):
+    """A Launch ready to run, plus its fake provider and journal."""
+    if policy_kw:
+        policy = Policy(**{**policy.__dict__, **policy_kw})
+    vast = vast or FakeVast(behaviour)
+    journal = Journal(tmp_path)
+    run_id = "quack-ci.test.0123abcd"
+    journal.append("run", run_id=run_id, namespace="quack-ci", image=spec.image)
+    return Launch(vast, spec, policy, journal, FakeProber(vast), run_id), vast, journal
+
+
+def foreign_untouched(vast):
+    return all(9000 + i in vast.live for i in range(len(FOREIGN)))

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpubox"
+version = "0.1.0"
+description = "Rent a verified GPU box from a marketplace, and make sure it is destroyed afterwards"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+gpubox = "gpubox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpubox"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["E731", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
