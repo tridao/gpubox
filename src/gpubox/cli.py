@@ -129,7 +129,7 @@ def advisory(what: str, fn, *a, **kw) -> None:
     """Run something whose failure must not fail the command (reports, reputation)."""
     try:
         fn(*a, **kw)
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+    except Exception as exc:  # whatever it is, it is not worth a box
         log(f"WARNING: {what} failed: {exc!r}")
 
 

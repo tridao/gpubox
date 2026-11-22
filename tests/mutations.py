@@ -308,7 +308,7 @@ MUTATIONS = [
      '            if False:\n                raise StateError',
      'damaged_journal'),
     ('a reporting failure fails the launch', 'cli.py',
-     '    except (OSError, ValueError, TypeError, KeyError) as exc:',
+     '    except Exception as exc:  # whatever it is, it is not worth a box',
      '    except ZeroDivisionError as exc:',
      'nothing_after_the_decision'),
     ('--dry-run ignored', 'cli.py',
