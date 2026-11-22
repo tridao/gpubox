@@ -12,6 +12,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from .policy import REASONS
+
 GATE_VERSION = 1
 
 GATE_SCRIPT = r"""
@@ -118,9 +120,13 @@ done()
 class Prober:
     """SSH to candidate boxes with a throwaway key generated for this state directory."""
 
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, fresh: bool = False):
         self.key = Path(state_dir) / "id_ed25519"
         self.known_hosts = Path(state_dir) / "known_hosts"
+        if fresh:
+            # A new run may be given an address an earlier run's box had, with
+            # a different host key; the old entry would make it look unreachable.
+            self.known_hosts.unlink(missing_ok=True)
         if not self.key.exists():
             Path(state_dir).mkdir(parents=True, exist_ok=True)
             subprocess.run(
@@ -144,7 +150,9 @@ class Prober:
             "ServerAliveCountMax": "8",
             "LogLevel": "ERROR",
         }
-        argv = ["ssh", "-i", str(self.key), "-p", str(ep[1])]
+        # -F /dev/null: nothing from the user's or the system's ssh_config
+        # (SendEnv, extra identities, proxies) applies to these connections.
+        argv = ["ssh", "-F", "/dev/null", "-i", str(self.key), "-p", str(ep[1])]
         for k, v in opts.items():
             argv += ["-o", f"{k}={v}"]
         return [*argv, f"root@{ep[0]}", remote]
@@ -182,8 +190,14 @@ class Prober:
         try:
             report = json.loads(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
+            report = None
+        if not isinstance(report, dict) or not isinstance(report.get("ok"), bool):
             tail = (r.stderr or r.stdout).strip()[-300:]
             return False, "runtime_error", f"health gate crashed (rc={r.returncode}): {tail}", {}
-        if not report.get("ok"):
-            return False, report.get("reason", "runtime_error"), report.get("detail", ""), report
-        return True, None, "", report
+        if report["ok"]:
+            return True, None, "", report
+        reason, detail = report.get("reason"), str(report.get("detail") or "")
+        if reason not in REASONS:
+            # A verdict we do not understand is our bug, not the machine's.
+            return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
+        return False, reason, detail, report

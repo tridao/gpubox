@@ -1,5 +1,6 @@
 """The Vast client's create contract, the bootstrap, labels and the journal."""
 
+import http.client
 import io
 import json
 import shlex
@@ -237,3 +238,257 @@ def test_rotate_keeps_the_old_journal(tmp_path):
     j.append("run", run_id="ns.n.0123abcd", namespace="ns", image="img")
     j.rotate()
     assert not j.exists() and (tmp_path / "journal.ns.n.0123abcd.jsonl").exists()
+
+
+# ----------------------------------------------------- answers we cannot trust
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {},  # an empty 2xx body
+        [],
+        {"new_contract": 7},  # an id without an explicit success
+        {"success": True, "new_contract": True},
+        {"success": True, "new_contract": 1.5},
+        {"success": True, "new_contract": "7"},
+        {"success": True, "new_contract": 0},
+        {"success": "yes", "new_contract": 7},
+        408,
+        http.client.IncompleteRead(b"{"),
+    ],
+)
+def test_anything_but_an_explicit_yes_or_no_on_create_is_unknown(wire, answer):
+    w = wire(answer)
+    with pytest.raises(v.CreateUnknown):
+        v.Vast("k").create(7, {})
+    assert len(w.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, [], {"success": False, "msg": "x"}, {"instances": {"id": 6}}, {"instances": [1]}],
+)
+def test_a_malformed_answer_is_never_read_as_the_instance_being_gone(wire, answer):
+    wire(answer)
+    with pytest.raises(v.VastError):
+        v.Vast("k").instance(5)
+
+
+def test_instance_returns_the_row_when_it_is_the_one_asked_for(wire):
+    wire({"instances": {"id": 5, "actual_status": "running"}})
+    assert v.Vast("k").instance(5)["actual_status"] == "running"
+
+
+@pytest.mark.parametrize("second_page", [{}, {"instances": None}, {"success": False}, []])
+def test_a_listing_with_an_unreadable_page_is_an_error_not_a_short_list(wire, second_page):
+    wire({"instances": [{"id": 1}], "next_token": "t"}, second_page)
+    with pytest.raises(v.VastError):
+        v.Vast("k").instances()
+
+
+def test_an_explicitly_refused_destroy_is_an_error(wire):
+    wire({"success": False, "msg": "nope"})
+    with pytest.raises(v.VastError):
+        v.Vast("k").destroy(5)
+    wire({"success": True})
+    v.Vast("k").destroy(5)
+
+
+def test_the_wire_requests_equal_the_reference_launchers(wire):
+    """What goes over HTTP for the QuACK CI spec, against a pinned recording."""
+    ref = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
+    w = wire({"offers": []}, {"success": True, "new_contract": 9})
+    vast = v.Vast("k")
+    vast.offers(v.offer_query(SPEC))
+    vast.create(123, v.create_payload(SPEC, "LABEL", "KEY"))
+    (m1, u1, b1), (m2, u2, b2) = w.requests
+    assert (m1, u1) == ("POST", v.API_BASE + ref["search"]["path"])
+    assert json.loads(b1) == ref["search"]["body"]
+    assert (m2, u2) == ("PUT", v.API_BASE + ref["create"]["path"].format(offer_id=123))
+    assert json.loads(b2) == ref["create"]["body"]
+
+
+def test_the_quack_ci_command_line_maps_to_the_reference_search():
+    from gpubox import cli
+
+    flags = [
+        "search", "--gpu", "RTX 5090", "--num-gpus", "2", "--max-dph-per-gpu", "1.25",
+        "--capability", "12.0", "--min-vram-gb", "29.3", "--min-cuda", "13.2",
+        "--must-reach", "https://github.com/", "--must-reach", "https://pypi.org/simple/pip/",
+    ]  # fmt: skip
+    seen = {}
+    parser_main, cli.cmd_search = (
+        cli.cmd_search,
+        lambda args: seen.update(spec=cli.spec_from(args)) or 0,
+    )
+    try:
+        assert cli.main(flags) == 0
+    finally:
+        cli.cmd_search = parser_main
+    ref = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
+    spec = seen["spec"]
+    assert v.offer_query(spec) == ref["search"]["body"]
+    assert spec.capability == (12, 0) and spec.min_vram_mib == 30003
+    assert spec.must_reach == ("https://github.com/", "https://pypi.org/simple/pip/")
+
+
+def test_offer_query_scales_with_gpu_count():
+    q = v.offer_query(Spec(image="i", gpu="RTX 5090", num_gpus=4, max_dph_per_gpu=1.25))
+    assert q["num_gpus"] == {"eq": 4} and q["dph_total"] == {"lte": 5.0}
+    assert q["cpu_cores_effective"] == {"gte": 32} and q["cpu_ram"] == {"gte": 4 * 32 * 1024}
+
+
+# ----------------------------------------------------------- journal recovery
+
+
+def run_with_one_box(tmp_path):
+    j = Journal(tmp_path)
+    j.append("run", run_id="ns.n.0123abcd", namespace="ns", image="img")
+    j.append("intent", seq=1, label="l1", offer_id=1, machine_id=1, host_id=1, dph=1)
+    j.append("created", seq=1, instance_id=10)
+    return j
+
+
+def test_appending_after_a_torn_tail_loses_neither_record(tmp_path):
+    j = run_with_one_box(tmp_path)
+    with open(j.path, "a") as f:
+        f.write('{"ev": "destroying", "instance_')  # the process died mid-write
+    # The very next record must survive: glued to the fragment it would be
+    # unreadable, and the box would be taken for still alive.
+    j.append("destroyed", instance_id=10)
+    s = j.state()
+    assert s.attempts[1].status == "destroyed" and s.skipped == 1
+
+
+def test_replay_never_loses_an_id_it_has_learned(tmp_path):
+    j = run_with_one_box(tmp_path)
+    j.append("intent", seq=1, label="l1", offer_id=1, machine_id=1, host_id=1, dph=1)  # duplicate
+    j.append("unknown", seq=1)  # late, out of order
+    j.append("refused", seq=1)
+    j.append("created", seq=1, instance_id=99)  # a second, conflicting id
+    a = j.state().attempts[1]
+    assert (a.status, a.instance_id) == ("created", 10)
+
+
+def test_a_destroyed_box_does_not_come_back(tmp_path):
+    j = run_with_one_box(tmp_path)
+    j.append("destroyed", instance_id=10)
+    j.append("destroying", instance_id=10)
+    assert j.state().attempts[1].status == "destroyed"
+
+
+def test_closed_is_not_believed_while_a_box_is_live(tmp_path):
+    j = run_with_one_box(tmp_path)
+    j.append("closed")
+    assert not j.state().closed and len(j.state().live()) == 1
+
+
+def test_the_winner_record_proves_the_id_when_created_is_missing(tmp_path):
+    j = Journal(tmp_path)
+    j.append("run", run_id="ns.n.0123abcd", namespace="ns", image="img")
+    j.append("intent", seq=1, label="l1", offer_id=1, machine_id=1, host_id=1, dph=1)
+    j.append("winner", seq=1, instance_id=10, host="h", port=22)
+    a = j.state().attempts[1]
+    assert (a.status, a.instance_id) == ("created", 10)
+
+
+def test_events_of_the_wrong_shape_are_skipped_not_fatal(tmp_path):
+    j = run_with_one_box(tmp_path)
+    with open(j.path, "a") as f:
+        f.write('[1, 2]\n"text"\n{"ev": "created", "seq": 1}\n{"no_ev": 1}\n')
+    s = j.state()
+    # Three cannot be applied; the id-less `created` is a no-op on a known id.
+    assert s.skipped == 3 and s.attempts[1].instance_id == 10
+
+
+def test_a_named_run_is_found_after_rotation(tmp_path):
+    j = run_with_one_box(tmp_path)
+    j.rotate()
+    Journal(tmp_path).append("run", run_id="ns.n.89abcdef", namespace="ns", image="img")
+    assert Journal(tmp_path, run_id="ns.n.0123abcd").state().attempts[1].instance_id == 10
+    assert Journal(tmp_path, run_id="ns.n.89abcdef").state().run_id == "ns.n.89abcdef"
+    with pytest.raises(StateError):
+        Journal(tmp_path, run_id="ns.n.00000000")
+
+
+def test_a_run_id_cannot_name_a_file_outside_the_state_directory(tmp_path):
+    state = tmp_path / "state"
+    (state / "journal.x").mkdir(parents=True)
+    (tmp_path / "elsewhere.jsonl").write_text(
+        '{"ev": "run", "run_id": "a.b.0123abcd", "namespace": "a"}\n'
+    )
+    with pytest.raises(StateError, match="not a run id"):
+        Journal(state, run_id="x/../../elsewhere")
+
+
+# ------------------------------------------------------------------ the gate
+
+
+def prober(tmp_path):
+    from gpubox.gate import Prober
+
+    (tmp_path / "id_ed25519").write_text("")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA gpubox\n")
+    return Prober(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "rc,stdout,expect",
+    [
+        (0, 'noise\n{"ok": true, "cpus": 32}\n', (True, None)),
+        (0, '{"ok": false, "reason": "wrong_hardware", "detail": "GPU 0 is RTX 4090"}', (False, "wrong_hardware")),
+        (0, '{"ok": false, "reason": "busy_gpu", "detail": "util 100%"}', (False, "busy_gpu")),
+        (0, '{"ok": false, "reason": "gremlins"}', (False, None)),  # our bug: nobody is blamed
+        (0, '{"ok": false}', (False, None)),
+        (0, "[1, 2]", (False, "runtime_error")),
+        (0, '{"ok": "yes"}', (False, "runtime_error")),
+        (255, "", (False, "unreachable")),  # ssh itself failed
+        (1, "Traceback (most recent call last): ...", (False, "runtime_error")),  # gate crashed
+    ],
+)  # fmt: skip
+def test_gate_verdicts(tmp_path, monkeypatch, rc, stdout, expect):
+    from gpubox import gate
+
+    done = subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")
+    monkeypatch.setattr(gate.subprocess, "run", lambda *a, **k: done)
+    ok, reason, _, _ = prober(tmp_path).gate(("10.0.0.1", 22), SPEC)
+    assert (ok, reason) == expect
+
+
+def test_a_hung_gate_is_a_soft_failure(tmp_path, monkeypatch):
+    from gpubox import gate
+
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], 240)
+
+    monkeypatch.setattr(gate.subprocess, "run", hang)
+    assert prober(tmp_path).gate(("10.0.0.1", 22), SPEC)[:2] == (False, "unreachable")
+
+
+def test_gate_script_is_valid_python_and_names_only_known_reasons():
+    import re
+
+    from gpubox import gate, policy
+
+    compile(gate.GATE_SCRIPT, "gate", "exec")
+    named = set(re.findall(r'done\("([a-z_]+)"', gate.GATE_SCRIPT))
+    assert named and named <= set(policy.REASONS)
+
+
+def test_ssh_ignores_ambient_configuration(tmp_path):
+    argv = prober(tmp_path).ssh(("10.0.0.1", 2222), "true")
+    assert argv[:3] == ["ssh", "-F", "/dev/null"]
+    joined = " ".join(argv)
+    for opt in ("IdentitiesOnly=yes", "IdentityAgent=none", "ForwardAgent=no", "BatchMode=yes"):
+        assert opt in joined
+    assert argv[-2:] == ["root@10.0.0.1", "true"]
+
+
+def test_a_new_run_forgets_the_host_keys_of_the_last(tmp_path):
+    from gpubox.gate import Prober
+
+    p = prober(tmp_path)
+    p.known_hosts.write_text("[10.0.0.1]:2222 ssh-ed25519 OLD\n")
+    Prober(tmp_path, fresh=True)
+    assert not p.known_hosts.exists() and p.key.exists()

@@ -60,6 +60,7 @@ def label_namespace(label: str | None) -> str | None:
 class AttemptState:
     seq: int
     label: str
+    ts: float = 0.0  # when the intent was written
     status: str = "intent"  # intent|refused|unknown|created|destroying|destroyed|absent
     instance_id: int | None = None
     machine_id: int | None = None
@@ -74,6 +75,8 @@ class RunState:
     attempts: dict[int, AttemptState] = field(default_factory=dict)
     winner: dict | None = None
     closed: bool = False
+    meta: dict = field(default_factory=dict)  # the `run` event: image, gpu, ...
+    skipped: int = 0  # lines that could not be read
 
     def live(self) -> list[AttemptState]:
         return [a for a in self.attempts.values() if a.status in LIVE]
@@ -100,10 +103,20 @@ def state_lock(state_dir: Path):
         os.close(fd)
 
 
+RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]*\.[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{8}")
+
+
 class Journal:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, run_id: str | None = None):
+        """The current run's journal, or (with `run_id`) that run's, wherever it now is."""
         self.path = Path(state_dir) / "journal.jsonl"
         self._lock = threading.Lock()
+        if run_id is not None and self.state().run_id != run_id:
+            if not RUN_ID.fullmatch(run_id):
+                raise StateError(f"not a run id: {run_id!r}")
+            self.path = Path(state_dir) / f"journal.{run_id}.jsonl"
+            if not self.path.exists():
+                raise StateError(f"no journal for run {run_id} in {state_dir}")
 
     def exists(self) -> bool:
         return self.path.exists()
@@ -116,8 +129,15 @@ class Journal:
         """
         line = json.dumps({"ev": ev, "ts": round(time.time(), 3), **fields}, sort_keys=True)
         with self._lock:
-            with open(self.path, "a") as f:
-                f.write(line + "\n")
+            with open(self.path, "a+b") as f:
+                # A crash can leave a partial last line. Terminate it, or this
+                # record would be glued to the fragment and lost with it.
+                f.seek(0, os.SEEK_END)
+                if f.tell():
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        f.write(b"\n")
+                f.write(line.encode() + b"\n")
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -125,36 +145,54 @@ class Journal:
         s = RunState()
         if not self.path.exists():
             return s
-        for raw in self.path.read_text().splitlines():
+        for raw in self.path.read_text(errors="replace").splitlines():
             try:
                 e = json.loads(raw)
-            except ValueError:
-                continue  # a torn last line after a crash
-            ev = e.get("ev")
-            a = s.attempts.get(e.get("seq")) if "seq" in e else None
-            if ev == "run":
-                s.run_id, s.namespace = e["run_id"], e["namespace"]
-            elif ev == "intent":
+                self._apply(s, e)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                # A torn line after a crash. Safe to skip: an intent is synced
+                # before its create is sent, and an attempt whose later records
+                # are lost stays "intent", which `down` resolves by label.
+                s.skipped += 1
+        # `closed` is only believed while nothing is live.
+        s.closed = s.closed and not s.live()
+        return s
+
+    @staticmethod
+    def _apply(s: RunState, e: dict) -> None:
+        """One event. Transitions only move forward: a known id is never lost."""
+        ev = e["ev"]
+        a = s.attempts.get(e.get("seq")) if "seq" in e else None
+        if ev == "run":
+            if s.run_id is None:
+                s.run_id, s.namespace, s.meta = e["run_id"], e["namespace"], e
+        elif ev == "intent":
+            if a is None:
                 s.attempts[e["seq"]] = AttemptState(
                     seq=e["seq"],
                     label=e["label"],
+                    ts=float(e.get("ts") or 0),
                     machine_id=e.get("machine_id"),
                     host_id=e.get("host_id"),
                     dph=e.get("dph") or 0.0,
                 )
-            elif ev in ("refused", "unknown", "absent") and a:
+        elif ev in ("refused", "unknown", "absent"):
+            if a and a.status in ("intent", "unknown"):
                 a.status = ev
-            elif ev == "created" and a:
-                a.status, a.instance_id = "created", e["instance_id"]
-            elif ev in ("destroying", "destroyed"):
-                a = s.by_instance(e["instance_id"])
-                if a:
-                    a.status = ev
-            elif ev == "winner":
-                s.winner = {k: e[k] for k in ("seq", "instance_id", "host", "port")}
-            elif ev == "closed":
-                s.closed = True
-        return s
+        elif ev == "created":
+            if a and a.instance_id is None:
+                a.status, a.instance_id = "created", int(e["instance_id"])
+        elif ev in ("destroying", "destroyed"):
+            a = s.by_instance(e["instance_id"])
+            if a and a.status != "destroyed":
+                a.status = ev
+        elif ev == "winner":
+            s.winner = {k: e[k] for k in ("seq", "instance_id", "host", "port")}
+            # The winner record also proves the id, should `created` be missing.
+            if a and a.instance_id is None:
+                a.status, a.instance_id = "created", int(e["instance_id"])
+        elif ev == "closed":
+            s.closed = True
 
     def rotate(self) -> None:
         """Move a closed run's journal aside so the directory can host a new run."""

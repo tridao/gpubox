@@ -68,7 +68,7 @@ class Observations:
                     row = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(row, dict) and "machine_id" in row and "ts" in row:
+                if _valid(row):
                     self.rows.append(row)
 
     def add(self, row: dict) -> None:
@@ -80,17 +80,40 @@ class Observations:
                 f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def _valid(row) -> bool:
+    """Is this a row the policy can use? The file is a cache: anything else is skipped."""
+    return (
+        isinstance(row, dict)
+        and type(row.get("machine_id")) is int
+        and type(row.get("ts")) in (int, float)
+        and row.get("kind") in KINDS
+        and type(row.get("policy_version", 1)) is int
+    )
+
+
 def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
-    """machine_id -> {"until", "class", "reason"} for machines blocked at `now`."""
+    """machine_id -> {"until", "class", "reason"} for machines blocked at `now`.
+
+    Repeats are counted per class (soft, hard), not per reason: a machine that
+    was busy yesterday and is unreachable today is on its second soft strike.
+    A row seen twice (same id) counts once. Rows in the same second are
+    ordered by id, which is arbitrary but the same for every reader.
+    """
     per_machine: dict[int, list[dict]] = {}
+    seen = set()
     for row in rows:
-        if row.get("kind") in KINDS and row.get("policy_version", 1) <= POLICY_VERSION:
-            per_machine.setdefault(int(row["machine_id"]), []).append(row)
+        if not _valid(row) or row.get("policy_version", 1) > POLICY_VERSION:
+            continue
+        if row.get("id") is not None:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+        per_machine.setdefault(row["machine_id"], []).append(row)
     out = {}
     for machine, obs in per_machine.items():
         block = {"soft": (0, None), "hard": (0, None)}  # class -> (until, reason)
         strikes: dict[str, list[int]] = {"soft": [], "hard": []}
-        for o in sorted(obs, key=lambda o: (o["ts"], o.get("id", ""))):
+        for o in sorted(obs, key=lambda o: (o["ts"], str(o.get("id", "")))):
             if o["kind"] == "healthy":
                 block["soft"] = (0, None)  # it works now; history still counts
                 continue

@@ -45,6 +45,8 @@ class FakeVast:
     lost_late as lost, but listed only once `reveal()` is called
     late      still in the gate when another candidate wins
     slow      passes the gate, but only after `slow_secs`
+    hold      passes the gate once the test sets `release`
+    api_down  rented, but the provider never answers a status query
     """
 
     def __init__(self, behaviour, offers=None, slow_secs=0.5):
@@ -57,6 +59,9 @@ class FakeVast:
         self.listings_until_visible = {}
         self.revealed = False
         self.slow_secs = slow_secs
+        self.release = threading.Event()  # lets "hold" boxes through the gate
+        self.in_gate = {}  # machine -> Event, set when its gate starts
+        self.list_fails = 0  # number of listing calls that raise first
         self.lock = threading.Lock()
         for i, label in enumerate(FOREIGN):
             self.live[9000 + i] = {"id": 9000 + i, "label": label, "machine": None}
@@ -81,7 +86,7 @@ class FakeVast:
                 "label": payload["label"],
                 "machine": machine,
                 "start_date": time.time(),
-                "born": time.monotonic(),
+                "image_uuid": payload.get("image"),
             }
             self.creates += 1
             self.peak = max(self.peak, len(self.ours()))
@@ -95,6 +100,8 @@ class FakeVast:
         if box is None:
             return None
         kind = self.behaviour.get(box["machine"], "ok")
+        if kind == "api_down":
+            raise v.VastError(503, "unavailable")
         row = {"id": iid, "label": box["label"], "actual_status": "loading", "status_msg": ""}
         if kind == "cdi":
             row["status_msg"] = (
@@ -114,6 +121,9 @@ class FakeVast:
 
     def instances(self):
         rows = []
+        if self.list_fails > 0:
+            self.list_fails -= 1
+            raise v.VastError(503, "unavailable")
         with self.lock:
             for iid, box in self.live.items():
                 kind = self.behaviour.get(box["machine"])
@@ -122,7 +132,8 @@ class FakeVast:
                 if kind == "lost" and self.listings_until_visible.get(iid, 0) > 0:
                     self.listings_until_visible[iid] -= 1
                     continue
-                rows.append({k: box.get(k) for k in ("id", "label", "start_date")})
+                row = {k: box.get(k) for k in ("id", "label", "start_date", "image_uuid")}
+                rows.append({**row, "machine_id": box["machine"]})
         return rows
 
     def reveal(self):
@@ -155,6 +166,9 @@ class FakeProber:
     def gate(self, ep, spec):
         machine = int(ep[0].rsplit(".", 1)[1])
         kind = self.vast.behaviour[machine]
+        self.vast.in_gate.setdefault(machine, threading.Event()).set()
+        if kind == "hold":
+            self.vast.release.wait(5)
         if kind == "bad_gpu":
             return False, "cuda_init", "CUDA unavailable", {}
         if kind == "busy":
@@ -177,7 +191,7 @@ def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, **policy_kw
     vast = vast or FakeVast(behaviour)
     journal = Journal(tmp_path)
     run_id = "quack-ci.test.0123abcd"
-    journal.append("run", run_id=run_id, namespace="quack-ci", image=spec.image)
+    journal.append("run", run_id=run_id, namespace="quack-ci", image=spec.image, gpu=spec.gpu)
     return Launch(vast, spec, policy, journal, FakeProber(vast), run_id), vast, journal
 
 

@@ -1,0 +1,71 @@
+{
+ "_source": "QuACK tools/ci/vast/vast_ci.py as run against real boxes on 2026-11-22 (working tree on top of f1ce94e)",
+ "create": {
+  "body": {
+   "args_str": "bash -c 'set -eu; if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server; fi; mkdir -p /run/sshd /root/.ssh; chmod 700 /root/.ssh; printf '\"'\"'%s\\n'\"'\"' KEY > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; ssh-keygen -A >/dev/null; (sleep 60m; until python3 -c '\"'\"'import os, urllib.request as u; u.urlopen(u.Request('\"'\"'\"'\"'\"'\"'\"'\"'https://console.vast.ai/api/v0/instances/'\"'\"'\"'\"'\"'\"'\"'\"' + os.environ['\"'\"'\"'\"'\"'\"'\"'\"'CONTAINER_ID'\"'\"'\"'\"'\"'\"'\"'\"'] + '\"'\"'\"'\"'\"'\"'\"'\"'/'\"'\"'\"'\"'\"'\"'\"'\"', method='\"'\"'\"'\"'\"'\"'\"'\"'DELETE'\"'\"'\"'\"'\"'\"'\"'\"', data=b'\"'\"'\"'\"'\"'\"'\"'\"'{}'\"'\"'\"'\"'\"'\"'\"'\"', headers={'\"'\"'\"'\"'\"'\"'\"'\"'Content-Type'\"'\"'\"'\"'\"'\"'\"'\"': '\"'\"'\"'\"'\"'\"'\"'\"'application/json'\"'\"'\"'\"'\"'\"'\"'\"', '\"'\"'\"'\"'\"'\"'\"'\"'Authorization'\"'\"'\"'\"'\"'\"'\"'\"': '\"'\"'\"'\"'\"'\"'\"'\"'Bearer '\"'\"'\"'\"'\"'\"'\"'\"' + os.environ['\"'\"'\"'\"'\"'\"'\"'\"'CONTAINER_API_KEY'\"'\"'\"'\"'\"'\"'\"'\"']}), timeout=30)'\"'\"'; do sleep 60; done) >/dev/null 2>&1 & exec /usr/sbin/sshd -D -e -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no'",
+   "disk": 40,
+   "env": {
+    "-p 22:22": "1"
+   },
+   "image": "tridao/quack-kernels:cu13.2-26.11.22",
+   "label": "LABEL",
+   "runtype": "args",
+   "target_state": "running"
+  },
+  "method": "PUT",
+  "path": "/v0/asks/{offer_id}/"
+ },
+ "search": {
+  "body": {
+   "allocated_storage": 40,
+   "cpu_cores_effective": {
+    "gte": 16
+   },
+   "cpu_ram": {
+    "gte": 65536
+   },
+   "cuda_max_good": {
+    "gte": 13.2
+   },
+   "direct_port_count": {
+    "gte": 1
+   },
+   "disk_space": {
+    "gte": 40
+   },
+   "dph_total": {
+    "lte": 2.5
+   },
+   "gpu_name": {
+    "in": [
+     "RTX 5090"
+    ]
+   },
+   "inet_down": {
+    "gte": 200
+   },
+   "limit": 200,
+   "num_gpus": {
+    "eq": 2
+   },
+   "order": [
+    [
+     "dph_total",
+     "asc"
+    ]
+   ],
+   "reliability": {
+    "gte": 0.98
+   },
+   "rentable": {
+    "eq": true
+   },
+   "type": "on-demand",
+   "verified": {
+    "eq": true
+   }
+  },
+  "method": "POST",
+  "path": "/v0/bundles/"
+ }
+}

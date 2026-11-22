@@ -7,8 +7,9 @@
     search  show the offers `up` would try (rents nothing)
 
 Exit codes: 0 ok; 2 configuration (image cannot be pulled, no API key, state
-directory in use); 75 infrastructure (no healthy box, box lost mid-run);
-124 script timeout. `run` otherwise returns the script's own exit code.
+directory in use, bad arguments); 75 infrastructure (no healthy box, box lost
+mid-run, teardown not confirmed); 124 script timeout. `run` otherwise returns
+the script's own exit code, except that 255 is taken for a lost connection.
 
 The API key is read from VASTAI_API_KEY.
 """
@@ -27,7 +28,7 @@ from pathlib import Path
 
 from . import policy as pol
 from . import vast as v
-from .gate import Prober
+from .gate import GATE_VERSION, Prober
 from .journal import Journal, StateError, new_run_id, state_lock
 from .launch import ConfigError, Launch, Policy, Result, Spec, down, log, observe, reap
 
@@ -86,7 +87,11 @@ def write_summary(spec: Spec, result: Result) -> None:
 
 
 def spec_from(args, image: str = "") -> Spec:
-    cap = tuple(int(x) for x in args.capability.split(".")) if args.capability else None
+    cap = None
+    if args.capability:
+        if not re.fullmatch(r"\d+\.\d+", args.capability):
+            raise ConfigError(f"--capability expects MAJOR.MINOR, got {args.capability!r}")
+        cap = tuple(int(x) for x in args.capability.split("."))
     return Spec(
         image=image,
         gpu=args.gpu,
@@ -102,7 +107,17 @@ def spec_from(args, image: str = "") -> Spec:
 
 
 def observations_path(args) -> Path:
-    return Path(args.observations) if args.observations else Path(args.state_dir) / "obs.jsonl"
+    if args.observations:
+        return Path(args.observations)
+    return Path(args.state_dir) / "observations.jsonl"
+
+
+def advisory(what: str, fn, *a, **kw) -> None:
+    """Run something whose failure must not fail the command (reports, reputation)."""
+    try:
+        fn(*a, **kw)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        log(f"WARNING: {what} failed: {exc!r}")
 
 
 def cmd_up(args) -> int:
@@ -125,13 +140,23 @@ def cmd_up(args) -> int:
                 )
             journal.rotate()
         run_id = new_run_id(args.namespace, args.name)
-        journal.append("run", run_id=run_id, namespace=args.namespace, image=spec.image)
+        journal.append(
+            "run",
+            run_id=run_id,
+            namespace=args.namespace,
+            image=spec.image,
+            gpu=spec.gpu,
+            num_gpus=spec.num_gpus,
+        )
+        github_output(run_id=run_id)
+        log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
-        launch = Launch(v.Vast(key), spec, policy, journal, Prober(state_dir), run_id)
+        launch = Launch(v.Vast(key), spec, policy, journal, Prober(state_dir, fresh=True), run_id)
         result = launch.run(pol.blocklist(obs.rows, time.time()))
-        observe(result, spec, run_id, obs)
-    github_output(observations_changed=str(obs.added > 0).lower())
-    write_summary(spec, result)
+    # From here on the box is ours and recorded; nothing below may fail the launch.
+    advisory("recording observations", observe, result, spec, run_id, obs)
+    advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
+    advisory("writing the summary", write_summary, spec, result)
     for a in result.unresolved:
         where = f"instance {a.instance_id}" if a.instance_id else f"label {a.label}"
         log(f"::warning::attempt {a.seq} may have left a box ({where}); `gpubox down` retries")
@@ -148,12 +173,27 @@ def cmd_up(args) -> int:
     return 0
 
 
+# Provider states that mean the box is over, as opposed to missing or in transition.
+DEAD_STATUSES = ("exited", "offline")
+
+
+def _ours_to_blame(journal: Journal, run_id: str, instance_id: int) -> bool:
+    """False if this run (or its teardown) is why the box went away."""
+    state = journal.state()
+    if state.run_id != run_id or state.closed:
+        return False
+    attempt = state.by_instance(instance_id)
+    return bool(attempt) and attempt.status == "created"
+
+
 def cmd_run(args) -> int:
     state_dir = Path(args.state_dir)
     journal = Journal(state_dir)
     state = journal.state()
-    if not state.winner:
-        raise StateError(f"no launched box in {state_dir}; run `gpubox up` first")
+    w = state.winner
+    box = state.by_instance(w["instance_id"]) if w else None
+    if state.closed or not box or box.status != "created":
+        raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
     exports = []
     for item in args.env:
         name, sep, value = item.partition("=")
@@ -161,54 +201,64 @@ def cmd_run(args) -> int:
             raise ConfigError(f"--env expects NAME=VALUE, got {item!r}")
         exports.append(f"export {name}={shlex.quote(value)}\n")
     script = "".join(exports) + Path(args.script).read_text()
-    # Store the script first so nothing it runs can swallow it from stdin.
-    remote = "cat > /tmp/gpubox-script.sh && exec bash /tmp/gpubox-script.sh </dev/null"
-    w = state.winner
+    # Store the script first, under a name of its own, so nothing it runs can
+    # swallow it from stdin and a second `run` cannot overwrite it.
+    remote = 'f=$(mktemp /tmp/gpubox-script.XXXXXX) && cat > "$f" && exec bash "$f" </dev/null'
     argv = Prober(state_dir).ssh((w["host"], w["port"]), remote)
     try:
         rc = subprocess.run(argv, input=script.encode(), timeout=args.timeout_min * 60).returncode
     except subprocess.TimeoutExpired:
         log(f"::error::remote script exceeded {args.timeout_min} minutes")
         return EXIT_TIMEOUT
-    if rc != 255:  # 255 is ssh's own failure code
+    if rc != 255:  # 255 is ssh's own failure code (a script exiting 255 reads the same)
         return rc
-    ours = journal.state().by_instance(w["instance_id"])
-    if ours and ours.status in ("destroying", "destroyed"):
+    iid = w["instance_id"]
+    if not _ours_to_blame(journal, state.run_id, iid):
         log("::error::the box was destroyed by `gpubox down` while the script ran")
         return EXIT_INFRA
+    status = None
     try:
-        inst = v.Vast(api_key(args)).instance(w["instance_id"])
-        status = (inst or {}).get("actual_status") or "gone"
+        inst = v.Vast(api_key(args)).instance(iid)
+        status = "gone" if inst is None else inst.get("actual_status")
     except (v.VastError, ConfigError) as exc:
-        status = None
         log(f"WARNING: could not ask the provider what happened: {exc}")
     log(f"::error::lost the SSH connection to the box (instance status: {status or 'unknown'})")
-    if status and status != "running":
-        # It passed the gate and then died, and the provider confirms it: that
-        # is the machine. An unknown status is not evidence of anything.
-        obs = pol.Observations(observations_path(args))
-        attempt = state.attempts[w["seq"]]
-        obs.add(
-            pol.observation(
-                "died_after_admission",
-                attempt.machine_id,
-                attempt.host_id,
-                state.run_id,
-                reason="died",
+    # Blame the machine only on the provider's word that the box is over, and
+    # only if our own teardown did not start in the meantime. A missing or
+    # transitional status, or an API error, is not evidence.
+    if (status == "gone" or status in DEAD_STATUSES) and _ours_to_blame(journal, state.run_id, iid):
+        meta = state.meta
+        extra = {k: meta[k] for k in ("gpu", "num_gpus") if k in meta}
+
+        def record():
+            pol.Observations(observations_path(args)).add(
+                pol.observation(
+                    "died_after_admission",
+                    box.machine_id,
+                    box.host_id,
+                    state.run_id,
+                    reason="died",
+                    gate_version=GATE_VERSION,
+                    **extra,
+                )
             )
-        )
-        github_output(observations_changed="true")
+            github_output(observations_changed="true")
+
+        advisory("recording the observation", record)
     return EXIT_INFRA
 
 
 def cmd_down(args) -> int:
     state_dir = Path(args.state_dir)
-    if not Journal(state_dir).exists():
-        log(f"no run in {state_dir}: nothing to destroy")
-        return 0
     with state_lock(state_dir):
-        left = down(v.Vast(api_key(args)), Journal(state_dir), Policy())
-    return 1 if left else 0
+        journal = Journal(state_dir, run_id=args.run_id)
+        if not journal.exists():
+            log(f"no run in {state_dir}: nothing to destroy")
+            return 0
+        left = down(v.Vast(api_key(args)), journal, Policy())
+    if left:
+        log(f"::error::{left} attempt(s) unresolved; run `gpubox down` again")
+    return EXIT_INFRA if left else 0
 
 
 def cmd_reap(args) -> int:
@@ -216,10 +266,10 @@ def cmd_reap(args) -> int:
         v.Vast(api_key(args)),
         args.namespace,
         args.max_age_min,
-        destroy=args.destroy,
-        also_prefix=args.also_prefix,
+        destroy=args.destroy and not args.dry_run,
+        legacy=args.legacy_pattern,
     )
-    return 1 if failed else 0
+    return EXIT_INFRA if failed else 0
 
 
 def cmd_search(args) -> int:
@@ -241,6 +291,25 @@ def cmd_search(args) -> int:
     return 0
 
 
+def number(kind, low, *, exclusive=False):
+    """An argparse type: a finite number of `kind`, above (or at) `low`."""
+
+    def parse(text):
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+        if value != value or value in (float("inf"), float("-inf")):
+            raise argparse.ArgumentTypeError(f"not finite: {text!r}")
+        if value < low or (exclusive and value == low):
+            raise argparse.ArgumentTypeError(
+                f"must be {'>' if exclusive else '>='} {low}: {text!r}"
+            )
+        return value
+
+    return parse
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="gpubox", description=__doc__.split("\n\n")[0])
     p.add_argument("--keys-file", default=LOCAL_KEYS_FILE, help=argparse.SUPPRESS)
@@ -252,12 +321,17 @@ def main(argv=None) -> int:
 
     def spec_args(s):
         s.add_argument("--gpu", required=True, help='Vast GPU name, e.g. "RTX 5090"')
-        s.add_argument("--num-gpus", type=int, default=1)
-        s.add_argument("--max-dph-per-gpu", type=float, required=True, help="price cap, $/GPU/hr")
+        s.add_argument("--num-gpus", type=number(int, 1), default=1)
+        s.add_argument(
+            "--max-dph-per-gpu",
+            type=number(float, 0, exclusive=True),
+            required=True,
+            help="price cap, $/GPU/hr",
+        )
         s.add_argument("--capability", help="required CUDA compute capability, e.g. 12.0")
-        s.add_argument("--min-vram-gb", type=float, default=0)
-        s.add_argument("--min-cuda", type=float, default=12.0)
-        s.add_argument("--disk-gb", type=int, default=40)
+        s.add_argument("--min-vram-gb", type=number(float, 0), default=0)
+        s.add_argument("--min-cuda", type=number(float, 0), default=12.0)
+        s.add_argument("--disk-gb", type=number(int, 1), default=40)
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
         state_args(s)
 
@@ -266,33 +340,48 @@ def main(argv=None) -> int:
     s.add_argument("--image", required=True)
     s.add_argument("--namespace", required=True, help="who owns the box, e.g. quack-ci")
     s.add_argument("--name", required=True, help="this run, e.g. the CI run id")
-    s.add_argument("--spare", type=int, default=DEFAULTS.spare)
-    s.add_argument("--max-attempts", type=int, default=DEFAULTS.max_attempts)
-    s.add_argument("--startup-timeout", type=float, default=DEFAULTS.startup_timeout)
-    s.add_argument("--overall-timeout", type=float, default=DEFAULTS.overall_timeout)
-    s.add_argument("--ttl-min", type=int, default=90, help="the box destroys itself after this")
+    s.add_argument("--spare", type=number(int, 0), default=DEFAULTS.spare)
+    s.add_argument("--max-attempts", type=number(int, 1), default=DEFAULTS.max_attempts)
+    s.add_argument(
+        "--startup-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.startup_timeout
+    )
+    s.add_argument(
+        "--overall-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.overall_timeout
+    )
+    s.add_argument(
+        "--ttl-min", type=number(int, 1), default=90, help="the box destroys itself after this"
+    )
     s.set_defaults(fn=cmd_up)
 
     s = sub.add_parser("run")
     state_args(s)
     s.add_argument("--script", required=True)
     s.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
-    s.add_argument("--timeout-min", type=float, default=60)
+    s.add_argument("--timeout-min", type=number(float, 0, exclusive=True), default=60)
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("down")
     state_args(s)
+    s.add_argument(
+        "--run-id",
+        help="the run to tear down (printed by `up`); without it, the directory's current run",
+    )
     s.set_defaults(fn=cmd_down)
 
     s = sub.add_parser("reap")
     s.add_argument("--namespace", required=True)
-    s.add_argument("--max-age-min", type=float, required=True)
+    s.add_argument("--max-age-min", type=number(float, 0), required=True)
     s.add_argument(
         "--destroy",
         action="store_true",
         help="destroy stale boxes; asserts every box in this namespace is disposable",
     )
-    s.add_argument("--also-prefix", help="also match labels with this prefix (migration only)")
+    s.add_argument("--dry-run", action="store_true", help="report only, even with --destroy")
+    s.add_argument(
+        "--legacy-pattern",
+        metavar="REGEX",
+        help="also match labels of an older scheme (full match; never a current-scheme label)",
+    )
     s.set_defaults(fn=cmd_reap)
 
     s = sub.add_parser("search")

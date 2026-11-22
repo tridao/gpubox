@@ -149,3 +149,36 @@ def test_soft_blocked_machines_are_readmitted_last_when_the_pool_is_too_small():
 def test_everything_hard_blocked_leaves_nothing():
     hard = {"until": 9, "class": "hard", "reason": "cuda_init"}
     assert pol.select_offers([offer(1), offer(2)], {1: hard, 2: hard}, want=2) == []
+
+
+def test_a_row_seen_twice_counts_once():
+    row = failed(5, 0, "busy_gpu")
+    assert pol.blocklist([row, dict(row)], 1)[5]["until"] == 2 * H
+
+
+def test_strikes_are_counted_per_class_not_per_reason():
+    rows = [failed(5, 0, "busy_gpu"), failed(5, D, "unreachable")]
+    assert pol.blocklist(rows, D + 1)[5]["until"] == D + 2 * D  # second soft strike
+    rows = [failed(6, 0, "busy_gpu"), failed(6, D, "cuda_init")]
+    assert pol.blocklist(rows, D + 1)[6]["until"] == D + 14 * D  # first hard strike
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"machine_id": None, "ts": 1, "kind": "failed_admission", "reason_code": "cuda_init"},
+        {"machine_id": "5", "ts": 1, "kind": "failed_admission", "reason_code": "cuda_init"},
+        {"machine_id": 5, "ts": "soon", "kind": "failed_admission", "reason_code": "cuda_init"},
+        {"machine_id": 5, "ts": 1, "kind": "exploded", "reason_code": "cuda_init"},
+        {"machine_id": 5, "ts": 1, "kind": "failed_admission", "reason_code": "cuda_init", "policy_version": "x"},
+        "text",
+        None,
+    ],
+)  # fmt: skip
+def test_malformed_cached_rows_are_skipped_everywhere(tmp_path, row):
+    import json
+
+    assert pol.blocklist([row], 2) == {}
+    path = tmp_path / "observations.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    assert pol.Observations(path).rows == []

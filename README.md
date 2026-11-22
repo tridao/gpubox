@@ -1,0 +1,57 @@
+# gpubox
+
+Rent a verified GPU box from Vast.ai, and make sure it is destroyed afterwards.
+
+Phase 1: one box for a CI job. Standard library only (Python 3.10+). The
+design and its review history are in QuACK's `AI/gpubox_design.md`.
+
+```bash
+export VASTAI_API_KEY=...
+gpubox up --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 \
+    --image tridao/quack-kernels:cu13.2-DATE --namespace quack-ci --name "$RUN-$ATTEMPT"
+gpubox run --script remote.sh --env SHA=$SHA --timeout-min 40
+gpubox down                      # always; exit 75 means "run me again"
+gpubox reap --namespace quack-ci --max-age-min 90            # report
+gpubox reap --namespace quack-ci --max-age-min 90 --destroy  # only if every box in the namespace is disposable
+```
+
+State lives in `--state-dir` (default `.gpubox`): the journal of what was
+rented, a throwaway SSH key, and `observations.jsonl` (which machines worked;
+cache this file between CI runs, and nothing else).
+
+## What it guarantees, and what it does not
+
+- A box is used only after it passed the health gate and its id is durably
+  journalled. Until then any failure destroys everything the launch rented.
+- `down` destroys by journalled id. A label is only used to find a box whose
+  create request got no usable answer, and then only a single instance on the
+  expected machine, with our image, started after the attempt.
+- At most `1 + --spare` boxes exist at once. A failed box keeps its slot until
+  the provider confirms it is gone; a create with an unclear outcome keeps its
+  slot too.
+- Every box carries a timer that destroys it after `--ttl-min`, whatever
+  happens to the launcher.
+- Not guaranteed: a cap across separate runs; cleanup of a box whose code
+  relabelled it and killed its timer when the launcher's state is also lost
+  (use a provider account of its own for CI to close that).
+
+## QuACK CI mapping
+
+The flags that reproduce `tools/ci/vast/vast_ci.py` (checked against a pinned
+recording of its requests in `tests/fixtures/reference_requests.json`):
+
+```
+--gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 --capability 12.0
+--min-vram-gb 29.3 --min-cuda 13.2 --ttl-min 60
+--must-reach https://github.com/ --must-reach https://pypi.org/simple/pip/
+```
+
+The reaper needs `--legacy-pattern 'quack-ci-\d+-\d+'` for one release, to
+sweep boxes labelled by the old launcher.
+
+## Tests
+
+```bash
+python3 -m pytest          # fake provider and fake SSH; rents nothing
+python3 tests/mutations.py # breaks each safety property in turn; the suite must notice
+```

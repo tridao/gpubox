@@ -16,8 +16,11 @@ blocks further renting instead of being replaced blindly.
 from __future__ import annotations
 
 import collections
+import re
+import signal
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
@@ -65,6 +68,7 @@ class Policy:
     cleanup_reserve: float = 60  # stop renting this long before overall_timeout
     poll: float = 5
     reconcile_timeout: float = 60  # how long to look for a box after an unknown create
+    settle: float = 300  # after this long unseen, an unknown create is taken as never made
     confirm_timeout: float = 30  # how long to wait for a delete to show
     confirm_poll: float = 2
 
@@ -125,11 +129,69 @@ def destroy_confirmed(vast, journal: Journal, instance_id: int, policy: Policy) 
 
 
 def _note(journal: Journal, ev: str, **fields) -> None:
-    """Journal something that has already happened; a write failure must not stop cleanup."""
+    """Journal a step of cleanup; a write failure must not stop the cleanup.
+
+    Not for acquiring ownership: an instance id that cannot be journalled must
+    fail the attempt (see Launch._bring_up).
+    """
     try:
         journal.append(ev, **fields)
     except OSError as exc:
         log(f"WARNING: journal write failed ({ev} {fields}): {exc}")
+
+
+@contextmanager
+def _signals_deferred():
+    """Hold SIGINT/SIGTERM until the block ends, then deliver one.
+
+    Cleanup must not be cut short by the signal that asked for it (or a second
+    one). Everything inside is bounded by timeouts. Outside the main thread
+    signals cannot be redirected, and nothing is changed.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    got, old = [], {}
+
+    def hold(signum, frame):
+        got.append(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old[sig] = signal.signal(sig, hold)
+    try:
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if got:
+        raise KeyboardInterrupt
+
+
+def find_by_label(listing: list[dict], label: str, *, not_before: float, image, machine_id):
+    """The one instance that plausibly is the box of an attempt we lost track of.
+
+    A label is mutable, so it is a hint, not proof. To be taken for ours an
+    instance must also sit on the machine the attempt asked for, have been
+    started after we wrote the intent, and run our image; and it must be the
+    only such instance. What remains possible is an impostor matching all
+    four, which we accept. Returns (instance or None, number carrying the label).
+    """
+    labelled = [i for i in listing if i.get("label") == label]
+    plausible = []
+    for inst in labelled:
+        started, img, machine = (
+            inst.get("start_date"),
+            inst.get("image_uuid"),
+            inst.get("machine_id"),
+        )
+        if started is not None and float(started) < not_before - 300:
+            continue
+        if image and img and img != image:
+            continue
+        if machine_id is not None and machine is not None and machine != machine_id:
+            continue
+        plausible.append(inst)
+    return (plausible[0] if len(plausible) == 1 else None), len(labelled)
 
 
 class Launch:
@@ -138,6 +200,8 @@ class Launch:
         self.journal, self.prober, self.run_id = journal, prober, run_id
         self.stop = threading.Event()
         self.attempts: dict[int, Attempt] = {}
+        self.rent_until = float("inf")  # monotonic; no create is sent after this
+        self.intent_ts: dict[int, float] = {}
 
     # ------------------------------------------------------------- one attempt
 
@@ -146,7 +210,8 @@ class Launch:
         t0 = time.monotonic()
         elapsed = lambda: round(time.monotonic() - t0, 1)
         tag = f"[m{a.machine_id} a{a.seq}]"
-        if self.stop.is_set():
+        if self.stop.is_set() or time.monotonic() >= self.rent_until:
+            # Nothing was sent, so there is certainly no box.
             a.state, a.detail = "refused", "cancelled before create"
             _note(self.journal, "refused", seq=a.seq)
             return a
@@ -164,19 +229,27 @@ class Launch:
             self._reconcile(a)
             return a
         a.state = "created"
-        _note(self.journal, "created", seq=a.seq, instance_id=a.instance_id)
+        # Ownership is the journal. If the id cannot be recorded the box must
+        # not be admitted: this raises, and the launch rolls back by the id we
+        # still hold in memory.
+        self.journal.append("created", seq=a.seq, instance_id=a.instance_id)
         log(f"  {tag} rented instance {a.instance_id}: ${a.dph:.2f}/hr, host {a.host_id}, {a.geo}")
 
         status = msg = ssh_err = ""
+        answered = False  # did the provider ever tell us anything about this box?
         while True:
             if self.stop.wait(policy.poll):
                 a.detail = "cancelled"
                 return a
             if elapsed() > policy.startup_timeout:
                 extra = ssh_err or msg[:120] or "no status message"
-                a.reason = "unreachable"
+                # Only the provider's own account of the box is evidence
+                # against the machine; our failure to reach the API is not.
+                a.reason = "unreachable" if answered else None
                 a.detail = (
                     f"not reachable after {policy.startup_timeout:g}s (status={status}; {extra})"
+                    if answered
+                    else f"provider API gave no status for {policy.startup_timeout:g}s"
                 )
                 return a
             try:
@@ -185,6 +258,7 @@ class Launch:
                 continue
             if not inst:
                 continue
+            answered = True
             status, msg = inst.get("actual_status") or "none", str(inst.get("status_msg") or "")
             kind = v.classify_status(msg)
             if kind == "image":
@@ -220,17 +294,26 @@ class Launch:
         on the box yet, so at this point it is a reliable correlation id.
         """
         deadline = time.monotonic() + self.policy.reconcile_timeout
+        count = 0
         while True:
             try:
-                for inst in self.vast.instances():
-                    if inst.get("label") == a.label:
-                        a.instance_id, a.state = int(inst["id"]), "created"
-                        a.detail += f"; found as instance {a.instance_id}"
-                        _note(self.journal, "created", seq=a.seq, instance_id=a.instance_id)
-                        return
+                inst, count = find_by_label(
+                    self.vast.instances(),
+                    a.label,
+                    not_before=self.intent_ts[a.seq],
+                    image=self.spec.image,
+                    machine_id=a.machine_id,
+                )
+                if inst:
+                    a.instance_id, a.state = int(inst["id"]), "created"
+                    a.detail += f"; found as instance {a.instance_id}"
+                    _note(self.journal, "created", seq=a.seq, instance_id=a.instance_id)
+                    return
             except v.VastError:
                 pass
             if time.monotonic() >= deadline:
+                if count:
+                    a.detail += f"; {count} instance(s) carry its label, none provably ours"
                 return
             time.sleep(self.policy.poll)
 
@@ -244,9 +327,16 @@ class Launch:
     # ---------------------------------------------------------------- the race
 
     def run(self, blocked: dict[int, dict]) -> Result:
+        """Race candidates until one is healthy and durably recorded as the winner.
+
+        Until that record is written nothing is kept: any exception, including
+        one raised by another candidate or by the journal, destroys every box
+        this launch rented, the would-be winner included.
+        """
         spec, policy = self.spec, self.policy
         t0 = time.monotonic()
-        found = [o for o in self.vast.offers(v.offer_query(spec)) if o.get("dph_total")]
+        self.rent_until = t0 + policy.overall_timeout - policy.cleanup_reserve
+        found = [o for o in self.vast.offers(v.offer_query(spec)) if _price(o) is not None]
         offers = collections.deque(pol.select_offers(found, blocked, policy.max_live))
         log(
             f"{len(offers)} candidate host(s) for {spec.num_gpus}x {spec.gpu} "
@@ -254,13 +344,18 @@ class Launch:
             f"up to {policy.max_attempts} attempts"
         )
         pool = ThreadPoolExecutor(max_workers=policy.max_live, thread_name_prefix="gpubox")
-        pending, judged, winner = set(), [], None
+        pending, judged, winner, handed_off = set(), [], None, False
 
         def live() -> int:
             return sum(a.state in LIVE for a in self.attempts.values())
 
         def fill():
-            while live() < policy.max_live and len(self.attempts) < policy.max_attempts and offers:
+            while (
+                live() < policy.max_live
+                and len(self.attempts) < policy.max_attempts
+                and offers
+                and time.monotonic() < self.rent_until
+            ):
                 o = offers.popleft()
                 seq = len(self.attempts) + 1
                 a = Attempt(
@@ -269,10 +364,11 @@ class Launch:
                     machine_id=o.get("machine_id"),
                     host_id=o.get("host_id"),
                     offer_id=o["id"],
-                    dph=float(o["dph_total"]),
+                    dph=_price(o),
                     geo=str(o.get("geolocation") or ""),
                 )
                 # Written, and synced, before the request: if this fails we do not rent.
+                self.intent_ts[seq] = time.time()
                 self.journal.append(
                     "intent",
                     seq=seq,
@@ -288,15 +384,14 @@ class Launch:
         try:
             fill()
             while pending and winner is None:
-                remaining = policy.overall_timeout - policy.cleanup_reserve
-                remaining -= time.monotonic() - t0
+                remaining = self.rent_until - time.monotonic()
                 if remaining <= 0:
                     log(f"giving up: no healthy box within {policy.overall_timeout:g}s")
                     break
                 done, _ = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
                 for fut in done:
                     pending.discard(fut)
-                    a = fut.result()
+                    a = fut.result()  # a worker's ConfigError or journal error surfaces here
                     judged.append(a)
                     tag = f"[m{a.machine_id} a{a.seq}]"
                     if a.ok and winner is None:
@@ -309,19 +404,21 @@ class Launch:
                         self._destroy(a)  # stop paying, and free its slot, now
                 if winner is None:
                     fill()
+            if winner:
+                self.journal.append(
+                    "winner",
+                    seq=winner.seq,
+                    instance_id=winner.instance_id,
+                    host=winner.endpoint[0],
+                    port=winner.endpoint[1],
+                )
+                handed_off = True
         finally:
             self.stop.set()
-            others = [a for a in self.attempts.values() if a is not winner]
-            for a in others:  # unblock threads waiting on SSH to these boxes
-                if a.state == "created":
-                    try:
-                        self.vast.destroy(a.instance_id)
-                    except v.VastError:
-                        pass
-            pool.shutdown(wait=True)
-            for a in others:  # includes boxes created or found after the race was decided
-                if a.state in ("created", "destroying"):
-                    self._destroy(a)
+            if not handed_off:
+                winner = None
+            with _signals_deferred():
+                self._cleanup(pool, keep=winner)
 
         for a in self.attempts.values():
             if a not in judged:
@@ -331,16 +428,33 @@ class Launch:
                 a.detail = a.detail or "cancelled"
             elif a.ok and a is not winner:
                 a.ok, a.detail = False, "healthy, but another candidate won"
-        if winner:
-            self.journal.append(
-                "winner",
-                seq=winner.seq,
-                instance_id=winner.instance_id,
-                host=winner.endpoint[0],
-                port=winner.endpoint[1],
-            )
         ordered = [self.attempts[k] for k in sorted(self.attempts)]
         return Result(winner=winner, attempts=ordered, seconds=time.monotonic() - t0)
+
+    def _cleanup(self, pool, keep: Attempt | None) -> None:
+        """Destroy every box of this launch except `keep`, and wait for the workers."""
+        others = [a for a in self.attempts.values() if a is not keep]
+        for a in others:  # unblock threads waiting on SSH to these boxes
+            if a.state == "created":
+                try:
+                    self.vast.destroy(a.instance_id)
+                except v.VastError:
+                    pass
+        pool.shutdown(wait=True)
+        for a in others:  # includes boxes created or found after the race was decided
+            if a.state in ("created", "destroying"):
+                try:
+                    self._destroy(a)
+                except Exception as exc:  # one box must not stop the cleanup of the rest
+                    log(f"WARNING: cleaning up instance {a.instance_id}: {exc!r}")
+
+
+def _price(offer: dict) -> float | None:
+    """The offer's hourly price, or None if it has no usable one."""
+    dph = offer.get("dph_total")
+    if isinstance(dph, bool) or not isinstance(dph, (int, float)) or not 0 < dph < float("inf"):
+        return None
+    return float(dph)
 
 
 def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> None:
@@ -370,51 +484,95 @@ def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> N
             )
 
 
-def down(vast, journal: Journal, policy: Policy) -> int:
-    """Destroy everything the journalled run rented. Returns the number left."""
+def down(vast, journal: Journal, policy: Policy, *, now=None) -> int:
+    """Destroy everything the journalled run rented. Returns how many attempts are unresolved.
+
+    Boxes whose id is known are destroyed by id, whatever their label says.
+    An attempt whose create may have been sent but whose id we never learned
+    is looked up by label: a single plausible match is destroyed. If nothing
+    carries the label, the attempt stays unresolved until `policy.settle`
+    seconds after the intent, and only then is recorded as never created.
+    """
+    now = time.time() if now is None else now
     state = journal.state()
     if state.run_id is None or state.closed:
         log("nothing to destroy")
         return 0
-    left, listing = 0, None
-    for a in sorted(state.attempts.values(), key=lambda a: a.seq):
-        iid = a.instance_id
-        if a.status in ("intent", "unknown"):
-            # The create was sent (or about to be) and we never learned the id.
-            listing = vast.instances() if listing is None else listing
-            match = [i for i in listing if i.get("label") == a.label]
-            if not match:
-                journal.append("absent", seq=a.seq)
-                log(f"attempt {a.seq}: no instance labelled {a.label}; treated as never created")
-                continue
-            iid = int(match[0]["id"])
-            journal.append("created", seq=a.seq, instance_id=iid)
-        elif a.status not in ("created", "destroying"):
+    if state.skipped:
+        log(f"WARNING: {state.skipped} unreadable journal line(s) were skipped")
+    left = 0
+    attempts = sorted(state.attempts.values(), key=lambda a: a.seq)
+    for a in attempts:  # known ids first: nothing below may prevent these
+        if a.status in ("created", "destroying"):
+            if destroy_confirmed(vast, journal, a.instance_id, policy):
+                log(f"destroyed instance {a.instance_id} (attempt {a.seq})")
+            else:
+                left += 1
+                log(f"ERROR: instance {a.instance_id} (attempt {a.seq}) not confirmed destroyed")
+    listing = None
+    for a in attempts:
+        if a.status not in ("intent", "unknown"):
             continue
-        if destroy_confirmed(vast, journal, iid, policy):
-            log(f"destroyed instance {iid} (attempt {a.seq})")
-        else:
+        try:
+            listing = vast.instances() if listing is None else listing
+        except v.VastError as exc:
             left += 1
-            log(f"ERROR: instance {iid} (attempt {a.seq}) is not confirmed destroyed")
+            log(f"ERROR: attempt {a.seq} ({a.label}) unresolved, cannot list instances: {exc}")
+            continue
+        inst, count = find_by_label(
+            listing,
+            a.label,
+            not_before=a.ts,
+            image=state.meta.get("image"),
+            machine_id=a.machine_id,
+        )
+        if inst:
+            iid = int(inst["id"])
+            _note(journal, "created", seq=a.seq, instance_id=iid)
+            if destroy_confirmed(vast, journal, iid, policy):
+                log(f"destroyed instance {iid} (attempt {a.seq}, found by label)")
+                continue
+            log(f"ERROR: instance {iid} (attempt {a.seq}) not confirmed destroyed")
+        elif count:
+            log(
+                f"ERROR: attempt {a.seq}: {count} instance(s) labelled {a.label}, none provably "
+                "ours (other machine or image, or older than the attempt); not touching them"
+            )
+        elif now - a.ts > policy.settle:
+            _note(journal, "absent", seq=a.seq)
+            log(
+                f"attempt {a.seq}: nothing labelled {a.label} after {policy.settle:g}s; never created"
+            )
+            continue
+        else:
+            log(
+                f"attempt {a.seq}: nothing labelled {a.label} yet; unresolved until "
+                f"{policy.settle:g}s after the attempt (run `down` again)"
+            )
+        left += 1
     if not left:
-        journal.append("closed")
+        _note(journal, "closed")
     return left
 
 
-def reap(vast, namespace, max_age_min, *, destroy, also_prefix=None, now=None) -> int:
+def reap(vast, namespace, max_age_min, *, destroy, legacy=None, now=None) -> int:
     """Find instances of a namespace that outlived any run. Returns failures.
 
     Destroying by label is only safe in a namespace the operator declares
     exclusive (every instance carrying it is disposable), which is what
     passing `destroy=True` asserts. Without it this only reports.
+
+    `legacy` is a regular expression for labels of an older scheme, matched in
+    full and never applied to a label of the current scheme.
     """
     now = time.time() if now is None else now
     failed = 0
     for inst in vast.instances():
         label = inst.get("label") or ""
-        ours = label_namespace(label) == namespace
-        legacy = bool(also_prefix) and label.startswith(also_prefix)
-        if not (ours or legacy):
+        ns = label_namespace(label)
+        ours = ns == namespace
+        old = bool(legacy) and ns is None and re.fullmatch(legacy, label) is not None
+        if not (ours or old):
             continue
         started = inst.get("start_date")
         if not started:
