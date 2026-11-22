@@ -13,7 +13,6 @@ minutes.
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 import uuid
@@ -85,14 +84,15 @@ def _valid(row) -> bool:
     """Is this a row the policy can use? The file is a cache: anything else is skipped."""
     if not isinstance(row, dict):
         return False
-    kind, reason = row.get("kind"), row.get("reason_code")
+    kind, reason, ts = row.get("kind"), row.get("reason_code"), row.get("ts")
     return (
         type(row.get("machine_id")) is int
-        and type(row.get("ts")) in (int, float)
-        and math.isfinite(row["ts"])
+        and type(ts) in (int, float)
+        and -1e15 < ts < 1e15  # also false for NaN, and for integers too big to compare
         and isinstance(kind, str)
         and kind in KINDS
-        and (reason is None or isinstance(reason, str))
+        # The same rule new observations obey: healthy has no reason, a failure has one.
+        and (reason is None if kind == "healthy" else isinstance(reason, str))
         and (row.get("id") is None or isinstance(row["id"], str))
         and type(row.get("policy_version", 1)) is int
     )

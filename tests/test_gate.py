@@ -141,3 +141,43 @@ def test_each_key_directory_gets_its_own_key(tmp_path):
     a, b = Prober(tmp_path / "run-a"), Prober(tmp_path / "run-b")
     assert a.pubkey != b.pubkey and a.known_hosts != b.known_hosts
     assert Prober(tmp_path / "run-a").pubkey == a.pubkey  # stable within a run
+
+
+# ------------------------------------------------------------ round three
+
+
+def test_whatever_bytes_the_box_prints_are_read_without_raising(tmp_path, monkeypatch):
+    _, calls = verdict(tmp_path, monkeypatch, 0, '{"ok": true}')
+    kw = calls[0][1]
+    assert kw.get("errors") == "replace" and kw.get("encoding") == "utf-8" and "text" not in kw
+    # And for real: a process that emits bytes that are not UTF-8.
+    monkeypatch.undo()
+    p = prober(tmp_path)
+    monkeypatch.setattr(
+        p,
+        "ssh",
+        lambda ep, remote, **k: [
+            "python3",
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'\\xff\\xfe junk'); sys.stderr.buffer.write(b'\\xff')",
+        ],
+    )
+    ok, reason, detail, report = p.gate(("10.0.0.1", 22), SPEC)
+    assert (ok, reason) == (False, None) and set(report) == {"gpus", "cpus", "driver", "torch"}
+    assert p.ready(("10.0.0.1", 22)) == (True, "\ufffd")
+
+
+@pytest.mark.parametrize(
+    "rc,stdout", [(255, ""), (1, "Traceback"), (0, "[1]"), (0, '{"ok": false, "reason": 5}')]
+)
+def test_every_outcome_carries_a_report_of_the_same_shape(tmp_path, monkeypatch, rc, stdout):
+    (_, _, _, report), _ = verdict(tmp_path, monkeypatch, rc, stdout)
+    assert report == {"gpus": [], "cpus": None, "driver": None, "torch": None}
+
+
+def test_loading_a_key_never_creates_one(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        Prober(tmp_path / "gone", create=False)
+    assert not (tmp_path / "gone").exists()
+    made = Prober(tmp_path / "run-a")
+    assert Prober(tmp_path / "run-a", create=False).pubkey == made.pubkey

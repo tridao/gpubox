@@ -21,13 +21,19 @@ cache this file between CI runs, and nothing else).
 
 ## What it guarantees, and what it does not
 
-- A box is used only after it passed the health gate, every other candidate
-  is confirmed gone, and its id is durably journalled as the winner. Until
-  then any failure or signal destroys everything the launch rented.
+- A box is used only after it passed the health gate, every other box whose
+  id is known is confirmed gone, and its id is durably journalled as the
+  winner. Until then any failure or signal destroys everything the launch
+  rented. The one thing that may stay open beside a winner is a create that
+  never gave us an id (below).
+- `up` can be interrupted after the winner is journalled and still exit
+  non-zero. Always run `down` after `up`, whatever it returned.
 - `down` destroys every instance id in the journal. A label is only used to
   find a box whose create request got no usable answer, and then only if the
   provider's listing shows exactly one instance with that label, on the
-  expected machine, with our image, started after the attempt.
+  expected machine, with our image, started no more than 30 s before the
+  attempt. That is strong evidence, not proof: an instance someone made to
+  match all of it would be destroyed.
 - At most `1 + --spare` boxes exist at once. A failed box keeps its slot until
   the provider confirms it is gone; a create with an unclear outcome keeps its
   slot too.
@@ -35,8 +41,11 @@ cache this file between CI runs, and nothing else).
   `down` then keeps exiting 75 until you have looked at the provider and run
   `down --abandon-unseen`.
 - Every create request carries a timer that destroys the box after
-  `--ttl-min`. It starts once the container runs, so it does not cover a box
-  stuck before that.
+  `--ttl-min`. It is started by the container's own start-up, just before
+  sshd, so it does not cover a box stuck pulling the image or in that
+  start-up.
+- `reap --destroy` deletes by label in a namespace you declare disposable.
+  It does not know or check that this launcher rented those boxes.
 - Not guaranteed: a cap across separate runs; cleanup of a box whose code
   relabelled it and killed its timer when the launcher's state is also lost
   (use a provider account of its own for CI to close that).

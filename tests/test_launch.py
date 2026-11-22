@@ -112,7 +112,7 @@ def test_bad_image_aborts_instead_of_trying_every_host(tmp_path):
     launch, vast, journal = start(tmp_path, dict.fromkeys(range(1, 6), "image"))
     with pytest.raises(L.ConfigError, match="cannot be pulled"):
         launch.run({})
-    assert vast.creates == 2
+    assert 1 <= vast.creates <= 2  # no replacement is rented once the image is known bad
     nothing_left(vast, journal)
 
 
@@ -130,6 +130,44 @@ def test_a_healthy_box_outweighs_another_hosts_image_error(tmp_path, monkeypatch
     result = launch.run({})
     assert vast.behaviour[result.winner.machine_id] == "ok" and vast.creates == 2
     only_winner_left(result, vast, journal)
+
+
+def test_an_image_error_does_not_cancel_a_box_that_is_still_coming_up(tmp_path):
+    # The two finish at different times, the image error first. The other box
+    # is already rented; if it comes up, the image is evidently fine.
+    launch, vast, journal = start(tmp_path, {1: "image", 2: "hold", 3: "ok"})
+
+    def release_after_the_image_error():
+        while 1 not in [a.machine_id for a in launch.attempts.values() if a.state == "destroyed"]:
+            time.sleep(0.005)
+        vast.release.set()
+
+    threading.Thread(target=release_after_the_image_error, daemon=True).start()
+    result = launch.run({})
+    assert result.winner.machine_id == 2
+    assert vast.creates == 2  # and no third box was rented after the image error
+    only_winner_left(result, vast, journal)
+
+
+def test_after_an_image_error_the_others_get_a_short_while_not_the_whole_timeout(tmp_path):
+    # The image is missing. One host says so at once, the other never says
+    # anything; waiting out its full startup timeout would be money for nothing.
+    launch, vast, journal = start(
+        tmp_path, {1: "image", 2: "stuck"}, startup_timeout=30, overall_timeout=60, image_grace=0.2
+    )
+    t0 = time.monotonic()
+    with pytest.raises(L.ConfigError):
+        launch.run({})
+    assert time.monotonic() - t0 < 5
+    nothing_left(vast, journal)
+
+
+def test_an_image_error_is_reported_when_nothing_else_comes_up(tmp_path):
+    launch, vast, journal = start(tmp_path, {1: "image", 2: "bad_gpu", 3: "ok"})
+    with pytest.raises(L.ConfigError):
+        launch.run({})
+    assert vast.creates == 2
+    nothing_left(vast, journal)
 
 
 def test_max_attempts_bounds_the_spend(tmp_path):
@@ -249,16 +287,80 @@ def test_a_failure_takes_precedence_over_a_signal(tmp_path, monkeypatch):
     nothing_left(vast, journal)
 
 
-def test_handlers_are_restored_after_a_normal_launch(tmp_path):
-    marker = lambda *a: None
-    old = signal.signal(signal.SIGTERM, marker)
+@pytest.mark.parametrize("disposition", ["custom", signal.SIG_IGN, signal.SIG_DFL])
+def test_handlers_are_restored_after_a_normal_launch(tmp_path, disposition):
+    if disposition == "custom":
+        disposition = lambda *a: None
+    saved = signal.signal(signal.SIGTERM, disposition), signal.getsignal(signal.SIGINT)
     try:
         result, vast, journal = run(tmp_path, {1: "ok"}, spare=0)
-        assert signal.getsignal(signal.SIGTERM) is marker
-        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert signal.getsignal(signal.SIGTERM) is disposition
+        assert signal.getsignal(signal.SIGINT) is saved[1]
     finally:
-        signal.signal(signal.SIGTERM, old)
+        signal.signal(signal.SIGTERM, saved[0])
     only_winner_left(result, vast, journal)
+
+
+def test_the_signal_handler_only_sets_a_flag(tmp_path):
+    # It may run in the middle of `stop.set()` on the same thread; taking the
+    # event's lock again there would hang the cleanup it interrupted.
+    launch, _, _ = start(tmp_path, {1: "ok"})
+    launch._cancel(signal.SIGTERM)
+    assert launch.cancelled and not launch.stop.is_set()
+
+
+def test_a_known_loser_that_will_not_go_away_means_no_winner(tmp_path):
+    # Machine 1 is healthy; machine 2's box exists, its id is known, and its
+    # delete is not confirmed. Keeping the winner would mean paying for both
+    # for as long as the job runs.
+    vast = FakeVast({1: "ok", 2: "stuck"})
+    vast.sticky.add(2)
+    launch, vast, journal = start(tmp_path, {}, vast=vast)
+    result = launch.run({})
+    assert result.winner is None and journal.state().winner is None
+    assert [a.machine_id for a in result.unresolved] == [2]
+    assert [vast.live[i]["machine"] for i in vast.ours()] == [2]  # the healthy box was given up
+    vast.sticky.clear()
+    assert L.down(vast, journal, FAST) == 0
+    nothing_left(vast, journal)
+
+
+def held_in_create(launch, vast, machine):
+    """Make `machine`'s create reach the provider only after the race is decided."""
+
+    def before_create(m):
+        if m == machine:
+            assert launch.stop.wait(5)
+
+    vast.before_create = before_create
+
+
+def test_a_box_created_after_the_race_was_decided_is_destroyed(tmp_path):
+    launch, vast, journal = start(tmp_path, {1: "ok", 2: "ok"})
+    held_in_create(launch, vast, 2)
+    result = launch.run({})
+    assert result.winner.machine_id == 1 and vast.creates == 2
+    only_winner_left(result, vast, journal)
+
+
+def test_a_late_failure_of_another_candidate_undoes_the_launch(tmp_path, monkeypatch):
+    # Machine 2's box is rented after machine 1 has won, and its id cannot be
+    # journalled. Seen during the race this aborts the launch; seen after, it
+    # must do the same.
+    launch, vast, journal = start(tmp_path, {1: "ok", 2: "ok"})
+    held_in_create(launch, vast, 2)
+    real = journal.append
+
+    def no_id_for_two(ev, **fields):
+        if ev == "created" and fields.get("seq") == 2:
+            raise OSError(5, "Input/output error")
+        real(ev, **fields)
+
+    monkeypatch.setattr(journal, "append", no_id_for_two)
+    with pytest.raises(OSError):
+        launch.run({})
+    assert vast.creates == 2 and journal.state().winner is None
+    nothing_left(vast, journal)
 
 
 def test_a_launch_off_the_main_thread_runs_without_touching_handlers(tmp_path):
@@ -597,7 +699,24 @@ def test_a_damaged_journal_is_torn_down_but_never_reported_clean(tmp_path):
     assert vast.ours() == [] and not journal.state().closed
 
 
-def test_second_process_on_a_state_directory_fails_fast(tmp_path):
+def test_a_dead_output_stream_does_not_stop_a_teardown(tmp_path, monkeypatch):
+    import builtins
+
+    result, vast, journal = run(tmp_path, {1: "ok"}, spare=0)
+    second = vast.create(1001, {"label": "x", "image": "img"})
+    journal.append("created", seq=7, instance_id=second)
+    assert len(vast.ours()) == 2
+
+    def closed_pipe(*a, **k):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(builtins, "print", closed_pipe)
+    left = L.down(vast, journal, FAST)
+    monkeypatch.undo()
+    assert left == 0 and vast.ours() == [] and journal.state().closed
+
+
+def test_taking_the_lock_twice_in_one_process_fails_fast(tmp_path):
     with state_lock(tmp_path):
         with pytest.raises(StateError, match="in use"):
             with state_lock(tmp_path):

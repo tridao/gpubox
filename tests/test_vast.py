@@ -289,3 +289,52 @@ def test_offers_we_cannot_identify_or_price_are_not_candidates(wire):
     wire({"offers": None})
     with pytest.raises(v.VastError):
         v.Vast("k").offers({})
+
+
+# ------------------------------------------------- round three: discriminators
+
+
+@pytest.mark.parametrize("success", [0, "false", None, [], "no"])
+def test_a_null_instance_under_a_bad_success_field_is_not_absence(wire, success):
+    wire({"success": success, "instances": None})
+    with pytest.raises(v.VastError):
+        v.Vast("k").instance(5)
+
+
+def test_the_two_real_shapes_of_absence_are_accepted(wire):
+    wire({"instances": None})  # what the provider sends today
+    assert v.Vast("k").instance(5) is None
+    wire({"success": True, "instances": None})
+    assert v.Vast("k").instance(5) is None
+
+
+@pytest.mark.parametrize("token", [[], 0, False, "", {}, 7])
+def test_only_null_ends_a_listing(wire, token):
+    # Anything else in the cursor's place is not "the last page".
+    wire({"success": True, "instances": [{"id": 1}], "next_token": token})
+    with pytest.raises(v.VastError):
+        v.Vast("k").instances()
+
+
+def test_a_listing_page_that_says_it_failed_is_an_error(wire):
+    for success in (False, 0, "true", None):
+        wire({"success": success, "instances": []})
+        with pytest.raises(v.VastError):
+            v.Vast("k").instances()
+    wire({"instances": [{"id": 3}], "next_token": None})  # no discriminator at all is fine
+    assert [r["id"] for r in v.Vast("k").instances()] == [3]
+
+
+@pytest.mark.parametrize(
+    "answer", [[], "ok", {"success": 0}, {"success": "true"}, {"success": None}]
+)
+def test_a_delete_is_done_only_if_the_answer_does_not_say_otherwise(wire, answer):
+    wire(answer)
+    with pytest.raises(v.VastError):
+        v.Vast("k").destroy(5)
+
+
+def test_offers_with_nonpositive_ids_are_not_candidates(wire):
+    good = {"id": 1, "machine_id": 2, "dph_total": 0.5}
+    wire({"offers": [good, {**good, "id": 0}, {**good, "machine_id": -4}, {**good, "id": True}]})
+    assert v.Vast("k").offers({}) == [good]

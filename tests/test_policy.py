@@ -215,3 +215,18 @@ def test_an_observation_that_could_not_be_written_is_not_counted(tmp_path):
     with pytest.raises(OSError):
         store.add(failed(5, 1, "cuda_init"))
     assert store.added == 0 and store.rows == []
+
+
+def test_a_timestamp_too_large_to_be_a_time_is_skipped_not_fatal(tmp_path):
+    path = tmp_path / "observations.jsonl"
+    path.write_text(
+        '{"machine_id": 5, "ts": 1%s, "kind": "failed_admission", "reason_code": "cuda_init"}\n'
+        % ("0" * 400)
+    )
+    assert pol.Observations(path).rows == []
+    assert pol.blocklist([{**failed(5, 1, "cuda_init"), "ts": 10**400}], 2) == {}
+
+
+def test_a_healthy_row_that_carries_a_reason_clears_nothing():
+    odd = {**obs("healthy", 5, 60), "reason_code": "busy_gpu"}
+    assert 5 in pol.blocklist([failed(5, 0, "busy_gpu"), odd], 120)

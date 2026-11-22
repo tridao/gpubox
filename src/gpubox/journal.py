@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import math
 import os
 import re
 import secrets
@@ -71,6 +70,11 @@ def label_namespace(label: str | None) -> str | None:
 
 def positive_int(value) -> bool:
     return type(value) is int and value > 0
+
+
+def finite_number(value) -> bool:
+    """A real number we can compute with. `10**400` is an int, but not one of these."""
+    return type(value) in (int, float) and -1e15 < value < 1e15
 
 
 @dataclass
@@ -171,9 +175,9 @@ class Journal:
         s = RunState()
         if not self.path.exists():
             return s
-        lines = self.path.read_text(errors="replace").splitlines()
+        lines = self.path.read_text(errors="replace").splitlines(keepends=True)
         events = []
-        for n, raw in enumerate(lines):
+        for raw in lines:
             try:
                 e = json.loads(raw)
                 if not isinstance(e, dict) or not isinstance(e.get("ev"), str):
@@ -181,22 +185,35 @@ class Journal:
                 events.append(e)
             except ValueError:
                 events.append(None)
+        bindings: dict[int, int] = {}  # attempt -> the id some record tied to it
         for n, e in enumerate(events):
             if e is None:
-                # Expected only as a write cut short by a crash: the last line,
-                # or one that the next append marked as a torn tail. Every
-                # record is synced before the step it authorizes, so such a
-                # fragment never hides a box: its intent, if any, is durable.
-                followed_by_marker = n + 1 < len(events) and (events[n + 1] or {}).get("ev") == (
-                    "torn_tail"
-                )
-                if n != len(events) - 1 and not followed_by_marker:
+                # Expected only as a write cut short by a crash: a last line
+                # without its newline, or one the next append marked as a torn
+                # tail. Every record is synced before the step it authorizes,
+                # so such a fragment never hides a box. A complete line that
+                # cannot be read is something else: damage.
+                last_and_unterminated = n == len(events) - 1 and not lines[n].endswith("\n")
+                marked = n + 1 < len(events) and (events[n + 1] or {}).get("ev") == "torn_tail"
+                if not (last_and_unterminated or marked):
                     s.problems.append(f"line {n + 1} is unreadable")
                 continue
             try:
-                self._apply(s, e)
+                if self._apply(s, e, bindings) == "stop":
+                    # What follows belongs to another run: none of it is ours to act on.
+                    s.problems.append(f"line {n + 1} starts another run; the rest is ignored")
+                    break
             except (KeyError, TypeError, ValueError) as exc:
                 s.problems.append(f"line {n + 1} ({e.get('ev')}) is malformed: {exc!r}")
+        for seq, instance_id in bindings.items():
+            a = s.attempts.get(seq)
+            if a is None or s.attempt_of(instance_id) is not None:
+                continue
+            if a.instance_id is None:
+                a.instance_id = instance_id
+            else:
+                # Two ids for one attempt: both were given to us, both are ours.
+                s.problems.append(f"attempt {seq} has ids {a.instance_id} and {instance_id}")
         for a in s.attempts.values():
             if a.instance_id is not None:
                 a.status = s.boxes[a.instance_id]
@@ -205,57 +222,78 @@ class Journal:
         return s
 
     @staticmethod
-    def _know(s: RunState, instance_id, status: str, seq=None) -> None:
-        """Learn an instance id, or advance its status. Ids are never dropped."""
+    def _know(s: RunState, bindings: dict, e: dict, status: str) -> None:
+        """Learn an instance id, or advance its status. Ids are never dropped.
+
+        The id is recorded before anything else about the record is looked at,
+        so a record whose other fields are damaged still yields its id.
+        """
+        instance_id = e["instance_id"]
         if not positive_int(instance_id):
             raise ValueError(f"bad instance id {instance_id!r}")
         order = ("created", "destroying", "destroyed")
         old = s.boxes.get(instance_id)
         if old is None or order.index(status) > order.index(old):
             s.boxes[instance_id] = status
-        a = s.attempts.get(seq) if seq is not None else None
-        if a is not None and s.attempt_of(instance_id) is None:
-            if a.instance_id is None:
-                a.instance_id = instance_id
-            else:
-                # Two ids for one attempt: both were given to us, both are ours.
-                s.problems.append(f"attempt {seq} has ids {a.instance_id} and {instance_id}")
+        seq = e.get("seq")
+        if seq is None:
+            return
+        if not positive_int(seq):
+            raise ValueError(f"bad attempt number {seq!r}")
+        if bindings.setdefault(seq, instance_id) != instance_id:
+            s.problems.append(f"attempt {seq} has ids {bindings[seq]} and {instance_id}")
 
     @classmethod
-    def _apply(cls, s: RunState, e: dict) -> None:
+    def _apply(cls, s: RunState, e: dict, bindings: dict):
         ev = e["ev"]
-        a = s.attempts.get(e.get("seq")) if "seq" in e else None
-        if ev == "run":
-            if s.run_id is None:
-                s.run_id, s.namespace, s.meta = str(e["run_id"]), str(e["namespace"]), e
-            elif e["run_id"] != s.run_id:
-                s.problems.append(f"second run header {e['run_id']!r}")
-        elif ev == "intent":
-            if a is None:
-                ts = e.get("ts")
-                s.attempts[int(e["seq"])] = AttemptState(
-                    seq=int(e["seq"]),
-                    label=str(e["label"]),
-                    ts=float(ts) if type(ts) in (int, float) and math.isfinite(ts) else None,
-                    machine_id=e.get("machine_id"),
-                    host_id=e.get("host_id"),
-                    dph=e.get("dph") or 0.0,
-                )
-        elif ev in ("refused", "unknown", "abandoned"):
-            if a is None:
-                raise ValueError("no such attempt")
-            allowed = ("intent",) if ev != "abandoned" else OPEN
-            if a.instance_id is None and a.status in allowed:
-                a.status = ev
-        elif ev in ("created", "destroying", "destroyed"):
-            cls._know(s, e["instance_id"], ev, e.get("seq"))
-        elif ev == "winner":
-            cls._know(s, e["instance_id"], "created", e.get("seq"))
+        if ev in ("created", "destroying", "destroyed"):
+            return cls._know(s, bindings, e, ev)
+        if ev == "winner":
+            cls._know(s, bindings, e, "created")
             s.winner = {k: e[k] for k in ("seq", "instance_id", "host", "port")}
-        elif ev == "closed":
-            s.closed = True
-        elif ev != "torn_tail":
-            s.problems.append(f"unknown event {ev!r}")
+            return None
+        if ev == "run":
+            run_id = e["run_id"]
+            if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+                raise ValueError(f"bad run id {run_id!r}")
+            if s.run_id is None:
+                s.run_id, s.namespace, s.meta = run_id, str(e["namespace"]), e
+            elif run_id != s.run_id:
+                return "stop"
+            return None
+        if ev in ("closed", "torn_tail"):
+            s.closed = s.closed or ev == "closed"
+            return None
+        if ev not in ("intent", "refused", "unknown", "abandoned"):
+            raise ValueError("unknown event")
+        seq = e["seq"]
+        if not positive_int(seq):
+            raise ValueError(f"bad attempt number {seq!r}")
+        a = s.attempts.get(seq)
+        if ev == "intent":
+            label = e["label"]
+            if not isinstance(label, str):
+                raise ValueError(f"bad label {label!r}")
+            if a is not None:
+                if (a.label, a.machine_id) != (label, e.get("machine_id")):
+                    raise ValueError("a second, different intent for the same attempt")
+                return None
+            ts = e.get("ts")
+            s.attempts[seq] = AttemptState(
+                seq=seq,
+                label=label,
+                ts=float(ts) if finite_number(ts) else None,
+                machine_id=e.get("machine_id"),
+                host_id=e.get("host_id"),
+                dph=e.get("dph") or 0.0,
+            )
+            return None
+        if a is None:
+            raise ValueError("no such attempt")
+        allowed = ("intent",) if ev != "abandoned" else OPEN
+        if a.instance_id is None and seq not in bindings and a.status in allowed:
+            a.status = ev
+        return None
 
     def rotate(self) -> None:
         """Move a finished run's journal aside so the directory can host a new run."""

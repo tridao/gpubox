@@ -30,7 +30,7 @@ from pathlib import Path
 from . import policy as pol
 from . import vast as v
 from .gate import GATE_VERSION, Prober
-from .journal import Journal, StateError, new_run_id, state_lock
+from .journal import RUN_ID, Journal, StateError, new_run_id, state_lock
 from .launch import (
     ConfigError,
     Launch,
@@ -137,6 +137,8 @@ def key_dir(state_dir: Path, run_id: str) -> Path:
     """Where a run keeps its SSH key and known hosts. Never shared between runs:
     a command still holding an earlier run's endpoint must not be able to log
     in to a later run's box that happens to get the same address."""
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        raise StateError(f"not a run id: {run_id!r}")  # it becomes part of a path
     return Path(state_dir) / "keys" / run_id
 
 
@@ -218,7 +220,9 @@ def cmd_run(args) -> int:
     journal = Journal(state_dir)
     state = journal.state()
     w = state.winner
-    if not w or state.boxes.get(w["instance_id"]) != "created":
+    if state.problems:
+        raise StateError(f"the journal in {state_dir} is damaged ({state.problems[0]})")
+    if not state.run_id or not w or state.boxes.get(w["instance_id"]) != "created":
         raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
     box = state.attempt_of(w["instance_id"])
     exports = []
@@ -232,10 +236,11 @@ def cmd_run(args) -> int:
     # swallow it from stdin and a second `run` cannot overwrite it.
     remote = 'f=$(mktemp /tmp/gpubox-script.XXXXXX) && cat > "$f" && exec bash "$f" </dev/null'
     # The key belongs to this run: it is gone once the run is torn down.
-    keys = key_dir(state_dir, state.run_id)
-    if not (keys / "id_ed25519").exists():
-        raise StateError(f"run {state.run_id} has no SSH key in {state_dir} (torn down?)")
-    argv = Prober(keys).ssh((w["host"], w["port"]), remote)
+    try:
+        prober = Prober(key_dir(state_dir, state.run_id), create=False)
+    except FileNotFoundError:
+        raise StateError(f"run {state.run_id} has no SSH key in {state_dir} (torn down?)") from None
+    argv = prober.ssh((w["host"], w["port"]), remote)
     try:
         rc = subprocess.run(argv, input=script.encode(), timeout=args.timeout_min * 60).returncode
     except subprocess.TimeoutExpired:
@@ -289,7 +294,8 @@ def cmd_down(args) -> int:
         run_id = journal.state().run_id
         left = down(v.Vast(api_key(args)), journal, Policy(), abandon_unseen=args.abandon_unseen)
         if not left and run_id:
-            # Nothing of this run is left to log in to.
+            # Nothing of this run is left to log in to. (A journal whose header
+            # is damaged has no run id, and nothing is removed for it.)
             shutil.rmtree(key_dir(state_dir, run_id), ignore_errors=True)
     if left:
         log(f"::error::{left} thing(s) unresolved; see above, then run `gpubox down` again")

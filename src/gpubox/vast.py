@@ -105,7 +105,9 @@ class Vast:
             for o in offers
             if isinstance(o, dict)
             and type(o.get("id")) is int
+            and o["id"] > 0
             and type(o.get("machine_id")) is int
+            and o["machine_id"] > 0
             and type(o.get("dph_total")) in (int, float)
             and 0 < o["dph_total"] < float("inf")
         ]
@@ -144,7 +146,9 @@ class Vast:
             if exc.status == 404:
                 return None
             raise
-        if isinstance(data, dict) and "instances" in data and data.get("success") is not False:
+        # The real answers are {"instances": null} and {"instances": {...}}; a
+        # `success` field, if there is one, must say true.
+        if isinstance(data, dict) and "instances" in data and data.get("success", True) is True:
             row = data["instances"]
             if row is None:
                 return None
@@ -164,7 +168,7 @@ class Vast:
         for _ in range(MAX_PAGES):
             data = self._call("GET", "/v1/instances/", query=query)
             page = data.get("instances") if isinstance(data, dict) else None
-            if not isinstance(page, list) or data.get("success") is False:
+            if not isinstance(page, list) or data.get("success", True) is not True:
                 raise VastError(
                     200, f"unexpected answer to the instance listing: {str(data)[:200]}"
                 )
@@ -175,9 +179,9 @@ class Vast:
                     )
             rows.extend(page)
             token = data.get("next_token")
-            if not token:
+            if token is None:  # how the provider marks the last page
                 return rows
-            if not isinstance(token, str) or token in seen_tokens:
+            if not isinstance(token, str) or not token or token in seen_tokens:
                 raise VastError(200, f"instance listing does not advance (token {token!r})")
             seen_tokens.add(token)
             query["after_token"] = token
@@ -191,7 +195,7 @@ class Vast:
             if exc.status != 404:
                 raise
             return
-        if isinstance(data, dict) and data.get("success") is False:
+        if not isinstance(data, dict) or data.get("success", True) is not True:
             raise VastError(200, f"destroy of instance {instance_id} refused: {str(data)[:200]}")
 
 

@@ -17,6 +17,7 @@ FAST = Policy(
     startup_timeout=0.3,
     overall_timeout=5,
     cleanup_reserve=0,
+    image_grace=2,
     reconcile_timeout=0.15,
     confirm_timeout=0.15,
     confirm_poll=0.01,
@@ -67,6 +68,7 @@ class FakeVast:
         self.in_gate = {}  # machine -> Event, set when its gate starts
         self.list_fails = 0  # number of listing calls that raise first
         self.on_destroy = None  # called with the instance id before each destroy
+        self.before_create = None  # called with the machine before the provider rents
         self.queries, self.payloads = [], []  # what was asked of the provider
         self.lock = threading.Lock()
         for i, label in enumerate(FOREIGN):
@@ -90,6 +92,8 @@ class FakeVast:
             raise v.CreateRefused(400, "offer no longer available")
         if kind == "ghost":
             raise v.CreateUnknown(0, "timed out")
+        if self.before_create:
+            self.before_create(machine)
         self.payloads.append(payload)
         with self.lock:
             iid, self._next = self._next, self._next + 1
@@ -228,8 +232,8 @@ class FakeProber:
         kind = self.vast.behaviour[machine]
         self.wants.append(spec)
         self.vast.gate_started(machine).set()
-        if kind == "hold":
-            self.vast.release.wait(5)
+        if kind == "hold" and not self.vast.release.wait(5):
+            return False, None, "the test never released this gate", {}
         if kind == "bad_gpu":
             return False, "cuda_init", "CUDA unavailable", {}
         if kind == "busy":

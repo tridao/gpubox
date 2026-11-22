@@ -253,3 +253,89 @@ def test_a_run_id_cannot_name_a_file_outside_the_state_directory(tmp_path):
     )
     with pytest.raises(StateError, match="not a run id"):
         Journal(state, run_id="x/../../elsewhere")
+
+
+# --------------------------------------------------------- round three: damage
+
+
+def raw(j, *lines):
+    with open(j.path, "a") as f:
+        f.write("".join(line + "\n" for line in lines))
+
+
+def test_a_complete_but_unreadable_last_line_is_damage_not_a_torn_tail(tmp_path):
+    # A write cut short by a crash has no newline. This one does: it was
+    # written whole and has since been damaged, and may have been an intent.
+    j = new_run(tmp_path, intents=0)
+    raw(j, '{"ev": "intent", "seq": 1, "lab')
+    assert j.state().problems
+    with pytest.raises(StateError):
+        j.rotate()
+
+
+def test_an_id_arriving_before_its_intent_is_bound_to_it(tmp_path):
+    j = Journal(tmp_path)
+    j.append("run", run_id="ns.n.0123abcd", namespace="ns", image="img")
+    j.append("created", seq=1, instance_id=10)
+    j.append("intent", seq=1, label="l1", offer_id=1, machine_id=1, host_id=1, dph=1)
+    s = j.state()
+    assert view(j) == ({1: ("created", 10)}, {10: "created"})
+    assert not s.open_attempts()  # the intent is not left looking for its box
+
+
+@pytest.mark.parametrize("seq", ["[1]", '{"a": 1}', '"1"', "true", "1.0", "0", "-1"])
+def test_a_record_with_a_bad_attempt_number_still_yields_its_id(tmp_path, seq):
+    j = new_run(tmp_path)
+    raw(j, '{"ev": "created", "seq": %s, "instance_id": 10}' % seq)
+    s = j.state()
+    assert s.live_ids() == [10] and s.problems
+    assert [a.status for a in s.open_attempts()] == ["intent"]  # and attempt 1 is untouched
+
+
+@pytest.mark.parametrize("ev", ["refused", "unknown", "abandoned"])
+def test_true_is_not_attempt_one(tmp_path, ev):
+    j = new_run(tmp_path)
+    raw(j, '{"ev": "%s", "seq": true}' % ev)
+    s = j.state()
+    assert [a.status for a in s.open_attempts()] == ["intent"] and s.problems
+
+
+def test_two_intents_for_one_attempt_that_disagree_are_a_problem(tmp_path):
+    j = new_run(tmp_path)
+    j.append("intent", seq=1, label="another-label", offer_id=1, machine_id=1, host_id=1, dph=1)
+    s = j.state()
+    assert s.problems and s.attempts[1].label == "l1"
+    (tmp_path / "same").mkdir()
+    j2 = new_run(tmp_path / "same")
+    j2.append("intent", seq=1, label="l1", offer_id=1, machine_id=1, host_id=1, dph=1)
+    assert not j2.state().problems  # an exact repeat is harmless
+
+
+def test_a_second_run_in_the_same_file_is_not_this_run(tmp_path):
+    j = new_run(tmp_path)
+    j.append("created", seq=1, instance_id=10)
+    raw(
+        j,
+        '{"ev": "run", "run_id": "ns.other.89abcdef", "namespace": "ns"}',
+        '{"ev": "created", "seq": 1, "instance_id": 77}',
+    )
+    s = j.state()
+    assert s.run_id == "ns.n.0123abcd" and s.boxes == {10: "created"}  # 77 is not ours to act on
+    assert s.problems and not s.closed
+
+
+@pytest.mark.parametrize(
+    "run_id", ['"../../outside"', '"/etc"', '""', "7", "null", '["a.b.0123abcd"]']
+)
+def test_a_header_with_a_bad_run_id_names_no_run(tmp_path, run_id):
+    j = Journal(tmp_path)
+    raw(j, '{"ev": "run", "run_id": %s, "namespace": "ns"}' % run_id)
+    s = j.state()
+    assert s.run_id is None and s.problems
+
+
+def test_a_timestamp_too_large_to_be_a_time_is_unusable_not_fatal(tmp_path):
+    j = Journal(tmp_path)
+    j.append("run", run_id="ns.n.0123abcd", namespace="ns", image="img")
+    raw(j, '{"ev": "intent", "seq": 1, "label": "l1", "ts": 1%s}' % ("0" * 400))
+    assert j.state().attempts[1].ts is None

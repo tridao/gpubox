@@ -33,7 +33,7 @@ def world(tmp_path, monkeypatch):
     vast = FakeVast({1: "ok", 2: "ok"})
     vast.key_dirs, vast.probers = [], []
 
-    def prober(key_dir):
+    def prober(key_dir, create=True):
         key_dir.mkdir(parents=True, exist_ok=True)
         (key_dir / "id_ed25519").touch()
         vast.key_dirs.append(key_dir)
@@ -59,7 +59,9 @@ def fake_ssh(monkeypatch, rc=0, timeout=False, before=None):
     calls = []
 
     class FakeSsh:
-        def __init__(self, key_dir):
+        def __init__(self, key_dir, create=True):
+            if not create and not (key_dir / "id_ed25519").exists():
+                raise FileNotFoundError(key_dir)
             self.key_dir = key_dir
 
         def ssh(self, ep, remote):
@@ -301,6 +303,25 @@ def test_run_is_refused_once_the_box_is_destroyed_but_the_run_is_not_over(
     assert (tmp_path / "keys").exists()
     calls = fake_ssh(monkeypatch)
     assert run(script(tmp_path)) == cli.EXIT_CONFIG and not calls
+
+
+def test_run_refuses_a_damaged_journal(world, tmp_path, monkeypatch):
+    _, run = world
+    assert run(UP) == 0
+    journal = tmp_path / "journal.jsonl"
+    lines = journal.read_text().splitlines()
+    journal.write_text("\n".join([lines[0], "garbage", *lines[1:]]) + "\n")
+    calls = fake_ssh(monkeypatch)
+    assert run(script(tmp_path)) == cli.EXIT_CONFIG and not calls
+
+
+@pytest.mark.parametrize("run_id", ["../../outside", "/etc", "", "a.b.c", None, 7])
+def test_a_run_id_is_checked_before_it_becomes_part_of_a_path(tmp_path, run_id):
+    with pytest.raises(cli.StateError):
+        cli.key_dir(tmp_path, run_id)
+    assert (
+        cli.key_dir(tmp_path, "quack-ci.77-1.0123abcd") == tmp_path / "keys/quack-ci.77-1.0123abcd"
+    )
 
 
 def test_run_rejects_malformed_env(world, tmp_path):

@@ -138,10 +138,14 @@ def _clean_report(raw: dict) -> dict:
 class Prober:
     """SSH to candidate boxes with a throwaway key that belongs to one run."""
 
-    def __init__(self, key_dir: Path):
+    def __init__(self, key_dir: Path, create: bool = True):
+        """`create=False` only loads: a run that has been torn down has no key,
+        and looking for it must not bring one back."""
         self.key = Path(key_dir) / "id_ed25519"
         self.known_hosts = Path(key_dir) / "known_hosts"
         if not self.key.exists():
+            if not create:
+                raise FileNotFoundError(f"no SSH key in {key_dir}")
             Path(key_dir).mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpubox", "-f", self.key],
@@ -174,7 +178,11 @@ class Prober:
     def ready(self, ep: tuple[str, int]) -> tuple[bool, str]:
         try:
             r = subprocess.run(
-                self.ssh(ep, "true", connect_timeout=8), capture_output=True, text=True, timeout=25
+                self.ssh(ep, "true", connect_timeout=8),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=25,
             )
         except subprocess.TimeoutExpired:
             return False, "ssh timed out"
@@ -200,20 +208,23 @@ class Prober:
                 self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want))),
                 input=GATE_SCRIPT,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",  # whatever the box prints, we get a string
                 timeout=240,
             )
         except subprocess.TimeoutExpired:
-            return False, "unreachable", "health gate hung for 240s", {}
+            return False, "unreachable", "health gate hung for 240s", _clean_report({})
         if r.returncode == 255:
-            return False, "unreachable", f"ssh dropped during gate: {r.stderr.strip()[-200:]}", {}
+            detail = f"ssh dropped during gate: {r.stderr.strip()[-200:]}"
+            return False, "unreachable", detail, _clean_report({})
         try:
             raw = json.loads(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             raw = None
         if r.returncode != 0 or not isinstance(raw, dict) or type(raw.get("ok")) is not bool:
             tail = (r.stderr or r.stdout).strip()[-300:]
-            return False, None, f"health gate gave no verdict (rc={r.returncode}): {tail}", {}
+            detail = f"health gate gave no verdict (rc={r.returncode}): {tail}"
+            return False, None, detail, _clean_report({})
         report = _clean_report(raw)
         if raw["ok"]:
             return True, None, "", report

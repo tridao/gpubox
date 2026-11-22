@@ -9,6 +9,11 @@ rented, the candidate included.
 Signals do not interrupt the transaction. SIGINT and SIGTERM set a flag; the
 loop notices it, rolls back, and only then lets the interruption through.
 
+The box is kept only if all of this holds when the race is over: a candidate
+passed the gate; every other box whose id we know is confirmed gone; no
+worker ended with an error; no signal arrived. The one thing that may stay
+open beside a winner is a create that never gave us an id (see `down`).
+
 An attempt keeps its slot until its box is confirmed destroyed or its create
 was explicitly refused. So a box whose delete has not been confirmed, or a
 create whose outcome is unknown, blocks further renting instead of being
@@ -40,8 +45,12 @@ CLOCK_SKEW = 30
 
 
 def log(msg: str) -> None:
-    with _print_lock:
-        print(msg, flush=True)
+    """Say something. Never raises: a closed pipe must not stop a teardown."""
+    try:
+        with _print_lock:
+            print(msg, flush=True)
+    except Exception:
+        pass
 
 
 class ConfigError(RuntimeError):
@@ -75,6 +84,7 @@ class Policy:
     cleanup_reserve: float = 60  # stop renting this long before overall_timeout
     poll: float = 5
     tick: float = 0.5  # how often the race loop looks at the stop flag
+    image_grace: float = 90  # after one host says the image cannot be pulled, how long others get
     reconcile_timeout: float = 60  # how long to look for a box after an unknown create
     settle: float = 300  # youngest age at which the operator may abandon an unseen create
     confirm_timeout: float = 30  # how long to wait for a delete to show
@@ -214,14 +224,17 @@ class Launch:
     def __init__(self, vast, spec: Spec, policy: Policy, journal: Journal, prober, run_id: str):
         self.vast, self.spec, self.policy = vast, spec, policy
         self.journal, self.prober, self.run_id = journal, prober, run_id
-        self.stop = threading.Event()  # tells workers to give up
-        self.cancelled = False  # a signal asked us to stop
+        self.stop = threading.Event()  # tells workers to give up; set by ordinary code only
+        self.cancelled = False  # a signal asked us to stop; set by the handler only
         self.attempts: dict[int, Attempt] = {}
         self.rent_until = math.inf  # monotonic; no create is sent after this
 
     def _cancel(self, signum) -> None:
+        # A signal handler runs on the main thread between two bytecodes of
+        # whatever that thread was doing, possibly `stop.set()` itself, whose
+        # lock is not reentrant. So the handler only assigns; the race loop
+        # looks at this flag every `tick` and stops the workers itself.
         self.cancelled = True
-        self.stop.set()
 
     # ------------------------------------------------------------- one attempt
 
@@ -231,7 +244,7 @@ class Launch:
         elapsed = lambda: round(time.monotonic() - t0, 1)
         tag = f"[m{a.machine_id} a{a.seq}]"
         payload = v.create_payload(spec, a.label, self.prober.pubkey)
-        if self.stop.is_set() or time.monotonic() >= self.rent_until:
+        if self.stop.is_set() or self.cancelled or time.monotonic() >= self.rent_until:
             # Nothing was sent, so there is certainly no box.
             a.state, a.detail = "refused", "cancelled before create"
             _note(self.journal, "refused", seq=a.seq)
@@ -348,8 +361,13 @@ class Launch:
         except Exception as exc:
             log(f"WARNING: cleaning up instance {a.instance_id}: {exc!r}")
 
-    def _cleanup(self, pool, keep: Attempt | None) -> None:
-        """Destroy every box of this launch except `keep`, and wait for the workers. Never raises."""
+    def _cleanup(self, pool, keep: Attempt | None) -> bool:
+        """Destroy every box of this launch except `keep`, and wait for the workers.
+
+        Never raises. Returns False if the workers could not be waited for, in
+        which case nothing may be concluded about what they rented.
+        """
+        joined = True
         self.stop.set()
         others = [a for a in self.attempts.values() if a is not keep]
         for a in others:  # unblock threads waiting on SSH to these boxes
@@ -361,10 +379,12 @@ class Launch:
         try:
             pool.shutdown(wait=True)
         except Exception as exc:
+            joined = False
             log(f"WARNING: waiting for workers: {exc!r}")
         for a in others:  # includes boxes created or found after the race was decided
             if a.state in ("created", "destroying"):
                 self._destroy(a)
+        return joined
 
     # ---------------------------------------------------------------- the race
 
@@ -399,7 +419,8 @@ class Launch:
             f"up to {policy.max_attempts} attempts"
         )
         pool = ThreadPoolExecutor(max_workers=policy.max_live, thread_name_prefix="gpubox")
-        pending, judged, candidate, error = set(), [], None, None
+        pending, judged, candidate, error, committed = set(), [], None, None, False
+        owner: dict = {}  # future -> its attempt
 
         def live() -> int:
             return sum(a.state in LIVE for a in self.attempts.values())
@@ -411,6 +432,7 @@ class Launch:
                 and offers
                 and time.monotonic() < self.rent_until
                 and not self.stop.is_set()
+                and not self.cancelled
             ):
                 o = offers.popleft()
                 seq = len(self.attempts) + 1
@@ -435,73 +457,99 @@ class Launch:
                     dph=a.dph,
                 )
                 self.attempts[seq] = a
-                pending.add(pool.submit(self._bring_up, a))
+                fut = pool.submit(self._bring_up, a)
+                owner[fut] = a
+                pending.add(fut)
 
+        image_error = None  # a host said the image cannot be pulled
+        give_up_at = self.rent_until
         try:
             fill()
             while pending and candidate is None and not self.cancelled:
-                remaining = self.rent_until - time.monotonic()
+                remaining = give_up_at - time.monotonic()
                 if remaining <= 0:
-                    log(f"giving up: no healthy box within {policy.overall_timeout:g}s")
+                    if image_error is None:
+                        log(f"giving up: no healthy box within {policy.overall_timeout:g}s")
                     break
                 done, _ = wait(
                     pending, timeout=min(remaining, policy.tick), return_when=FIRST_COMPLETED
                 )
                 pending.difference_update(done)
-                finished, errors = [], []
+                finished = []
                 for fut in done:
                     exc = fut.exception()
-                    errors.append(exc) if exc else finished.append(fut.result())
-                # The order in which this batch is looked at must not matter.
+                    if exc is None:
+                        finished.append(fut.result())
+                    elif isinstance(exc, ConfigError):
+                        if image_error is None:
+                            # Usually the image really is missing, and waiting
+                            # for the others only costs money: give them a
+                            # short while to prove it was this host's problem.
+                            image_error = exc
+                            give_up_at = min(give_up_at, time.monotonic() + policy.image_grace)
+                        if owner[fut].state == "created":
+                            self._destroy(owner[fut])  # it will never come up
+                    else:
+                        raise exc  # the journal, or a bug: stop and roll back
                 for a in sorted(finished, key=lambda a: a.seq):
                     judged.append(a)
                     tag = f"[m{a.machine_id} a{a.seq}]"
                     if a.ok:
                         log(f"  {tag} healthy after {a.timings['healthy']:.0f}s")
+                        candidate = candidate or a
                     else:
                         log(f"  {tag} failed ({a.reason or 'not blamed'}): {a.detail}")
-                fatal = [e for e in errors if not isinstance(e, ConfigError)]
-                if fatal:
-                    raise fatal[0]  # the journal, or a bug: stop and roll back
-                healthy = [a for a in sorted(finished, key=lambda a: a.seq) if a.ok]
-                if healthy:
-                    # A healthy box proves the image can be pulled, so another
-                    # host's "cannot pull" is that host's problem, not ours.
-                    candidate = healthy[0]
-                    for exc in errors:
-                        log(f"  ignored, since a box is healthy: {exc}")
-                    break
-                if errors:
-                    raise errors[0]
-                for a in finished:
-                    if a.state == "created":
-                        self._destroy(a)  # stop paying, and free its slot, now
-                fill()
+                        if a.state == "created":
+                            self._destroy(a)  # stop paying, and free its slot, now
+                if candidate is None and image_error is None:
+                    # After an image error nothing more is rented, but boxes
+                    # already rented may still come up: a healthy one proves the
+                    # image can be pulled and the error was that host's own.
+                    fill()
+            if candidate is None and image_error is not None:
+                raise image_error
+            if candidate is not None and image_error is not None:
+                log(f"  ignored, since a box is healthy: {image_error}")
         except BaseException as exc:
             error = exc
 
-        # One exit path. Nothing is kept unless everything below succeeds.
-        keep = candidate  # set only by the last, error-free pass of the loop
-        self._cleanup(pool, keep)
-        for fut in pending:
-            if fut.done() and fut.exception() and not isinstance(fut.exception(), ConfigError):
-                log(f"WARNING: a cancelled candidate ended with {fut.exception()!r}")
-        if keep is not None and self.cancelled:
+        # One exit path. The candidate is kept only if everything below holds.
+        keep = candidate  # set only by an error-free pass of the loop
+        joined = self._cleanup(pool, keep)
+        if keep is not None and error is None:
+            late = [f.exception() for f in pending if f.done() and f.exception() is not None]
+            late = [e for e in late if not isinstance(e, ConfigError)]
+            stuck = [
+                a
+                for a in self.attempts.values()
+                if a is not keep and a.instance_id and a.state != "destroyed"
+            ]
+            if late:
+                error = late[0]  # e.g. a loser whose id could not be journalled
+            elif not joined or stuck or self.cancelled:
+                why = (
+                    "a signal arrived"
+                    if self.cancelled
+                    else "the workers could not be waited for"
+                    if not joined
+                    else f"instance {stuck[0].instance_id} is not confirmed destroyed"
+                )
+                log(f"  not keeping instance {keep.instance_id}: {why}")
+            else:
+                try:
+                    self.journal.append(
+                        "winner",
+                        seq=keep.seq,
+                        instance_id=keep.instance_id,
+                        host=keep.endpoint[0],
+                        port=keep.endpoint[1],
+                    )
+                    committed = True
+                except OSError as exc:
+                    error = exc
+        if keep is not None and not committed:
             self._destroy(keep)
             keep = None
-        if keep is not None:
-            try:
-                self.journal.append(
-                    "winner",
-                    seq=keep.seq,
-                    instance_id=keep.instance_id,
-                    host=keep.endpoint[0],
-                    port=keep.endpoint[1],
-                )
-            except OSError as exc:
-                error = exc
-                self._destroy(keep)
-                keep = None
 
         for a in self.attempts.values():
             if a not in judged:
