@@ -39,7 +39,7 @@ Each of these is false sometimes. The right-hand column is what happens then.
 | A3 | The state directory is sound. | It is written by one process under a lock; consistency checks on it found nothing in practice. | An unreadable state file: `down --run-id` works from the tag; the box's address and key are lost. |
 | A4 | The listing shows a box once its create has returned. | 65 of 65 boxes in `experiments/pull_time` did. | `down` could miss a box whose id it does not hold. It lists twice, a few seconds apart, to cover a short lag; beyond that, A2. |
 | A5 | The provider does not give an instance id to a second box. | `down` deletes the ids in the state file without looking at their tags, so that it reaches a box whatever its label. | A reused id would be someone else's box, deleted. |
-| A6 | Every holder of a reputation-store token is trusted (today: Tri's laptop and QuACK CI). | Opaque source ids, a revocation list and resumable reads guarded against a hostile or leaked token and a large table; neither is the case. | A leaked token can mark up to 500 machines a day failed for everyone (2 hours to 14 days each). Remove its secret, redeploy, and delete its rows. |
+| A6 | Every holder of a reputation-store token is trusted (today: Tri's laptop and QuACK CI). | Opaque source ids, a revocation list and resumable reads guarded against a hostile or leaked token and a large table; neither is the case. | A leaked token can mark up to 500 machines a day failed for everyone (2 hours to 14 days each). Delete its secret (`cf workers secrets delete`; a redeploy keeps it) and its rows. |
 
 Not assumed, because being wrong is expensive or the code is small:
 
@@ -205,7 +205,11 @@ source: a machine is blocked if any source's rows block it, and a source's
   replaces `observations.jsonl.remote` whole; a failed read leaves the
   previous one in use.
 - Rows to send wait in `observations.jsonl.outbox` until the store has them;
-  a resend is harmless (the row id is unique).
+  a resend is harmless (the row id is unique). The store times a row from
+  when it arrives, so a failure whose block is already over is not sent.
+- A row of ours that the store has is judged as the store has it, under the
+  source that sent it: CI runners share one token, and one runner's local
+  copy must not outvote what the same source reported later.
 - The store limits each source to 500 rows a day and one failure per machine
   per hour, and deletes rows after 90 days.
 

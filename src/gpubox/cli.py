@@ -171,12 +171,20 @@ def share(shared: st.Shared, what: str, **kw) -> None:
 
 
 def known_rows(obs: pol.Observations, shared: st.Shared) -> list[dict]:
-    """This client's own rows, then what the store said others saw."""
+    """This client's own rows, then what the store said everyone saw.
+
+    A row of ours that the store has is taken as the store has it, under the
+    source that sent it. Several CI runners share one token: that way a
+    machine one of them saw fail and another then saw recover is judged as
+    one source's word, not kept blocked by the first runner's local copy.
+    """
     try:
-        return [*obs.rows, *shared.remote_rows()]
+        remote = shared.remote_rows()
     except Exception as exc:
         log(f"WARNING: reputation store not used: {type(exc).__name__}")
-        return list(obs.rows)
+        remote = []
+    echoed = {r["id"] for r in remote}
+    return [*(r for r in obs.rows if r.get("id") not in echoed), *remote]
 
 
 def advisory(what: str, fn, *a, **kw) -> None:
@@ -387,12 +395,12 @@ def cmd_run(args) -> int:
                 **extra,
             )
             pol.Observations(observations_path(args)).add(row)
-            github_output(observations_changed="true")
             shared = open_shared(args)
             shared.queue([row])
             share(shared, "after the run", pull=False)
 
         advisory("recording the observation", record)
+        advisory("writing outputs", github_output, observations_changed="true")
     return EXIT_INFRA
 
 

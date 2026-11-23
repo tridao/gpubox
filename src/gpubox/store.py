@@ -192,6 +192,18 @@ def remote_row(row, now: float) -> dict | None:
         return None
 
 
+def expired(row, now: float) -> bool:
+    """A failure whose block is over already. The store times a row from when it
+    receives it, so sending this late would block the machine again, for everyone."""
+    reason, ts = row.get("reason_code"), row.get("ts")
+    return (
+        row.get("kind") != "healthy"
+        and reason in REASONS
+        and type(ts) in (int, float)
+        and ts + REASONS[reason][1] <= now
+    )
+
+
 def from_env(environ=os.environ) -> Store | None:
     """The store named by GPUBOX_STORE_URL and GPUBOX_STORE_TOKEN, if both are set."""
     url, token = environ.get("GPUBOX_STORE_URL"), environ.get("GPUBOX_STORE_TOKEN")
@@ -315,7 +327,10 @@ class Shared:
                 raise StoreError("no time left for the store in this command")
             with self._locked(min(LOCK_WAIT, self._left)):
                 waiting = _read_lines(self.outbox)
-            result = {"acked": [], "dropped": [], "read": [], "errors": []}
+            now = time.time()
+            late = [r.get("id") for r in waiting if expired(r, now)]
+            waiting = [r for r in waiting if not expired(r, now)]
+            result = {"acked": [], "dropped": late, "read": [], "errors": []}
             worker = threading.Thread(
                 target=self._exchange, args=(waiting, pull, deadline, result), daemon=True
             )
@@ -360,6 +375,10 @@ class Shared:
         now = time.time()
         gone = {i for i in [*result["acked"], *result["dropped"]] if isinstance(i, str)}
         read = None
+        if not gone and not result["read"]:  # no file to change: no lock to wait for
+            if result["errors"]:
+                raise StoreError("; ".join(result["errors"]))
+            return "sent 0"
         with self._locked():
             if gone:
                 # Remove what was dealt with from the queue as it is now: rows

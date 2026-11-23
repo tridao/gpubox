@@ -60,7 +60,7 @@ async function call(method, path, { token = LAPTOP, body, raw } = {}) {
   return { status: res.status, json: await res.json() };
 }
 const post = (observations, opts) => call("POST", "/v1/observations", { body: { observations }, ...opts });
-const list = (query = "", opts) => call("GET", `/v1/observations?provider=vast${query}`, opts);
+const list = (opts) => call("GET", "/v1/observations?provider=vast", opts);
 const stored = async (where = "1=1") =>
   (await db.prepare(`SELECT * FROM observations WHERE ${where} ORDER BY seq`).all()).results;
 const seed = (row) =>
@@ -77,7 +77,7 @@ test("health needs no token and says nothing", async () => {
 test("anything else needs a known token", async () => {
   // Other secrets of the Worker, however long, are not tokens.
   for (const token of [null, "", "wrong", "short", NOT_A_TOKEN, LAPTOP + "x", LAPTOP.slice(1), "x".repeat(700)]) {
-    assert.equal((await list("", { token })).status, 401, `token ${String(token).slice(0, 12)}`);
+    assert.equal((await list({ token })).status, 401, `token ${String(token).slice(0, 12)}`);
     assert.equal((await post([obs()], { token })).status, 401);
   }
   assert.equal((await stored()).length, 0);

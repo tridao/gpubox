@@ -295,6 +295,54 @@ def test_a_failed_send_does_not_stop_the_read(tmp_path, remote):
     assert [r["machine_id"] for r in s.remote_rows()] == [9] and outbox(s) == [1]
 
 
+def test_a_failure_whose_block_is_over_is_not_sent_late(tmp_path, remote):
+    # Queued while the store was out of reach. The store times rows from when it
+    # gets them: sent now, the busy GPU of three hours ago would block for two more.
+    now = time.time()
+    s = shared(tmp_path, remote)
+    s.queue([
+        failed(1, reason="busy_gpu", now=now - 3 * H),
+        failed(2, reason="cuda_init", now=now - 3 * H),
+        healthy(3, now=now - 3 * H),
+    ])  # fmt: skip
+    assert s.sync(pull=False) == "sent 2"
+    assert sorted(r["machine_id"] for r in remote.rows) == [2, 3] and outbox(s) == []
+
+
+def test_with_nothing_to_write_down_no_lock_is_waited_for(tmp_path, remote):
+    import fcntl
+
+    s = shared(tmp_path, remote)
+    nothing = {"acked": [], "dropped": [], "read": [], "errors": []}
+    with open(s._lockfile, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # another gpubox process, writing
+        t0 = time.monotonic()
+        assert s._apply(nothing) == "sent 0"
+        with pytest.raises(st.StoreError, match="HTTP 500"):
+            s._apply({**nothing, "errors": ["POST /v1/observations: HTTP 500"]})
+        assert time.monotonic() - t0 < 0.5
+
+
+def test_runners_that_share_a_token_are_one_source(tmp_path, remote):
+    # CI runner A saw machine 7's GPU busy and reported it; runner B, same token,
+    # then saw it work. A's own copy of its report must not outvote the store.
+    now = time.time()
+    a_obs = pol.Observations(tmp_path / "a.jsonl")
+    a_obs.add(failed(7, reason="busy_gpu", now=now - 600))
+    a = shared(tmp_path, remote, name="a.jsonl")
+    a.queue(a_obs.rows)
+    a.sync()
+    b = shared(tmp_path, remote, name="b.jsonl")
+    b.queue([healthy(7, now=now - 60)])
+    b.sync()
+    a.sync()
+    assert 7 in pol.blocklist(a_obs.rows, now)  # A alone still says busy...
+    assert pol.blocklist(cli.known_rows(a_obs, a), now) == {}  # ...the source as a whole does not
+    # A row the store does not have yet stays this client's own word.
+    a_obs.add(failed(8, reason="busy_gpu", now=now - 60))
+    assert set(pol.blocklist(cli.known_rows(a_obs, a), now)) == {8}
+
+
 @pytest.mark.parametrize("mode", ["quota", "bad_counts", "error"])
 def test_rows_stay_queued_unless_the_store_says_it_has_them(tmp_path, remote, mode):
     s = shared(tmp_path, remote)
@@ -711,8 +759,27 @@ def test_a_broken_store_costs_a_launch_a_few_seconds_and_nothing_else(
 
 def test_a_broken_copy_on_disk_does_not_fail_a_launch(world, remote, tmp_path):
     vast, run = world
+    remote.mode = "fail_reads"  # so the broken copy is what the launch has to go on
     (tmp_path / "observations.jsonl.remote").write_text("{broken")
     assert run(UP) == 0 and len(vast.ours()) == 1
+    assert (tmp_path / "observations.jsonl.remote").read_text() == "{broken"
+    assert run(["down"]) == 0
+
+
+def test_a_death_reaches_the_store_even_if_the_outputs_cannot_be_written(
+    world, remote, tmp_path, monkeypatch
+):
+    from test_cli import fake_ssh, script
+
+    vast, run = world
+    assert run(UP) == 0
+    fake_ssh(monkeypatch, rc=255)
+    vast.live[vast.ours()[0]]["status"] = "exited"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "no" / "such" / "dir" / "out"))
+    assert run(script(tmp_path)) == cli.EXIT_INFRA
+    assert [r["kind"] for r in remote.rows] == ["healthy", "died_after_admission"]
+    assert st._read_lines(tmp_path / "observations.jsonl.outbox") == []
+    monkeypatch.delenv("GITHUB_OUTPUT")
     assert run(["down"]) == 0
 
 

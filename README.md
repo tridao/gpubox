@@ -107,11 +107,13 @@ runtime errors); a later healthy run clears the first two.
 With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, these observations are
 shared through the reputation store (`store/`, a Cloudflare Worker and D1):
 `up` and `search` read what every client reported in the last 30 days, and
-`up` and `run` send what they observed. A machine any client blocks is
-skipped. The store is advisory: it costs a command at most 5 seconds in all
-and never fails it; when it cannot be reached, the last read is used and
-unsent rows wait in `observations.jsonl.outbox`. Without it, cache
-`observations.jsonl` between CI runs.
+send what is waiting; `up` and `run` send what they observed. A machine any
+client blocks is skipped (a soft block is waived if too few hosts are left).
+The store is advisory: it costs a command about 5 seconds at most and never
+fails it; when it cannot be reached, the last read is used and unsent rows
+wait in `observations.jsonl.outbox`, which an ephemeral CI runner loses
+unless it caches it. Without a store, cache `observations.jsonl` between CI
+runs.
 
 ## QuACK CI mapping
 
