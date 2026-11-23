@@ -162,6 +162,18 @@ def test_a_box_that_keeps_reporting_progress_is_not_taken_for_stalled(tmp_path):
     only_winner_left(result, vast, state)
 
 
+def test_a_driver_too_old_for_the_image_is_not_blamed_and_its_like_are_skipped(tmp_path):
+    offers = [offer(1, dph=0.5, cuda=12.8), offer(2, dph=0.6, cuda=12.9),
+              offer(3, dph=0.7), offer(4, dph=0.8, cuda=13.0)]  # fmt: skip
+    vast = FakeVast({1: "old_driver", 2: "ok", 3: "ok", 4: "ok"}, offers)
+    result, vast, state = run(tmp_path, None, vast=vast, spare=0)
+    assert result.winner.machine_id == 3  # says nothing about its driver: still tried
+    assert [m for n, m in vast.names("create")] == [1, 3]  # 2 is as old as 1
+    assert reasons(result)[1] is None and "--min-cuda 13.0" in result.attempts[0].detail
+    assert observed(result) == {(3, "healthy", None)}
+    only_winner_left(result, vast, state)
+
+
 def test_stale_offer_is_skipped_without_blame(tmp_path):
     result, vast, state = run(tmp_path, {1: "stale", 2: "ok"}, spare=0)
     assert result.winner.machine_id == 2

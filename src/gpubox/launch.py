@@ -275,6 +275,9 @@ class Launch:
         self.state, self.prober = state, prober
         self.attempts: dict[int, Attempt] = {}
         self.held: set[int] = set()  # every id a create gave us, on disk or not
+        # The CUDA major version a box's gate said the image needs (driver_too_old):
+        # offers whose driver is for an older one are not rented after that.
+        self.needs_cuda: int | None = None
 
     # ------------------------------------------------------------ the frame
 
@@ -391,6 +394,7 @@ class Launch:
                         if a.host_id is not None:  # two boxes of one host are one witness
                             image_errors[a.host_id] = said
             self._destroy_failed()
+            offers = self._drop_old_drivers(offers)
             # A box that ran our start-up command shows the image works, whatever
             # some host says about it.
             if image_said and self._image_works():
@@ -422,6 +426,22 @@ class Launch:
                 )
                 return None
             time.sleep(policy.poll)
+
+    def _drop_old_drivers(self, offers: collections.deque) -> collections.deque:
+        """The offers whose driver supports the CUDA version a gate said the image needs.
+        An offer that does not say what its driver supports is kept."""
+        if self.needs_cuda is None:
+            return offers
+        old = lambda o: type(o.get("cuda_max_good")) in (int, float) and (
+            o["cuda_max_good"] < self.needs_cuda
+        )
+        kept = collections.deque(o for o in offers if not old(o))
+        if len(kept) < len(offers):
+            log(
+                f"  skipping {len(offers) - len(kept)} offer(s) whose driver supports a CUDA "
+                f"older than {self.needs_cuda}.0, which the image needs"
+            )
+        return kept
 
     def _image_works(self) -> bool:
         """Has any box of this launch answered SSH with the run's key? Only our start-up
@@ -488,6 +508,12 @@ class Launch:
                 return None
             a.check = None
             ok, reason, detail, a.report = result
+            need = a.report.get("needs_cuda") if not ok else None
+            if need is not None:
+                self.needs_cuda = max(self.needs_cuda or 0, need)
+                detail += (
+                    f"; not blamed: pass --min-cuda {need}.0 to rent only hosts that can run it"
+                )
             if not ok:
                 self._fail(a, reason, detail)
             elif spec.gate_script is not None:

@@ -40,14 +40,17 @@ SPEC = Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25)
 REPORT = {"gpus": ["RTX 5090"], "cpus": 32, "driver": "1", "torch": "2"}
 
 
-def offer(machine, host=None, dph=1.0, gpu="RTX 5090"):
-    return {
+def offer(machine, host=None, dph=1.0, gpu="RTX 5090", cuda=None):
+    o = {
         "id": 1000 + machine,
         "machine_id": machine,
         "host_id": host or machine,
         "dph_total": dph,
         "gpu_name": gpu,
     }
+    if cuda is not None:
+        o["cuda_max_good"] = cuda
+    return o
 
 
 class FakeVast:
@@ -56,6 +59,7 @@ class FakeVast:
     ok        comes up and passes the gate
     bad_gpu   comes up, gate reports cuda_init
     busy      comes up, gate reports busy_gpu
+    old_driver comes up, gate says its driver is for an older CUDA than the image needs (13)
     stuck     never leaves "loading", and its status message never changes
     pulling   never leaves "loading", but its status message changes at every look
     cdi       status message blames the machine's container runtime
@@ -332,6 +336,8 @@ class FakeProber:
                 return False, "cuda_init", "CUDA unavailable", {}
             if kind == "busy":
                 return False, "busy_gpu", "util 100%", {}
+            if kind == "old_driver":
+                return False, None, "driver supports CUDA 12.8", {"needs_cuda": 13}
             if kind == "vanish":
                 for iid in [i for i, b in vast.live.items() if b["machine"] == machine]:
                     vast.live.pop(iid)

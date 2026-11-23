@@ -208,7 +208,13 @@ VRAM; required URLs reachable; the GPU idle before our first CUDA context.
 Where the image has a CUDA build of PyTorch, also: CUDA initialises, and per
 GPU a matmul checked against the CPU and 80% of free VRAM allocated and
 filled. Without PyTorch, or with a CPU-only build, those are skipped: that
-says nothing about the machine. A CUDA build that cannot use the GPU does.
+says nothing about the machine. A CUDA build that cannot use the GPU does,
+unless the host's driver is for an older CUDA major version than the build
+(a cu132 PyTorch on a 570 driver, CUDA 12.8, was seen to fail this way;
+on 580 and 590 drivers, CUDA 13.0 and 13.1, it ran, and so did QuACK's
+kernels). That is the caller's choice of host, not a fault of the machine:
+the box fails without blame, the message says to raise `--min-cuda`, and
+the launch rents no more offers whose driver is that old.
 It checks the machine, not the project under test.
 
 The caller's own checks (`--gate-script`) run after the gate passes. They are

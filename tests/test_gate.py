@@ -83,7 +83,7 @@ def test_gate_verdicts(tmp_path, monkeypatch, rc, stdout, expect):
 )
 def test_the_report_handed_on_always_has_the_same_shape(tmp_path, monkeypatch, stdout):
     (ok, _, _, report), _ = verdict(tmp_path, monkeypatch, 0, stdout)
-    assert ok and set(report) == {"gpus", "cpus", "driver", "torch", "checks"}
+    assert ok and set(report) == {"gpus", "cpus", "driver", "torch", "checks", "needs_cuda"}
     assert isinstance(report["gpus"], list) and all(isinstance(g, str) for g in report["gpus"])
     assert report["cpus"] is None and report["driver"] is None and report["torch"] is None
 
@@ -119,7 +119,8 @@ def test_the_gate_is_asked_exactly_what_the_reference_launcher_asked(tmp_path, m
 def test_gate_script_is_valid_python_and_names_only_known_reasons():
     compile(gate.GATE_SCRIPT, "gate", "exec")
     named = set(re.findall(r'done\("([a-z_]+)"', gate.GATE_SCRIPT))
-    assert named and named <= set(policy.REASONS)
+    assert named and named <= set(policy.REASONS) | set(gate.NO_BLAME)
+    assert not set(gate.NO_BLAME) & set(policy.REASONS)  # a verdict blames, or it does not
 
 
 def run_script(tmp_path, body):
@@ -181,6 +182,7 @@ def test_whatever_bytes_the_box_prints_are_read_without_raising(tmp_path, monkey
         "driver",
         "torch",
         "checks",
+        "needs_cuda",
     }
     assert finish(p.start_ready(("10.0.0.1", 22))) == (True, "\ufffd")
 
@@ -280,7 +282,9 @@ def test_a_check_reads_the_result_of_its_child():
 )
 def test_every_outcome_carries_a_report_of_the_same_shape(tmp_path, monkeypatch, rc, stdout):
     (_, _, _, report), _ = verdict(tmp_path, monkeypatch, rc, stdout)
-    assert report == {"gpus": [], "cpus": None, "driver": None, "torch": None, "checks": None}
+    assert report == {
+        "gpus": [], "cpus": None, "driver": None, "torch": None, "checks": None, "needs_cuda": None
+    }  # fmt: skip
 
 
 def test_loading_a_key_never_creates_one(tmp_path):
@@ -294,7 +298,11 @@ def test_loading_a_key_never_creates_one(tmp_path):
 # ------------------------------------------------------- the gate, for real
 
 SMI = """#!/bin/sh
-echo "0, NVIDIA GeForce RTX 5090, 32607, 1, 0, 20.5, 570.86"
+if [ $# -eq 0 ]; then
+  echo "| NVIDIA-SMI 570.86    Driver Version: 570.86    CUDA Version: $SMI_CUDA     |"
+else
+  echo "0, NVIDIA GeForce RTX 5090, 32607, 1, 0, 20.5, 570.86"
+fi
 """
 WANT = {
     "num_gpus": 1,
@@ -305,7 +313,7 @@ WANT = {
 }
 
 
-def real_gate(tmp_path, torch_source=None, want=WANT):
+def real_gate(tmp_path, torch_source=None, want=WANT, driver_cuda="12.8"):
     """Run the real gate script against a stand-in nvidia-smi and, if given, a stand-in
     PyTorch package; the interpreter's own packages are out of reach (-S)."""
     bin_dir, lib = tmp_path / "bin", tmp_path / "lib"
@@ -321,7 +329,7 @@ def real_gate(tmp_path, torch_source=None, want=WANT):
         input=gate.GATE_SCRIPT,
         capture_output=True,
         text=True,
-        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(lib)},
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(lib), "SMI_CUDA": driver_cuda},
         timeout=60,
     )
     return gate.read_gate(gate.Done(r.returncode, r.stdout, r.stderr))
@@ -358,6 +366,28 @@ def test_a_cpu_only_pytorch_skips_the_cuda_checks(tmp_path):
 
 def test_a_cuda_build_of_pytorch_that_cannot_use_the_gpu_is_the_machine(tmp_path):
     ok, reason, detail, report = real_gate(tmp_path, CUDA_TORCH_WITHOUT_GPU)
+    assert (ok, reason) == (False, "cuda_init")
+
+
+CUDA13_TORCH_WITHOUT_GPU = CUDA_TORCH_WITHOUT_GPU.replace("12.8", "13.2")
+
+
+def test_a_driver_for_an_older_cuda_than_pytorch_is_built_for_blames_nobody(tmp_path):
+    # Seen on Vast: torch 2.15.0+cu132 on a 570 driver (CUDA 12.8).
+    ok, reason, detail, report = real_gate(tmp_path, CUDA13_TORCH_WITHOUT_GPU, driver_cuda="12.8")
+    assert (ok, reason) == (False, None)
+    assert "CUDA 12.8" in detail and "13.2" in detail and report["needs_cuda"] == 13
+
+
+def test_a_driver_for_an_older_minor_version_of_the_same_cuda_is_the_machine(tmp_path):
+    # Any 13.x driver runs a 13.2 build (measured on 580 and 590 drivers), so if CUDA
+    # does not work on one, the machine is at fault.
+    ok, reason, detail, report = real_gate(tmp_path, CUDA13_TORCH_WITHOUT_GPU, driver_cuda="13.0")
+    assert (ok, reason) == (False, "cuda_init") and report["needs_cuda"] is None
+
+
+def test_a_driver_whose_cuda_version_cannot_be_read_leaves_the_verdict_with_the_machine(tmp_path):
+    ok, reason, _, _ = real_gate(tmp_path, CUDA13_TORCH_WITHOUT_GPU, driver_cuda="unknown")
     assert (ok, reason) == (False, "cuda_init")
 
 

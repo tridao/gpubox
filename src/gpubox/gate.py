@@ -23,10 +23,16 @@ from pathlib import Path
 
 from .policy import REASONS
 
-GATE_VERSION = 2  # 2: CUDA checks skipped without a CUDA build of PyTorch
+GATE_VERSION = 3  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old
+
+# Verdicts the gate gives that are about the caller's choice, not the machine: the box
+# fails, nobody is blamed. driver_too_old: the host's driver supports an older CUDA major
+# version than the image's PyTorch was built for (CUDA 13 on a 12.x driver fails; any
+# 13.x driver runs a 13.x build).
+NO_BLAME = ("driver_too_old",)
 
 GATE_SCRIPT = r"""
-import json, os, shutil, subprocess, sys, time, urllib.error, urllib.request, warnings
+import json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request, warnings
 
 want = json.loads(sys.argv[1])
 out = {"ok": False}
@@ -47,6 +53,15 @@ def smi():
     if r.returncode:
         done("runtime_error", "nvidia-smi failed: " + (r.stderr or r.stdout).strip()[:300])
     return [[c.strip() for c in line.split(",")] for line in r.stdout.strip().splitlines()]
+
+def driver_cuda():
+    # (major, minor) of the newest CUDA the driver supports, from nvidia-smi's header.
+    try:
+        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30)
+        m = re.search(r"CUDA Version: *(\d+)\.(\d+)", r.stdout)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+    except Exception:
+        return None
 
 rows = smi()
 out["gpus"] = [r[1] for r in rows]
@@ -97,7 +112,9 @@ if util > 20 or used > 512:
 #
 # The CUDA checks need a CUDA build of PyTorch. An image without PyTorch, or
 # with a CPU-only build, has no use for them, and that says nothing about the
-# machine: they are skipped. A CUDA build that cannot use the GPU is the machine.
+# machine: they are skipped. A CUDA build that cannot use the GPU is the machine,
+# unless the driver is for an older CUDA major version than the build: that is the
+# caller's choice of host (`--min-cuda`), and it is said so.
 try:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -117,6 +134,12 @@ try:
         out["checks"] = "CPU-only PyTorch: CUDA checks skipped"
         done()
     if not available:
+        built = re.match(r"(\d+)\.(\d+)", str(torch.version.cuda))
+        drv = driver_cuda()
+        if built and drv and drv[0] < int(built.group(1)):
+            out["needs_cuda"] = int(built.group(1))
+            done("driver_too_old", "the host's driver supports CUDA %d.%d, the image's PyTorch "
+                 "is built for CUDA %s" % (drv[0], drv[1], torch.version.cuda))
         done("cuda_init", "CUDA unavailable: " + "; ".join(str(w.message) for w in caught)[:300])
     if torch.cuda.device_count() != want["num_gpus"]:
         done("cuda_init", "torch sees %d GPUs, expected %d"
@@ -159,6 +182,8 @@ def _clean_report(raw: dict) -> dict:
         "driver": text(raw.get("driver")),
         "torch": text(raw.get("torch")),
         "checks": text(raw.get("checks")),
+        # The CUDA major version the image needs, said only with driver_too_old.
+        "needs_cuda": raw.get("needs_cuda") if type(raw.get("needs_cuda")) is int else None,
     }
 
 
@@ -395,6 +420,8 @@ def read_gate(done: Done) -> tuple[bool, str | None, str, dict]:
     if raw["ok"]:
         return True, None, "", report
     reason, detail = raw.get("reason"), str(raw.get("detail") or "")[:400]
+    if reason in NO_BLAME:
+        return False, None, detail, report
     if not isinstance(reason, str) or reason not in REASONS:
         return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
     return False, reason, detail, report
