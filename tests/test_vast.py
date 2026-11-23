@@ -145,7 +145,10 @@ def test_bootstrap_command_is_one_valid_shell_line():
     assert timer.startswith("[ -f /etc/gpubox-expiry ] || echo 1795400000 > /etc/gpubox-expiry; (")
     assert "CONTAINER_API_KEY" in timer
     assert rest.startswith("set -eu; ") and "apt-get" in rest
-    assert rest.endswith("-o PasswordAuthentication=no") and "exec /usr/sbin/sshd -D" in rest
+    assert "exec /usr/sbin/sshd -D" in rest and "-o PasswordAuthentication=no" in rest
+    # The key is in a file of our own, and sshd reads that and nothing else.
+    assert "> /etc/ssh/gpubox_authorized_keys; " in rest and "/root/.ssh" not in rest
+    assert rest.endswith(" -o AuthorizedKeysFile=/etc/ssh/gpubox_authorized_keys")
     compile(v.SELF_DESTROY, "self_destroy", "exec")
 
 
@@ -453,7 +456,14 @@ def same_but_for_the_timer(payload, reference):
     old_rest, old_tail = old.split("(sleep 60m; ", 1)
     old_timer, old_sshd = old_tail.split(" >/dev/null 2>&1 & ", 1)
     assert shlex.quote(v.SELF_DESTROY) in timer and shlex.quote(v.SELF_DESTROY) in old_timer
-    return ours == theirs and rest == old_rest + old_sshd
+    # ... and in where the key is put: a file of our own that sshd is pointed at,
+    # where the reference used root's authorized_keys.
+    expected = (old_rest + old_sshd).replace(
+        "mkdir -p /run/sshd /root/.ssh; chmod 700 /root/.ssh; ", "mkdir -p /run/sshd /etc/ssh; "
+    )
+    expected = expected.replace("/root/.ssh/authorized_keys", v.KEYS_FILE)
+    expected += f" -o AuthorizedKeysFile={v.KEYS_FILE}"
+    return ours == theirs and rest == expected
 
 
 def test_offers_in_an_excluded_country_are_dropped_and_unknown_locations_kept():

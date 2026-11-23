@@ -284,6 +284,11 @@ SELF_DESTROY = (
 
 
 EXPIRY_FILE = "/etc/gpubox-expiry"
+# The run's key goes into a file of our own, and sshd is told to read only that.
+# /root/.ssh/authorized_keys is not ours to rely on: on a real box Vast was seen to
+# replace it with the account's registered key as the container started, which locked
+# the launcher out of an image whose sshd was up within the first second.
+KEYS_FILE = "/etc/ssh/gpubox_authorized_keys"
 
 
 def check_expiry(expiry) -> None:
@@ -333,13 +338,13 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
                 "if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq"
                 " && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
                 " --no-install-recommends openssh-server; fi",
-                "mkdir -p /run/sshd /root/.ssh",
-                "chmod 700 /root/.ssh",
-                f"printf '%s\\n' {shlex.quote(pubkey)} > /root/.ssh/authorized_keys",
-                "chmod 600 /root/.ssh/authorized_keys",
+                "mkdir -p /run/sshd /etc/ssh",
+                f"printf '%s\\n' {shlex.quote(pubkey)} > {KEYS_FILE}",
+                f"chmod 600 {KEYS_FILE}",
                 "ssh-keygen -A >/dev/null",
                 "exec /usr/sbin/sshd -D -e"
-                " -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no",
+                " -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no"
+                f" -o AuthorizedKeysFile={KEYS_FILE}",
             ]
         )
     )

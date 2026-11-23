@@ -851,6 +851,11 @@ MUTATIONS = [
      '        return sum(a.state != "refused" for a in self.attempts.values())',
      '        return len(self.attempts)',
      'already_gone_do_not_use_up_the_attempts'),
+    ('sshd reads root\'s authorized_keys, which the provider rewrites',
+     'vast.py',
+     '                f" -o AuthorizedKeysFile={KEYS_FILE}",\n',
+     '',
+     'bootstrap_command_is_one_valid_shell_line'),
 ]
 # fmt: on
 
