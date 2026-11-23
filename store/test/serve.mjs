@@ -11,7 +11,7 @@ const mf = new Miniflare({
   host: "127.0.0.1",
   port: 0,
   d1Databases: { DB: "gpubox-reputation-serve" },
-  bindings: { TOKEN_LAPTOP: process.env.TOKEN_LAPTOP, TOKEN_OTHER: process.env.TOKEN_OTHER, SOURCE_SALT: "serve" },
+  bindings: { TOKEN_LAPTOP: process.env.TOKEN_LAPTOP, TOKEN_OTHER: process.env.TOKEN_OTHER, SOURCE_SALT: "salt-for-the-local-server-0123456789" },
 });
 const db = await mf.getD1Database("DB");
 for (const file of readdirSync("migrations").sort()) {

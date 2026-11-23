@@ -109,10 +109,12 @@ def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
 
     Within a source, repeats are counted per class (soft, hard), not per
     reason: a machine that was busy yesterday and is unreachable today is on
-    its second soft strike. A row seen twice (same id) counts once, for the
-    source it was seen under first; pass this client's own rows first. Rows in
-    the same second are ordered by id, which is arbitrary but the same for
-    every reader.
+    its second soft strike. A row seen twice under one source (same id)
+    counts once. Our own rows also come back from the store under our
+    source's id; they are then judged a second time there, which changes
+    nothing but lets our own "healthy" take back what that source said about
+    the machine earlier. Rows of the same moment are ordered by the store's
+    sequence number where they have one, else by id.
     """
     by_source: dict[str, dict[int, list[dict]]] = {}
     seen = set()
@@ -123,9 +125,9 @@ def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
         if not isinstance(src, str):
             continue
         if row.get("id") is not None:
-            if row["id"] in seen:
+            if (src, row["id"]) in seen:
                 continue
-            seen.add(row["id"])
+            seen.add((src, row["id"]))
         by_source.setdefault(src, {}).setdefault(row["machine_id"], []).append(row)
     out: dict[int, dict] = {}
     rank = lambda b: (b["class"] == "hard", b["until"])
@@ -137,11 +139,16 @@ def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
     return out
 
 
+def _order(o: dict):
+    seq = o.get("seq")
+    return (o["ts"], seq if type(seq) is int else 0, str(o.get("id", "")))
+
+
 def _block(obs: list[dict], now: float) -> dict | None:
     """What one source's rows about one machine amount to at `now`."""
     block = {"soft": (0, None), "hard": (0, None)}  # class -> (until, reason)
     strikes: dict[str, list[int]] = {"soft": [], "hard": []}
-    for o in sorted(obs, key=lambda o: (o["ts"], str(o.get("id", "")))):
+    for o in sorted(obs, key=_order):
         if o["kind"] == "healthy":
             block["soft"] = (0, None)  # it works now; history still counts
             continue

@@ -496,9 +496,8 @@ class Launch:
                             # short while to prove it was this host's problem.
                             image_error = exc
                             give_up_at = min(give_up_at, time.monotonic() + policy.image_grace)
-                            # Nothing more is rented, including by a worker that
-                            # is queued but has not sent its request yet.
-                            self.rent_until = time.monotonic()
+                            # (The worker that saw the error has already closed
+                            # the renting window: see _bring_up.)
                         if owner[fut].state == "created":
                             self._destroy(owner[fut])  # it will never come up
                     else:

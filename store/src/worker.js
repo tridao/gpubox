@@ -95,7 +95,7 @@ async function sourceOf(request, env) {
 
 /** What readers see instead of a source's name: stable, and meaningless without the salt. */
 async function opaque(source, env) {
-  const salt = typeof env.SOURCE_SALT === "string" ? env.SOURCE_SALT : "";
+  const salt = env.SOURCE_SALT; // checked in fetch(); must never change, or old ids stop matching
   return hex(await digest(`gpubox-source:${salt}:${source}`)).slice(0, 16);
 }
 
@@ -164,22 +164,20 @@ async function post(request, env, source) {
       if (failed.has(key)) continue;
       failed.add(key);
     }
-    fresh.push({ ...row, n: fresh.length });
+    fresh.push(row);
   }
   if (fresh.length === 0) return json(200, { accepted: 0, ignored: clean.length });
 
-  const used = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM observations WHERE source = ?1 AND received_at > ${NOW_SQL} - ?2`,
-  )
-    .bind(source, DAY_MS)
-    .first("n");
-  if (used + fresh.length > MAX_ROWS_PER_SOURCE_PER_DAY) {
-    return json(429, { error: "daily limit for this source reached" });
-  }
-
   // One statement, so that the limits hold however many requests race: the
-  // database runs statements one at a time, and this one counts and checks
-  // what is stored at the moment it inserts.
+  // database runs statements one at a time, and this one checks what is stored
+  // at the moment it inserts. (A statement that reads the table it inserts
+  // into reads it as it was before the statement.) The quota is all or
+  // nothing for the request; the spacing rule drops single rows.
+  const recentFailure =
+    "EXISTS (SELECT 1 FROM observations f WHERE f.source = ?2" +
+    " AND f.provider = r.value ->> 'provider' AND f.machine_id = r.value ->> 'machine_id'" +
+    ` AND f.kind != 'healthy' AND f.received_at > ${NOW_SQL} - ?3)`;
+  const payload = JSON.stringify(fresh);
   const result = await env.DB.prepare(
     "INSERT OR IGNORE INTO observations (id, received_at, source, provider, machine_id," +
       " host_id, kind, reason_code, gpu, num_gpus, gate_version, policy_version, secs_to_ready)" +
@@ -189,15 +187,25 @@ async function post(request, env, source) {
       " r.value ->> 'secs_to_ready'" +
       " FROM json_each(?1) AS r" +
       " WHERE (SELECT COUNT(*) FROM observations q WHERE q.source = ?2" +
-      `        AND q.received_at > ${NOW_SQL} - ?3) + (r.value ->> 'n') < ?4` +
-      "   AND (r.value ->> 'kind' = 'healthy' OR NOT EXISTS (" +
-      "        SELECT 1 FROM observations f WHERE f.source = ?2" +
-      "          AND f.provider = r.value ->> 'provider' AND f.machine_id = r.value ->> 'machine_id'" +
-      `          AND f.kind != 'healthy' AND f.received_at > ${NOW_SQL} - ?5))`,
+      `        AND q.received_at > ${NOW_SQL} - ?4) + json_array_length(?1) <= ?5` +
+      `   AND (r.value ->> 'kind' = 'healthy' OR NOT ${recentFailure})`,
   )
-    .bind(JSON.stringify(fresh), source, DAY_MS, MAX_ROWS_PER_SOURCE_PER_DAY, FAILURE_SPACING_MS)
+    .bind(payload, source, FAILURE_SPACING_MS, DAY_MS, MAX_ROWS_PER_SOURCE_PER_DAY)
     .run();
   const accepted = result.meta.changes;
+  if (accepted < fresh.length) {
+    // Why were some not stored? Rows we have by now (a racing resend) and
+    // failures inside the spacing are final. Anything else was the quota, and
+    // the client must keep those rows and try again later.
+    const explained = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM json_each(?1) AS r WHERE" +
+        " EXISTS (SELECT 1 FROM observations o WHERE o.id = r.value ->> 'id')" +
+        ` OR (r.value ->> 'kind' != 'healthy' AND ${recentFailure})`,
+    )
+      .bind(payload, source, FAILURE_SPACING_MS)
+      .first("n");
+    if (explained < fresh.length) return json(429, { error: "daily limit for this source reached" });
+  }
   return json(200, { accepted, ignored: clean.length - accepted });
 }
 
@@ -213,7 +221,7 @@ async function get(url, env) {
   // row only where the same source had failed that machine before (it then
   // takes back that source's own soft verdict). Healthy rows of machines
   // nobody complained about, the bulk of the table, are not sent.
-  const [page, revoked] = await env.DB.batch([
+  const [page, revoked, meta] = await env.DB.batch([
     env.DB.prepare(
       "SELECT o.seq, o.id, o.received_at, o.source, o.provider, o.machine_id, o.kind," +
         " o.reason_code, o.policy_version FROM observations o" +
@@ -226,6 +234,7 @@ async function get(url, env) {
         " ORDER BY o.seq LIMIT ?4",
     ).bind(provider, after, WINDOW_DAYS * DAY_MS, limit + 1),
     env.DB.prepare("SELECT source FROM revoked_sources"),
+    env.DB.prepare("SELECT value FROM meta WHERE key = 'store_id'"),
   ]);
   const rows = page.results.slice(0, limit);
   const names = new Map();
@@ -233,6 +242,9 @@ async function get(url, env) {
     if (!names.has(name)) names.set(name, await opaque(name, env));
   }
   return json(200, {
+    // Which database these sequence numbers belong to: a client that sees
+    // another value must forget what it read and start from 0.
+    store: meta.results[0].value,
     observations: rows.map((r) => ({
       seq: r.seq,
       id: r.id,
@@ -257,6 +269,9 @@ export default {
     try {
       if (url.pathname === "/v1/health") return json(200, { ok: true });
       if (url.pathname !== "/v1/observations") return json(404, { error: "not found" });
+      if (typeof env.SOURCE_SALT !== "string" || env.SOURCE_SALT.length < 16) {
+        return json(500, { error: "the store is not configured (SOURCE_SALT)" });
+      }
       const source = await sourceOf(request, env);
       if (!source) return json(401, { error: "unauthorized" });
       const revoked = await env.DB.prepare("SELECT 1 AS hit FROM revoked_sources WHERE source = ?1")

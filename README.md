@@ -68,11 +68,13 @@ redirects are refused. Each source is judged on its own: somebody else's
 "healthy" does not unblock a machine that failed here.
 
 If the store cannot be reached, what was read earlier is used and unsent rows
-wait in `observations.jsonl.outbox` (the oldest are dropped beyond 1,000).
-Without the two variables nothing is contacted and nothing read earlier is
-used; `observations.jsonl` alone decides (cache it between CI runs in that
-case). With a store, a fresh CI runner reads the last 30 days of failures
-each time unless `observations.jsonl.remote` and `.cursor` are cached too.
+wait in `observations.jsonl.outbox` (the oldest are dropped beyond 1,000; so
+is a batch the store rejects as malformed). Without the two variables nothing
+is contacted and nothing read earlier is used; `observations.jsonl` alone
+decides (cache it between CI runs in that case). With a store, a fresh CI
+runner reads the last 30 days of failures each time unless
+`observations.jsonl.remote` is cached too. The URL must be a plain
+`https://name[:port]`; proxies from the environment are not used.
 
 ## QuACK CI mapping
 

@@ -25,6 +25,7 @@ class FakeStore:
 
     def __init__(self):
         self.rows, self.requests, self.revoked = [], [], []
+        self.store_id = "0123456789abcdef"
         self.page_size = 2
         self.mode = "ok"
         self.fail_posts_after = None  # POST number from which POSTs fail with 500
@@ -97,12 +98,17 @@ class FakeStore:
                 page = [r for r in owner.rows if r["seq"] > after][: owner.page_size]
                 more = len([r for r in owner.rows if r["seq"] > after]) > owner.page_size
                 answer = {
+                    "store": owner.store_id,
                     "observations": page,
                     "next": page[-1]["seq"] if more else None,
                     "revoked": owner.revoked,
                 }
                 if mode == "endless":
                     answer["next"] = after
+                if mode == "skips_ahead" and page:
+                    answer["next"] = page[-1]["seq"] + 100
+                if mode == "out_of_order" and len(page) > 1:
+                    answer["observations"] = page[::-1]
                 if mode == "no_next":
                     del answer["next"]
                 if mode == "fail_page_2" and after:
@@ -173,7 +179,7 @@ def shared(tmp_path, remote, name="observations.jsonl", **kw):
 
 
 def outbox(s):
-    return [r["machine_id"] for r in st._read(s.outbox)]
+    return [r["machine_id"] for r in st._read_lines(s.outbox)]
 
 
 def posted(remote):
@@ -190,6 +196,11 @@ def posted(remote):
         "http://localhost:8787", "ftp://127.0.0.1", "https://user:pw@store.example",
         "https://store.example/?x=1", "https://store.example/#frag", "https://store.example/path",
         "https://", "store.example", "https://[::1", "",
+        # Each of these is refused by one check only:
+        "https://10.0.0.1",  # an address, not a name
+        "https://store.example:08443",  # not the text we would rebuild
+        "https://sto\tre.example",  # urlsplit would quietly drop the tab
+        "https://store.example:0",
     ],
 )  # fmt: skip
 def test_urls_the_token_must_not_be_sent_to(url):
@@ -218,6 +229,28 @@ def test_a_redirect_is_refused_and_the_token_goes_nowhere_else(tmp_path, remote,
     with pytest.raises(st.StoreError):
         s.sync()
     assert remote.requests and elsewhere.requests == []  # the other origin never heard from us
+
+
+def test_a_proxy_from_the_environment_never_sees_the_token(
+    tmp_path, remote, elsewhere, monkeypatch
+):
+    # With cleartext (tests only) a proxy would be handed the whole request.
+    for name in (
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ):
+        monkeypatch.setenv(name, elsewhere.url)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    remote.add(failed(1))
+    s = shared(tmp_path, remote)
+    s.queue([failed(2)])
+    assert s.sync() == "sent 1, read 2"  # the row that was there, and our own coming back
+    assert elsewhere.requests == [] and len(remote.requests) == 2
 
 
 @pytest.mark.parametrize("mode", ["error", "garbage", "slow", "redirect"])
@@ -309,7 +342,7 @@ def test_nothing_is_queued_or_sent_without_a_store(tmp_path):
     assert not s.outbox.exists() and s.sync() == "no store configured"
 
 
-@pytest.mark.parametrize("name", ["remote.jsonl", "outbox.jsonl", "observations.jsonl.remote", "x"])
+@pytest.mark.parametrize("name", ["remote.jsonl", "outbox.jsonl", "observations.jsonl", "x"])
 def test_the_side_files_never_are_the_observations_file(tmp_path, remote, name):
     mine = pol.Observations(tmp_path / name)
     mine.add(failed(1))
@@ -319,9 +352,41 @@ def test_the_side_files_never_are_the_observations_file(tmp_path, remote, name):
     s.queue([failed(2)])
     s.sync()
     assert (tmp_path / name).read_text() == before
-    assert len({tmp_path / name, s.outbox, s.remote, s.cursor, s._lockfile}) == 5
+    assert len({tmp_path / name, s.outbox, s.remote, s._lockfile}) == 4
     other = shared(tmp_path, remote, name=name + "2")
     assert other.outbox != s.outbox and other.remote != s.remote
+
+
+@pytest.mark.parametrize("name", ["observations.jsonl.remote", "x.outbox", "y.lock"])
+def test_an_observations_file_cannot_have_a_side_files_name(tmp_path, remote, name):
+    # `x` and `x.remote` as two observations files would overwrite each other.
+    with pytest.raises(st.StoreError):
+        shared(tmp_path, remote, name=name)
+    assert st.Shared(tmp_path / name, None).remote_rows() == []  # harmless without a store
+
+
+def test_an_outbox_that_cannot_be_read_is_not_replaced(tmp_path, remote):
+    s = shared(tmp_path, remote)
+    s.outbox.mkdir()  # exists, and is not a readable file
+    with pytest.raises(st.StoreError):
+        s.queue([failed(1)])
+    assert s.outbox.is_dir()
+
+
+def test_a_busy_lock_costs_a_second_not_the_launch(tmp_path, remote):
+    import fcntl
+
+    s = shared(tmp_path, remote, budget=0.5)
+    s.queue([failed(1)])
+    with open(s._lockfile, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # another gpubox process, suspended
+        t0 = time.monotonic()
+        with pytest.raises(st.StoreError, match="in use"):
+            s.sync()
+        with pytest.raises(st.StoreError):
+            s.queue([failed(2)])
+        assert time.monotonic() - t0 < 2.5
+    assert remote.requests == []
 
 
 # ------------------------------------------------------------------- reading
@@ -337,10 +402,13 @@ def test_reading_is_incremental(tmp_path, remote):
     remote.add(failed(6))
     assert shared(tmp_path, remote).sync() == "sent 0, read 1"
     assert [r[1].split("after=")[1] for r in remote.requests] == ["5"]  # not from the start again
+    assert json.loads(s.remote.read_text())["cursor"] == 6
     assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3, 4, 5, 6]
 
 
-@pytest.mark.parametrize("mode", ["fail_page_2", "endless", "no_next"])
+@pytest.mark.parametrize(
+    "mode", ["fail_page_2", "endless", "no_next", "skips_ahead", "out_of_order"]
+)
 def test_an_interrupted_read_keeps_a_consistent_prefix_and_resumes(tmp_path, remote, mode):
     for m in range(1, 6):
         remote.add(failed(m))
@@ -359,6 +427,18 @@ def test_an_interrupted_read_keeps_a_consistent_prefix_and_resumes(tmp_path, rem
     assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3, 4, 5]
 
 
+def test_a_page_out_of_order_is_refused(tmp_path, remote):
+    # Its last row is not its highest: taking it would move our position
+    # backwards and read the rest twice.
+    for m in range(1, 6):
+        remote.add(failed(m))
+    remote.page_size, remote.mode = 50, "out_of_order"
+    s = shared(tmp_path, remote)
+    with pytest.raises(st.StoreError, match="not in order"):
+        s.sync()
+    assert s.remote_rows() == []
+
+
 def test_what_a_revoked_source_wrote_is_dropped(tmp_path, remote):
     remote.add(failed(1), src="aaaa")
     remote.add(failed(2), src="bbbb")
@@ -368,6 +448,62 @@ def test_what_a_revoked_source_wrote_is_dropped(tmp_path, remote):
     remote.add(failed(3), src="bbbb")
     shared(tmp_path, remote).sync()
     assert [r["machine_id"] for r in s.remote_rows()] == [2, 3]
+    on_disk = json.loads(s.remote.read_text())
+    assert {r["src"] for r in on_disk["rows"]} == {"bbbb"}  # dropped, not just hidden
+
+
+def test_revocations_are_never_forgotten(tmp_path, remote):
+    # A slow reader that fetched before the revocation applies its page last:
+    # the revoked source's rows must not come back.
+    remote.add(failed(1), src="aaaa")
+    s = shared(tmp_path, remote)
+    s.sync()
+    remote.revoked = ["aaaa"]
+    shared(tmp_path, remote).sync()
+    assert s.remote_rows() == []
+    stale = {
+        "acked": [],
+        "dropped": [],
+        "errors": [],
+        "pages": [(remote.store_id, [remote.rows[0]], 1, [])],
+    }
+    s._apply(stale)
+    assert s.remote_rows() == [] and json.loads(s.remote.read_text())["revoked"] == ["aaaa"]
+
+
+def test_rows_and_position_live_and_die_together(tmp_path, remote):
+    for m in range(1, 4):
+        remote.add(failed(m))
+    s = shared(tmp_path, remote)
+    s.sync()
+    s.remote.unlink()  # the copy is lost (a cache restored only in part, say)
+    assert s.remote_rows() == []
+    shared(tmp_path, remote).sync()
+    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3]  # read again from the start
+
+
+def test_what_was_read_from_another_store_is_not_used(tmp_path, remote, elsewhere):
+    remote.add(failed(1))
+    shared(tmp_path, remote).sync()
+    other = st.Shared(tmp_path / "observations.jsonl", client(elsewhere))
+    assert other.remote_rows() == []
+    elsewhere.add(failed(2))
+    other.sync()
+    assert [r["machine_id"] for r in other.remote_rows()] == [2]
+
+
+def test_a_store_that_was_replaced_is_read_from_the_start(tmp_path, remote):
+    for m in range(1, 4):
+        remote.add(failed(m))
+    s = shared(tmp_path, remote)
+    s.sync()
+    remote.rows.clear()  # a new database behind the same address: numbers start over
+    remote.store_id = "fedcba9876543210"
+    remote.add(failed(7))
+    assert "starting over" in shared(tmp_path, remote).sync()
+    assert s.remote_rows() == []  # nothing of the old one is kept...
+    shared(tmp_path, remote).sync()
+    assert [r["machine_id"] for r in s.remote_rows()] == [7]  # ...and the new one is read whole
 
 
 def test_rows_older_than_the_window_are_forgotten(tmp_path, remote):
@@ -376,9 +512,9 @@ def test_rows_older_than_the_window_are_forgotten(tmp_path, remote):
     s = shared(tmp_path, remote)
     s.sync()
     assert [r["machine_id"] for r in s.remote_rows()] == [1, 2]
-    rows = st._read(s.remote)
-    rows[0]["ts"] = time.time() - st.WINDOW - 2 * 86400  # time passes
-    s.remote.write_text(st._lines(rows))
+    doc = json.loads(s.remote.read_text())
+    doc["rows"][0]["ts"] = time.time() - st.WINDOW - 60  # time passes
+    s.remote.write_text(json.dumps(doc))
     assert [r["machine_id"] for r in s.remote_rows()] == [2]
 
 
@@ -387,7 +523,9 @@ def test_rows_older_than_the_window_are_forgotten(tmp_path, remote):
     [
         {"provider": "runpod"}, {"machine_id": "3"}, {"machine_id": 0}, {"kind": "exploded"},
         {"reason_code": "gremlins"}, {"kind": "healthy"}, {"ts": "yesterday"},
-        {"ts": time.time() + 86400}, {"ts": time.time() - 40 * 86400}, {"ts": 10**400},
+        {"ts": time.time() + 86400}, {"ts": time.time() - 30 * 86400 - 60}, {"ts": 10**400},
+        {"policy_version": pol.POLICY_VERSION + 1}, {"policy_version": "1"},
+        {"reason_code": ["busy_gpu"]}, {"reason_code": {"a": 1}},
         {"id": 7}, {"id": None}, {"src": None}, {"src": ["a"]},
     ],
 )  # fmt: skip
@@ -402,13 +540,28 @@ def test_remote_rows_are_trusted_less_than_local_ones(tmp_path, remote, change):
     assert set(s.remote_rows()[0]) == set(st.KEPT_FIELDS) and good["id"] == s.remote_rows()[0]["id"]
 
 
-@pytest.mark.parametrize("row", ["text", None, [1], 7, {}, {"seq": "7"}, {"seq": 0}, {"seq": True}])
-def test_things_that_are_not_rows_are_not_rows(row):
-    good = {"seq": 3, "id": "ab", "ts": time.time(), "src": "aaaa", "provider": "vast",
-            "machine_id": 1, "kind": "failed_admission", "reason_code": "busy_gpu"}  # fmt: skip
+@pytest.mark.parametrize(
+    "row",
+    [
+        "text",
+        None,
+        [1],
+        7,
+        {"seq": "7"},
+        {"seq": 0},
+        {"seq": True},
+        {"reason_code": ["x"]},
+        "missing",
+    ],
+)
+def test_things_that_are_not_rows_are_not_rows_and_never_raise(row):
+    good = {"seq": 3, "id": "ab", "ts": time.time(), "src": "aaaa", "provider": "vast", "machine_id": 1,
+            "kind": "failed_admission", "reason_code": "busy_gpu", "policy_version": 1}  # fmt: skip
     assert st.remote_row(good, time.time()) == good
-    bad = {**good, **row} if isinstance(row, dict) and row else row
-    assert st.remote_row(bad, time.time()) is None
+    for field in good if row == "missing" else [None]:
+        bad = {k: v for k, v in good.items() if k != field} if row == "missing" else row
+        bad = {**good, **bad} if isinstance(bad, dict) and row != "missing" else bad
+        assert st.remote_row(bad, time.time()) is None
 
 
 def test_a_disabled_store_means_no_remote_rows_even_if_some_are_on_disk(tmp_path, remote):
@@ -419,10 +572,19 @@ def test_a_disabled_store_means_no_remote_rows_even_if_some_are_on_disk(tmp_path
 
 def test_an_unreadable_copy_is_no_rows_not_an_error(tmp_path, remote):
     s = shared(tmp_path, remote)
+    for junk in (
+        "not json",
+        "[1, 2]",
+        '{"origin": 5}',
+        json.dumps(
+            {"origin": s.store.identity(), "cursor": "x", "rows": [], "revoked": [], "store": None}
+        ),
+    ):
+        s.remote.write_text(junk)
+        assert s.remote_rows() == [] and s._load()["cursor"] == 0
+    s.remote.unlink()
     s.remote.mkdir()  # something is in the way
     assert s.remote_rows() == []
-    s.cursor.write_text("not a number")
-    assert s._read_cursor() == 0
 
 
 def test_a_wrong_token_is_an_error_not_an_empty_store(tmp_path, remote):
@@ -524,6 +686,41 @@ def test_our_own_row_coming_back_from_the_store_counts_once(tmp_path, remote):
     )
 
 
+def test_our_own_recovery_takes_back_what_our_source_said_before(tmp_path):
+    # A fresh CI runner: the failure it reported last week is known only from
+    # the store, under its source's id. Today the machine works, and that row
+    # comes back from the store too. The machine is not blocked any more.
+    now = time.time()
+    last_week = remote_like(
+        pol.observation("failed_admission", 7, 7, "r", reason="busy_gpu", now=now - 60),
+        "ci01",
+        seq=1,
+    )
+    today = pol.observation("healthy", 7, 7, "r", now=now - 5)
+    echo = remote_like(today, "ci01", seq=2)
+    assert 7 in pol.blocklist([last_week], now)
+    assert pol.blocklist([today, last_week, echo], now) == {}
+
+
+def test_rows_of_one_moment_are_ordered_by_the_stores_sequence():
+    # A failure and the recovery after it, sent in one request: same time.
+    now = time.time()
+    fail = remote_like(
+        pol.observation("failed_admission", 7, 7, "r", reason="busy_gpu", now=now - 5),
+        "ci01",
+        seq=1,
+    )
+    heal = {
+        **remote_like(pol.observation("healthy", 7, 7, "r", now=now - 5), "ci01", seq=2),
+        "ts": fail["ts"],
+    }
+    for a, b in ((fail, heal), (heal, fail)):
+        for ids in (("0" * 32, "f" * 32), ("f" * 32, "0" * 32)):  # whatever the ids are
+            rows = [{**a, "id": ids[0]}, {**b, "id": ids[1]}]
+            assert pol.blocklist(rows, now) == {}
+    assert 7 in pol.blocklist([{**heal, "seq": 1}, {**fail, "seq": 2}], now)
+
+
 def test_a_row_with_a_source_of_the_wrong_type_is_skipped():
     row = {**failed(7), "src": ["aaaa"]}
     assert pol.blocklist([row], time.time()) == {}
@@ -574,7 +771,18 @@ def test_up_skips_a_machine_someone_else_reported_and_reports_its_own(world, rem
     assert vast.live[vast.ours()[0]]["machine"] == 2 and vast.creates == 1
     sent = [r for r in remote.rows if r["src"] == "aaaa000000000001"]
     assert [(r["machine_id"], r["kind"]) for r in sent] == [(2, "healthy")]
-    assert st._read(tmp_path / "observations.jsonl.outbox") == []
+    assert st._read_lines(tmp_path / "observations.jsonl.outbox") == []
+    assert run(["down"]) == 0
+
+
+def test_a_setup_failure_of_the_http_stack_is_a_warning(world, monkeypatch, capsys):
+    vast, run = world
+
+    def broken(*a, **k):
+        raise OSError("cannot open the TLS key log")
+
+    monkeypatch.setattr(st, "from_env", broken)
+    assert run(UP) == 0 and "reputation store not used: OSError" in capsys.readouterr().out
     assert run(["down"]) == 0
 
 
@@ -589,14 +797,14 @@ def test_a_broken_store_costs_a_launch_a_few_seconds_and_nothing_else(
     assert run(UP) == 0 and len(vast.ours()) == 1
     assert time.monotonic() - t0 < 2.5  # both exchanges together, plus the fake launch
     assert "WARNING: reputation store" in capsys.readouterr().out
-    assert len(st._read(tmp_path / "observations.jsonl.outbox")) == 1  # kept for next time
+    assert len(st._read_lines(tmp_path / "observations.jsonl.outbox")) == 1  # kept for next time
     remote.mode = "ok"
     assert run(["down"]) == 0
 
 
 def test_a_broken_copy_on_disk_does_not_fail_a_launch(world, remote, tmp_path):
     vast, run = world
-    (tmp_path / "observations.jsonl.remote").mkdir(parents=True)
+    (tmp_path / "observations.jsonl.remote").write_text("{broken")
     assert run(UP) == 0 and len(vast.ours()) == 1
     assert run(["down"]) == 0
 
@@ -661,6 +869,7 @@ def test_the_client_and_the_real_worker_agree(tmp_path):
         # Three rows dealt with; one failure for machine 11 counts (the second is
         # spaced out), and the healthy row of an uncomplained-about machine is not served.
         assert mine.sync() == "sent 3, read 1"
+        assert json.loads(mine.remote.read_text())["store"]
         theirs.sync()
         (got,) = theirs.remote_rows()
         assert (got["machine_id"], got["kind"], got["reason_code"]) == (

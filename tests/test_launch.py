@@ -235,9 +235,15 @@ def test_no_replacement_is_rented_between_an_image_error_and_its_collection(tmp_
 
 
 def test_an_image_error_is_reported_when_nothing_else_comes_up(tmp_path):
-    launch, vast, journal = start(tmp_path, {1: "image", 2: "bad_gpu", 3: "ok"})
-    with pytest.raises(L.ConfigError):
-        launch.run({})
+    # Host 2 is still in its gate when the grace period ends.
+    launch, vast, journal = start(tmp_path, {1: "image", 2: "hold", 3: "ok"}, image_grace=0.2)
+
+    def let_go(iid):  # once we give up on host 2, let its worker out of the gate
+        if vast.live.get(iid, {}).get("machine") == 2:
+            vast.release.set()
+
+    vast.on_destroy = let_go
+    assert isinstance(outcome(launch), L.ConfigError)
     assert vast.creates == 2
     nothing_left(vast, journal)
 

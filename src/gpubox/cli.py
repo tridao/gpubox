@@ -130,12 +130,13 @@ def observations_path(args) -> Path:
 
 def open_shared(args) -> st.Shared:
     """The shared reputation store, if one is configured and its settings make sense."""
-    store = None
     try:
-        store = st.from_env()
-    except st.StoreError as exc:
+        return st.Shared(observations_path(args), st.from_env())
+    except st.StoreError as exc:  # its messages never contain the URL or the token
         log(f"WARNING: reputation store not used: {exc}")
-    return st.Shared(observations_path(args), store)
+    except Exception as exc:
+        log(f"WARNING: reputation store not used: {type(exc).__name__}")
+    return st.Shared(observations_path(args), None)
 
 
 def share(shared: st.Shared, what: str, **kw) -> None:

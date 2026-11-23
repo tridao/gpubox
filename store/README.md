@@ -15,12 +15,18 @@ GET  /v1/health
   (at least 32 characters; names must differ in more than case). The Worker
   decides who wrote a row, from the token, and when, from the database's
   clock; what a client says about either is ignored.
-- A row is stored once (its id is unique), so resending is safe and free.
+- A row is stored once (its id is unique), so resending a stored row is safe
+  and free.
 - Per source: 500 new rows a day, and one counted failure per machine per
   hour. Both are part of the insert statement itself, so requests that race
-  cannot get past them.
+  cannot get past them. A request that does not fit the daily limit is
+  refused whole with 429 and can be sent again later; a failure inside the
+  hour is dropped for good and reported as `ignored` (if that answer is lost
+  and the row is sent again more than an hour later, it is stored then).
 - Reads are by sequence number, in commit order: ask for what comes after the
-  last number you have. Rows of the last 30 days are served.
+  last number you have. Rows of the last 30 days are served. Every answer
+  carries `store`, the identity of the database; a client that sees it change
+  must forget what it read.
 - Readers get reason codes only: `seq, id, ts, src, provider, machine_id,
   kind, reason_code, policy_version`. `src` is an opaque id of the source
   (a salted hash), not its name. A `healthy` row is served only where the same
@@ -61,6 +67,9 @@ The secrets file is JSON and stays out of the repository:
 ```json
 {"TOKEN_LAPTOP": "...", "TOKEN_QUACK_CI": "...", "SOURCE_SALT": "..."}
 ```
+
+`SOURCE_SALT` (16 characters or more) is required, and must never change:
+the opaque source ids are derived from it, and clients remember revoked ids.
 
 The Worker's entry module must export nothing but the default handler object;
 the runtime rejects any other export (the tests catch this, `cf deploy

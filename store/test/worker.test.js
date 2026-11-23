@@ -193,7 +193,10 @@ test("a source has a daily limit, also when its requests race", async () => {
     Array.from({ length: 6 }, (_, k) => post([obs({ machine_id: 9000 + k }), obs({ machine_id: 9100 + k }), obs({ machine_id: 9200 + k })])),
   );
   assert.equal((await stored("source = 'laptop'")).length, QUOTA);
-  assert.ok(answers.every((a) => a.status === 200 || a.status === 429));
+  // Two requests got in whole; the other four were told to come back, not that
+  // their rows had been dealt with.
+  assert.deepEqual(answers.map((a) => a.status).sort(), [200, 200, 429, 429, 429, 429]);
+  assert.ok(answers.filter((a) => a.status === 200).every((a) => a.json.accepted === 3 && a.json.ignored === 0));
   assert.equal((await post([obs()])).status, 429);
   assert.equal((await post([obs()], { token: CI })).status, 200); // per source
   // Old rows stop counting after a day.
@@ -281,6 +284,42 @@ test("the daily job deletes rows older than ninety days", async () => {
   const worker = await mf.getWorker();
   await worker.scheduled({ cron: "17 4 * * *" });
   assert.deepEqual((await stored()).map((r) => r.machine_id), [2]);
+});
+
+test("a request is stored whole or told to come back, never half", async () => {
+  const stmt = db.prepare(
+    "INSERT INTO observations (id, received_at, source, provider, machine_id, kind, policy_version)" +
+      " VALUES (?1, ?2, 'laptop', 'vast', ?3, 'healthy', 1)",
+  );
+  for (let i = 0; i < 4; i++) {
+    await db.batch(Array.from({ length: 100 }, (_, j) => stmt.bind(id(), Date.now(), i * 100 + j + 1)));
+  }
+  await db.batch(Array.from({ length: QUOTA - 402 }, (_, j) => stmt.bind(id(), Date.now(), 5000 + j)));
+  // Two places left, three new rows: none is stored, and the answer says why.
+  const res = await post([obs({ machine_id: 9001 }), obs({ machine_id: 9002 }), obs({ machine_id: 9003 })]);
+  assert.equal(res.status, 429);
+  assert.equal((await stored("machine_id > 9000")).length, 0);
+  assert.deepEqual((await post([obs({ machine_id: 9001 }), obs({ machine_id: 9002 })])).json, { accepted: 2, ignored: 0 });
+});
+
+test("readers learn which database they are reading", async () => {
+  const a = (await list()).json.store;
+  assert.match(a, /^[0-9a-f]{16}$/);
+  assert.equal((await list()).json.store, a);
+});
+
+test("without its salt the store refuses to serve", async () => {
+  const bare = new Miniflare({
+    modules: true, scriptPath: "src/worker.js", compatibilityDate: "2025-09-01",
+    d1Databases: { DB: "gpubox-reputation-nosalt" }, bindings: { TOKEN_LAPTOP: LAPTOP },
+  });
+  try {
+    await migrate(await bare.getD1Database("DB"));
+    const res = await bare.dispatchFetch("http://store/v1/observations?provider=vast", { headers: { authorization: `Bearer ${LAPTOP}` } });
+    assert.equal(res.status, 500);
+  } finally {
+    await bare.dispose();
+  }
 });
 
 test("the queries use their indexes", async () => {
