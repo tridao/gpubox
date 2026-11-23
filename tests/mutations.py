@@ -856,6 +856,11 @@ MUTATIONS = [
      '                f" -o AuthorizedKeysFile={KEYS_FILE}",\n',
      '',
      'bootstrap_command_is_one_valid_shell_line'),
+    ('a refused key is waited out until the start-up timeout',
+     'launch.py',
+     '            if not ok and "Permission denied" in a.ssh_err:',
+     '            if False:',
+     'refuses_our_key_fails_fast'),
 ]
 # fmt: on
 

@@ -243,6 +243,21 @@ def test_a_host_that_cannot_pull_the_image_is_replaced(tmp_path):
     only_winner_left(result, vast, state)
 
 
+def test_an_image_whose_sshd_refuses_our_key_fails_fast_not_at_the_startup_timeout(tmp_path):
+    # Seen live: both boxes "running" and refusing the key for ten minutes each.
+    launch, vast, state = start(tmp_path, dict.fromkeys(range(1, 6), "nokey"), startup_timeout=60)
+    t0 = time.monotonic()
+    with pytest.raises(L.ConfigError, match="refuses the run's key"):
+        launch.run({})
+    assert time.monotonic() - t0 < 5 and vast.creates == 2 and vast.ours() == []
+
+
+def test_one_box_that_refuses_our_key_is_replaced_and_nobody_is_blamed(tmp_path):
+    result, vast, state = run(tmp_path, {1: "nokey", 2: "ok"}, spare=0, startup_timeout=60)
+    assert result.winner.machine_id == 2 and reasons(result)[1] is None
+    only_winner_left(result, vast, state)
+
+
 def test_two_boxes_whose_host_is_unknown_are_not_two_witnesses(tmp_path):
     # They may be the same host. A third, working, host is still tried.
     offers = [{**offer(m), "host_id": None} for m in (1, 2)] + [offer(3)]

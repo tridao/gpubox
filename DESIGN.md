@@ -127,6 +127,11 @@ stops as a configuration error (exit 2). With a wrong tag that is about 40 s
 in; a single misconfigured host is simply replaced. If the launch ends with
 no box and any host blamed the image, that is what is reported.
 
+A box that is running and whose sshd refuses the run's key is treated the
+same way: our own sshd is started with that key, so a refusal means the image
+runs something else in place of our start-up command, and waiting for the
+start-up timeout cannot help.
+
 **The hand-off** is the write that puts the winner into the state file.
 Before it, a failure or a signal rolls back everything the launch rented;
 after it the winner is kept. The rollback aims at 10 s (what a cancelled CI

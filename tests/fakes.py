@@ -69,6 +69,7 @@ class FakeVast:
     hold      passes the gate once the test sets `release`
     vanish    passes the gate, and the instance is gone the moment it does
     api_down  rented, but the provider never answers a status query
+    nokey     comes up, and its sshd refuses the run's key
     """
 
     def __init__(self, behaviour, offers=None, slow_secs=0.2):
@@ -302,7 +303,10 @@ class FakeProber:
             check.kill()
 
     def start_ready(self, ep):
-        self.checks.append(FakeCheck(lambda: (True, "")))
+        machine = int(ep[0].rsplit(".", 1)[1])
+        refused = self.vast.behaviour.get(machine) == "nokey"
+        answer = (False, f"root@{ep[0]}: Permission denied (publickey).") if refused else (True, "")
+        self.checks.append(FakeCheck(lambda: answer))
         return self.checks[-1]
 
     def start_gate(self, ep, spec):

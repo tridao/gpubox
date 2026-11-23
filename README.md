@@ -66,7 +66,9 @@ and `observations.jsonl` (which machines worked).
 - A box still loading whose status has not changed for `--stall-timeout`
   (300 s) is replaced. That matters when `--startup-timeout` is longer, as a
   large image needs.
-- If two hosts say the image cannot be pulled, `up` stops with exit 2.
+- If two hosts say the image cannot be pulled, or two boxes come up and
+  refuse the run's SSH key (the image does not run gpubox's start-up
+  command), `up` stops with exit 2.
 
 ## What it promises, and what it does not
 

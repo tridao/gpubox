@@ -390,7 +390,8 @@ class Launch:
     def _advance(self, a: Attempt) -> str | None:
         """Move one candidate on as far as it can go without waiting.
 
-        Returns the message if its host says the image cannot be pulled.
+        Returns a message if the box shows that the image itself is the
+        problem: its host cannot pull it, or it runs but refuses our key.
         """
         policy, spec = self.policy, self.spec
         if a.phase == "gating":
@@ -412,6 +413,19 @@ class Launch:
                 return None
             a.check = None
             ok, a.ssh_err = result
+            if not ok and "Permission denied" in a.ssh_err:
+                # An sshd answered and refused the run's key. Ours would not:
+                # it is started with that key. So the image runs something
+                # else in place of our start-up command, and waiting out the
+                # start-up timeout (ten minutes per box, when this was seen
+                # live) cannot help. Handled like an image that cannot be
+                # pulled: this box fails, and a second host settles it.
+                said = (
+                    f"image {spec.image!r} is running, but its sshd refuses the run's key: it "
+                    "does not seem to run gpubox's start-up command (an ENTRYPOINT of its own?)"
+                )
+                self._fail(a, None, said)
+                return said
             if ok:
                 a.timings["ssh"] = self._elapsed(a)
                 log(f"  {a.tag_name} reachable after {a.timings['ssh']:.0f}s, running health gate")
