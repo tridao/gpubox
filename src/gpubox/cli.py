@@ -177,6 +177,15 @@ def check_account(vast, expected: str | None) -> str | None:
     return actual
 
 
+def same_account(vast, state: State, account: str | None) -> None:
+    """Stop if the run recorded the account it was rented on and the key is another one's."""
+    if state.account and (account or vast.account()) != state.account:
+        raise ConfigError(
+            f"run {state.run} was rented on account {state.account}; "
+            "the API key belongs to another account"
+        )
+
+
 def cmd_up(args) -> int:
     state_dir = Path(args.state_dir)
     spec = spec_from(args, args.image)
@@ -235,7 +244,6 @@ def write_ssh_entry(state: State, keys: Path) -> None:
     path = sshconfig.add(
         state.run, alias, w["host"], w["port"], keys / "id_ed25519", keys / "known_hosts"
     )
-    state.set_ssh_alias(alias)
     log(f"`ssh {alias}` now reaches the box (entry in {path})")
 
 
@@ -350,8 +358,7 @@ def cmd_renew(args) -> int:
         state, w = live_box(state_dir)
         vast = v.Vast(api_key(args))
         account = check_account(vast, pinned_account(args))
-        if account and state.account and account != state.account:
-            raise ConfigError(f"run {state.run} was rented on account {state.account}")
+        same_account(vast, state, account)  # before anything on the box is changed
         try:
             prober = Prober(key_dir(state_dir, state.run), create=False)
         except FileNotFoundError:
@@ -385,12 +392,8 @@ def cmd_down(args) -> int:
         account = check_account(vast, pinned_account(args))
         ours = state is not None and (run_id is None or state.run == run_id)
         if ours:
-            if state.account and (account or vast.account()) != state.account:
-                # An empty listing on another account says nothing about this run.
-                raise ConfigError(
-                    f"run {state.run} was rented on account {state.account}; "
-                    "the API key belongs to another account"
-                )
+            # An empty listing on another account says nothing about this run.
+            same_account(vast, state, account)
         else:
             # By tag alone. The directory's own state and keys are not touched.
             log(f"run {run_id} has no state in {state_dir}: destroying what carries its tag")

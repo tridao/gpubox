@@ -78,11 +78,10 @@ def test_the_state_reads_back_what_was_written(tmp_path):
     state.add_id(41)  # once is enough
     state.publish(WINNER)
     state.set_expiry(EXPIRY + 60)
-    state.set_ssh_alias("test")
     disk = State.load(tmp_path)
     assert disk.data == state.data
     assert (disk.run, disk.account, disk.expiry) == (RUN_ID, "111", EXPIRY + 60)
-    assert disk.ids == [41, 42] and disk.winner == WINNER and disk.ssh_alias == "test"
+    assert disk.ids == [41, 42] and disk.winner == WINNER
     assert not disk.closing and not disk.closed
     state.close()
     assert State.load(tmp_path).closed and State.load(tmp_path).closing

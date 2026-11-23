@@ -233,6 +233,15 @@ def test_a_host_that_cannot_pull_the_image_is_replaced(tmp_path):
     only_winner_left(result, vast, state)
 
 
+def test_two_boxes_whose_host_is_unknown_are_not_two_witnesses(tmp_path):
+    # They may be the same host. A third, working, host is still tried.
+    offers = [{**offer(m), "host_id": None} for m in (1, 2)] + [offer(3)]
+    vast = FakeVast({1: "image", 2: "image", 3: "ok"}, offers=offers)
+    result, vast, state = run(tmp_path, None, vast=vast)
+    assert result.winner.machine_id == 3
+    only_winner_left(result, vast, state)
+
+
 def test_if_nothing_came_up_and_a_host_blamed_the_image_that_is_what_is_reported(tmp_path):
     launch, vast, state = start(tmp_path, {1: "image"}, spare=0)
     with pytest.raises(L.ConfigError, match="cannot be pulled"):
@@ -288,8 +297,44 @@ def test_a_failed_box_whose_delete_is_not_confirmed_keeps_its_slot(tmp_path):
 
 
 def test_the_cheaper_of_two_boxes_healthy_in_the_same_pass_wins(tmp_path):
-    vast = FakeVast({1: "ok", 2: "ok"}, offers=[offer(1, dph=2.0), offer(2, dph=1.0)])
+    # Rented second, because it was only let back in from the blocklist, but cheaper.
+    vast = FakeVast({1: "ok", 2: "ok"}, offers=[offer(1, dph=1.2), offer(2, dph=1.0)])
+    launch, vast, state = start(tmp_path, None, vast=vast)
+    soft = {"until": time.time() + 60, "class": "soft", "reason": "busy_gpu"}
+    result = launch.run({2: soft})
+    assert [a.machine_id for a in result.attempts] == [1, 2]
+    assert result.winner.machine_id == 2
+    only_winner_left(result, vast, state)
+
+
+def test_an_offer_above_the_price_cap_is_never_rented_whatever_the_search_returns(tmp_path):
+    # The cap is part of the search request, but what comes back is what gets
+    # rented: it is checked here too. SPEC allows $1.25 for its one GPU.
+    offers = [offer(1, dph=2.0), offer(2, dph=1.26), offer(3, dph=1.25)]
+    vast = FakeVast({1: "ok", 2: "ok", 3: "ok"}, offers=offers)
     result, vast, state = run(tmp_path, None, vast=vast)
+    assert result.winner.machine_id == 3 and vast.names("create") == [("create", 3)]
+
+
+def test_offers_are_tried_cheapest_first_whatever_order_the_search_returns(tmp_path):
+    offers = [offer(1, dph=1.2), offer(2, dph=0.5), offer(3, dph=0.9)]
+    vast = FakeVast({1: "ok", 2: "ok", 3: "ok"}, offers=offers)
+    result, vast, state = run(tmp_path, None, vast=vast, spare=0)
+    assert vast.names("create") == [("create", 2)]
+
+
+def test_a_running_box_with_an_unreadable_endpoint_does_not_cost_the_other_one(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "ok"})
+    real = vast.instance
+
+    def lookup(iid, **kw):
+        row = real(iid, **kw)
+        if row and vast.live.get(iid, {}).get("machine") == 1:
+            row["ports"] = {"22/tcp": [{"HostPort": "not-a-port"}]}
+        return row
+
+    vast.instance = lookup
+    result = launch.run({})
     assert result.winner.machine_id == 2
     only_winner_left(result, vast, state)
 
@@ -577,6 +622,42 @@ def test_down_is_not_done_if_it_cannot_list(tmp_path):
     assert L.down(vast, on_disk(state), FAST) == [] and on_disk(state).closed
 
 
+def test_a_listing_that_still_shows_a_destroyed_box_is_not_a_clean_one(tmp_path):
+    # The lookup says gone; the listing lags and shows it three more times.
+    # "Two listings that show nothing" means nothing.
+    result, vast, state = up(tmp_path, {1: "ok"}, spare=0)
+    vast.listing_lag = 3
+    vast.calls.clear()
+    assert L.down(vast, state, FAST) == []
+    assert len(vast.names("instances")) == 5  # three that showed it, then two that did not
+
+
+def test_a_box_that_will_not_go_away_does_not_keep_another_from_being_deleted(tmp_path):
+    # One id from the state file survives every delete. A second box, of a
+    # create that got no answer, is only found by the listing. It must get
+    # its delete in this run of `down`, and not wait behind the first.
+    result, vast, state = up(tmp_path, {1: "ok", 2: "lost_late"})
+    stuck = result.winner.instance_id
+    (other,) = [i for i in vast.ours() if i != stuck]
+    vast.revealed = True
+    vast.sticky.add(1)
+    # Even when the first round alone uses up all the time there is.
+    hurried = L.Policy(**{**FAST.__dict__, "confirm_timeout": 0.05, "round": 0.1})
+    assert L.down(vast, state, hurried) == [stuck]
+    assert vast.ours() == [stuck] and ("destroy", other) in vast.names()
+    vast.sticky.clear()
+    assert L.down(vast, on_disk(state), FAST) == []
+
+
+def test_up_looks_for_the_tag_even_when_a_loser_will_not_go_away(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "hold", 3: "lost_late"}, spare=2)
+    vast.revealed = True
+    vast.sticky.add(2)
+    result = launch.run({})
+    assert result.winner.machine_id == 1 and len(result.left) == 1
+    assert [vast.live[i]["machine"] for i in vast.ours()] == [1, 2]  # the unanswered one is gone
+
+
 def test_a_box_that_shows_up_between_the_two_listings_is_destroyed_too(tmp_path):
     # The first listing after the delete shows nothing; the box of a create
     # that got no answer becomes visible just then. The second listing is why
@@ -727,6 +808,25 @@ def test_a_renewal_whose_relabel_fails_leaves_the_reaper_on_the_old_expiry(tmp_p
         L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)
     label = vast.live[result.winner.instance_id]["label"]
     assert parse_tag(label).expiry == EXPIRY and on_disk(state).expiry == EXPIRY
+
+
+def test_a_relabel_that_took_effect_but_whose_answer_was_lost_is_reported_as_half_done(
+    tmp_path, capsys
+):
+    result, vast, state = up(tmp_path, {1: "ok"}, spare=0)
+    real = vast.relabel
+
+    def relabel(iid, label):
+        real(iid, label)
+        raise v.VastError(0, "timed out")
+
+    vast.relabel = relabel
+    with pytest.raises(v.VastError):
+        L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)
+    assert "half done" in capsys.readouterr().out and on_disk(state).expiry == EXPIRY
+    vast.relabel = real
+    L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)  # running it again settles it
+    assert on_disk(state).expiry == EXPIRY + 7200
 
 
 def test_a_run_without_a_box_cannot_be_renewed(tmp_path):

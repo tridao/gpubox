@@ -193,6 +193,10 @@ def test_the_timer_waits_for_its_time_and_then_keeps_trying(tmp_path):
         "restarted": (now + 3600, f"{now - 1}\n", True),  # a file already there is kept
         "garbage": (now - 1, "soon\n", True),  # not a number: the first expiry applies
         "empty": (now - 1, "", True),
+        # Digits, but too long for the shell to compare: without the length
+        # check the test would error every time, and the timer never fire.
+        "too-long": (now - 1, "9" * 25 + "\n", True),
+        "ten-digits": (now - 1, "9999999999\n", False),
     }
     timers = {k: Timer(tmp_path, k, baked, held) for k, (baked, held, _) in cases.items()}
     try:
@@ -218,6 +222,33 @@ def test_renewing_while_the_timer_runs_moves_its_time(tmp_path):
         assert timer.fired() >= 1  # the lease was moved into the past: it fires
     finally:
         timer.stop()
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {},
+        {"public_ipaddr": "1.2.3.4"},
+        {"public_ipaddr": "1.2.3.4", "ports": None},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": []}},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": [{}]}},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": [{"HostPort": "x"}]}},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": [{"HostPort": "0"}]}},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": [{"HostPort": "70000"}]}},
+        {"public_ipaddr": "1.2.3.4", "ports": {"22/tcp": "2222"}},
+        {"public_ipaddr": "", "ports": {"22/tcp": [{"HostPort": "22"}]}},
+        {"public_ipaddr": "-oProxyCommand=x", "ports": {"22/tcp": [{"HostPort": "22"}]}},
+        {"public_ipaddr": "1.2.3.4 evil", "ports": {"22/tcp": [{"HostPort": "22"}]}},
+        {"public_ipaddr": "1.2.3.4", "ports": ["22/tcp"]},
+    ],
+)
+def test_an_endpoint_we_cannot_read_is_none_not_an_error(row):
+    assert v.endpoint_of(row) is None
+
+
+def test_an_endpoint_is_the_address_and_the_port_mapped_to_22():
+    row = {"public_ipaddr": " 1.2.3.4 ", "ports": {"22/tcp": [{"HostPort": "40123"}]}}
+    assert v.endpoint_of(row) == ("1.2.3.4", 40123)
 
 
 def test_relabel_sends_the_label_and_needs_an_explicit_yes(wire):

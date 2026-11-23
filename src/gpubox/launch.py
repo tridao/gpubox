@@ -21,6 +21,8 @@ Assumptions (DESIGN.md, section 2, has the reasons and what each costs):
   A3  The state directory is sound: written by one process, under a lock.
   A4  The listing shows a box once its create has returned (`down` lists
       twice, a few seconds apart, to cover a short lag).
+  A5  The provider does not give an instance id to a second box: `down`
+      deletes the ids in the state file without looking at their tags.
 
 Not assumed: that a create is answered (an unanswered one keeps its slot),
 that a delete worked (each is confirmed by a lookup), that the provider's
@@ -30,7 +32,6 @@ answers are well formed, or that one host is right about the image.
 from __future__ import annotations
 
 import collections
-import math
 import time
 from dataclasses import dataclass, field
 
@@ -93,6 +94,7 @@ class Policy:
     rollback: float = 10  # what a cancelled CI step gets before it is killed
     confirm_timeout: float = 60  # how long a teardown keeps trying
     confirm_poll: float = 2
+    round: float = 8  # one delete-and-lookup round of a teardown, before it lists again
     recheck: float = 3  # between the two listings that must both show nothing of the run
     call_timeout: float = 10  # one provider call inside the loop or a teardown
     expiry_margin: float = 60  # clock skew allowed before an expired tag is acted on
@@ -212,19 +214,16 @@ def destroy_confirmed(vast, ids, budget: float, policy: Policy) -> list[int]:
             _try_destroy(vast, iid, share(len(left) - k))
 
 
-def tagged(vast, run_id: str, policy: Policy) -> set[int] | None:
+def tagged(vast, run_id: str, policy: Policy, timeout: float | None = None) -> set[int] | None:
     """The ids of the boxes the listing shows with this run's tag, or None if it could not
     be listed. Not retried here: callers loop."""
+    timeout = policy.call_timeout if timeout is None else min(policy.call_timeout, timeout)
     try:
-        rows = vast.instances(timeout=policy.call_timeout, retries=0)
+        rows = vast.instances(timeout=timeout, retries=0)
     except v.VastError as exc:
         log(f"WARNING: listing instances: {exc}")
         return None
     return {r["id"] for r in rows if (t := parse_tag(r.get("label"))) and t.run == run_id}
-
-
-def _usable_time(value) -> bool:
-    return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
 # ---------------------------------------------------------------------- launch
@@ -291,14 +290,15 @@ class Launch:
         """Destroy every box of the run except `keep`: the ids we hold, then whatever the
         listing shows with the run's tag (a box whose create gave no answer)."""
         deadline = time.monotonic() + budget
-        left = destroy_confirmed(self.vast, self.held - {keep}, budget, self.policy)
-        if time.monotonic() < deadline:
-            found = tagged(self.vast, self.state.run, self.policy) or set()
-            extra = found - self.held  # the winner is among those we hold
-            for iid in sorted(extra):
-                log(f"  instance {iid} carries this run's tag and was not known: destroying it")
-            remaining = max(0.0, deadline - time.monotonic())
-            left += destroy_confirmed(self.vast, extra, remaining, self.policy)
+        remaining = lambda: max(0.0, deadline - time.monotonic())
+        # Half the time for the ids we hold, so that one that will not go away
+        # leaves room for the listing and for what it finds.
+        left = set(destroy_confirmed(self.vast, self.held - {keep}, budget / 2, self.policy))
+        found = tagged(self.vast, self.state.run, self.policy, remaining()) or set()
+        extra = found - self.held  # the winner is among those we hold
+        for iid in sorted(extra):
+            log(f"  instance {iid} carries this run's tag and was not known: destroying it")
+        left = sorted(destroy_confirmed(self.vast, left | extra, remaining(), self.policy))
         for iid in left:
             log(f"WARNING: instance {iid} is not confirmed destroyed; `gpubox down` retries")
         return left
@@ -326,6 +326,10 @@ class Launch:
         spec, policy = self.spec, self.policy
         deadline = t0 + policy.overall_timeout - policy.cleanup_reserve
         found = self.vast.offers(v.offer_query(spec))
+        # The search is asked for the price cap and the order; neither is taken
+        # on trust, since what comes back is what gets rented.
+        cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
+        found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
         allowed = v.in_allowed_country(found, spec.exclude_countries)
         offers = collections.deque(pol.select_offers(allowed, blocked, policy.max_live))
         log(
@@ -335,17 +339,20 @@ class Launch:
             f"up to {policy.max_attempts} attempts"
         )
         image_errors: dict = {}  # host -> what it said
+        image_said = None  # the same, from any box, also one whose host we cannot name
         while True:
             for a in list(self.attempts.values()):
                 if a.state == "rented" and a.phase in ("booting", "probing", "gating"):
                     said = self._advance(a)
                     if said is not None:
-                        image_errors[a.host_id or ("machine", a.machine_id)] = said
+                        image_said = said
+                        if a.host_id is not None:  # two boxes of one host are one witness
+                            image_errors[a.host_id] = said
             self._destroy_failed()
             if len(image_errors) >= policy.image_errors:
                 # One host can be wrong about an image (a broken mirror, stale
                 # credentials). Several saying the same are not.
-                raise ConfigError(next(iter(image_errors.values())))
+                raise ConfigError(image_said)
             winner = self._choose()
             if winner is not None:
                 return winner
@@ -353,8 +360,8 @@ class Launch:
             if not out_of_time:
                 self._rent(offers, deadline)
             if out_of_time or not self._worth_waiting(offers, deadline):
-                if image_errors:
-                    raise ConfigError(next(iter(image_errors.values())))
+                if image_said:
+                    raise ConfigError(image_said)
                 log(
                     f"giving up: no healthy box within {policy.overall_timeout:g}s"
                     if out_of_time
@@ -596,47 +603,52 @@ def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> N
 def down(vast, state: State, policy: Policy) -> list[int] | None:
     """Destroy everything of a run.
 
-    Destroys the ids in the state file and everything the listing shows with
-    the run's tag, and goes on until two listings in a row, `policy.recheck`
-    apart and both taken after the last delete, show nothing of the run, or
-    until `policy.confirm_timeout` has passed.
+    Rounds, for up to `policy.confirm_timeout`: one short delete-and-lookup
+    round for everything known so far, then a listing, whose boxes with the
+    run's tag join the next round. So a box that will not go away cannot keep
+    another, found later, from being deleted. The run is gone when two
+    listings in a row, `policy.recheck` apart, show nothing with its tag and
+    nothing is left to delete.
 
-    Returns [] if the run is gone (and closes it); otherwise the ids not
-    confirmed destroyed, or None if those are all gone but the provider could
-    not be listed to make sure nothing else carries the tag.
+    Returns [] if the run is gone (and closes it); otherwise the ids still to
+    destroy, or None if there are none but the provider could not be listed
+    twice to make sure.
     """
     try:
         state.set_closing()
     except OSError as exc:
         log(f"WARNING: could not record that the run is closing: {exc}")
     pending = set(state.ids)
-    done: set[int] = set()
     deadline = time.monotonic() + policy.confirm_timeout
     clean = 0  # listings in a row that showed nothing of the run, with nothing pending
     while True:
         if pending:
-            budget = min(policy.confirm_timeout, max(1.0, deadline - time.monotonic()))
-            left = set(destroy_confirmed(vast, pending, budget, policy))
+            left = set(destroy_confirmed(vast, pending, policy.round, policy))
             for iid in sorted(pending - left):
                 log(f"destroyed instance {iid}")
-            done |= pending - left
-            pending, clean = left, 0
+            pending = left
         found = tagged(vast, state.run, policy)
+        new = (found or set()) - pending  # these have not been sent a delete yet
         if found is None:
             clean = 0
-        elif found - done or pending:
-            for iid in sorted(found - done - pending):
-                log(f"found instance {iid} by its tag")
-            pending |= found - done
+        elif found or pending:
+            # Also an id we just confirmed gone, if the listing still shows
+            # it: deleting it again costs nothing, and a listing that shows
+            # the run's tag is not a clean one.
+            for iid in sorted(found - pending):
+                log(f"instance {iid} is listed with the run's tag")
+            pending |= found
             clean = 0
         else:
             clean += 1
             if clean >= 2:
                 break
-        if time.monotonic() >= deadline:
+        # At the deadline, stop; but a box only just found gets its round first
+        # (two rounds past the deadline is the end, whatever the listing says).
+        late = time.monotonic() - deadline
+        if late >= 0 and (not new or late >= 2 * policy.round):
             break
-        if not pending:
-            time.sleep(policy.recheck)
+        time.sleep(policy.recheck if not pending else policy.confirm_poll)
     if clean >= 2:
         try:
             state.close()
@@ -701,9 +713,11 @@ def renew(vast, state: State, prober, expiry: int) -> None:
     """Move the end of the winner's lease to `expiry`.
 
     The box's own timer reads the expiry from a file on the box; the reaper
-    reads it from the tag. The file is written first: if the relabel then
-    fails, the reaper still acts on the old expiry, so a half-done renewal
-    ends the box early, never late.
+    reads it from the tag. The file is written first, so that if the relabel
+    is refused the reaper still acts on the old expiry: a refused renewal
+    can end the box early, not late. A relabel whose answer is lost, or a
+    state file that cannot be written afterwards, leaves the box renewed and
+    this directory showing the old expiry; running `renew` again settles it.
     """
     w = state.winner
     if not w:
@@ -711,6 +725,14 @@ def renew(vast, state: State, prober, expiry: int) -> None:
     v.check_expiry(expiry)
     r = prober.run((w["host"], w["port"]), v.set_expiry_command(expiry))
     if r != 0:
-        raise v.VastError(0, f"could not set the expiry on the box (ssh exit {r})")
-    vast.relabel(w["id"], make_tag(state.run, w["attempt"], expiry))
-    state.set_expiry(expiry)
+        raise v.VastError(0, f"could not set the expiry on the box (ssh exit {r}); nothing changed")
+    try:
+        vast.relabel(w["id"], make_tag(state.run, w["attempt"], expiry))
+        state.set_expiry(expiry)
+    except Exception:
+        log(
+            "WARNING: the renewal is half done. The box's own timer has the new expiry; its "
+            "tag, which the reaper goes by, may still have the old one, and this directory "
+            "still shows the old one. Run `gpubox renew` again."
+        )
+        raise

@@ -2,15 +2,22 @@
 `scp`, `rsync` and editors work.
 
 gpubox owns one file, `~/.ssh/gpubox_config`, with one block per run. The
-user's own `~/.ssh/config` gets a single `Include gpubox_config` line, at the
-top (an Include further down would fall inside whatever `Host` block precedes
-it), and nothing else in it is ever changed. Only written on request
+user's own `~/.ssh/config` gets a single `Include gpubox_config` line at the
+very top (further down it would fall inside whatever `Host` block precedes
+it and apply only there); nothing else in it is changed, and if it is a
+symbolic link, the file it points to is what is written. Only on request
 (`up --ssh-config`); `down` removes the run's block again.
+
+Several gpubox processes, in different state directories, share these files,
+so every change is made under one lock in the SSH directory.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 OWNED = "gpubox_config"
@@ -21,17 +28,34 @@ def _dir() -> Path:
     return Path(os.environ.get("GPUBOX_SSH_DIR") or Path.home() / ".ssh")
 
 
+@contextmanager
+def _locked():
+    d = _dir()
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(d / (OWNED + ".lock"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # held for milliseconds; waiting is fine
+        yield d
+
+
 def _marker(run_id: str) -> str:
     return f"# gpubox run {run_id}"
 
 
 def _write(path: Path, text: str) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".gpubox-tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """Replace a file's content. A symbolic link is followed, not replaced."""
+    path = Path(os.path.realpath(path))
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".gpubox-tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _blocks(text: str) -> list[list[str]]:
@@ -51,12 +75,21 @@ def _quoted(path) -> str:
     return f'"{text}"'
 
 
+def _is_host(block: list[str], alias: str) -> bool:
+    return any(line.strip() == f"Host {alias}" for line in block)
+
+
+def _included_at_the_top(text: str) -> bool:
+    """Is our Include the first directive, so that it applies to every host?"""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped == INCLUDE
+    return False
+
+
 def add(run_id: str, alias: str, host: str, port: int, key: Path, known_hosts: Path) -> Path:
     """Write the block for a run and make sure the user's config includes our file."""
-    remove(run_id)
-    owned = _dir() / OWNED
-    old = owned.read_text() if owned.exists() else ""
-    others = [b for b in _blocks(old) if not _is_host(b, alias)]  # a stale box of the same name
     block = [
         _marker(run_id),
         f"Host {alias}",
@@ -68,24 +101,26 @@ def add(run_id: str, alias: str, host: str, port: int, key: Path, known_hosts: P
         f"    UserKnownHostsFile {_quoted(Path(known_hosts).resolve())}",
         "    StrictHostKeyChecking accept-new",
     ]
-    _write(owned, "".join("\n".join(b) + "\n" for b in [*others, block]))
-    config = _dir() / "config"
-    text = config.read_text() if config.exists() else ""
-    if INCLUDE not in (line.strip() for line in text.splitlines()):
-        _write(config, f"{INCLUDE}\n\n{text}" if text else f"{INCLUDE}\n")
+    with _locked() as d:
+        owned = d / OWNED
+        old = owned.read_text() if owned.exists() else ""
+        # Not this run's earlier block, and not a stale box of the same name.
+        others = [b for b in _blocks(old) if b[0] != _marker(run_id) and not _is_host(b, alias)]
+        _write(owned, "".join("\n".join(b) + "\n" for b in [*others, block]))
+        config = d / "config"
+        text = config.read_text() if config.exists() else ""
+        if not _included_at_the_top(text):
+            _write(config, f"{INCLUDE}\n\n{text}" if text else f"{INCLUDE}\n")
     return owned
-
-
-def _is_host(block: list[str], alias: str) -> bool:
-    return any(line.strip() == f"Host {alias}" for line in block)
 
 
 def remove(run_id: str) -> None:
     """Remove a run's block, if there is one. The Include line stays: it is harmless."""
-    owned = _dir() / OWNED
-    if not owned.exists():
+    if not (_dir() / OWNED).exists():
         return
-    blocks = _blocks(owned.read_text())
-    kept = [b for b in blocks if b[0] != _marker(run_id)]
-    if len(kept) != len(blocks):
-        _write(owned, "".join("\n".join(b) + "\n" for b in kept))
+    with _locked() as d:
+        owned = d / OWNED
+        blocks = _blocks(owned.read_text())
+        kept = [b for b in blocks if b[0] != _marker(run_id)]
+        if len(kept) != len(blocks):
+            _write(owned, "".join("\n".join(b) + "\n" for b in kept))

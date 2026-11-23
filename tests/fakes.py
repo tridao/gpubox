@@ -32,6 +32,7 @@ FAST = Policy(
     rollback=0.3,
     confirm_timeout=0.3,
     confirm_poll=0.01,
+    round=0.05,
     recheck=0.01,
     call_timeout=1,
 )
@@ -82,6 +83,8 @@ class FakeVast:
         self.hidden = set()  # ids no listing shows
         self.unlabelled = set()  # ids listed with no label
         self.lookup_hidden = set()  # ids whose lookup says "does not exist" although they do
+        self.listing_lag = 0  # listings that still show a box after it was destroyed
+        self.lingering = {}  # id -> [its row, listings left]
         self.slow_secs = slow_secs
         self.release = False  # lets "hold" boxes through the gate
         self.gate_started = set()  # machines whose gate has started
@@ -187,6 +190,10 @@ class FakeVast:
             if iid in self.unlabelled:
                 row["label"] = None
             rows.append({**row, "machine_id": box["machine"], "actual_status": "running"})
+        for iid, entry in list(self.lingering.items()):
+            if iid not in self.live and entry[1] > 0:
+                entry[1] -= 1
+                rows.append(entry[0])
         return rows
 
     def relabel(self, iid, label):
@@ -208,6 +215,14 @@ class FakeVast:
             return
         self.live.pop(iid)
         self.destroyed.append(iid)
+        if self.listing_lag:
+            row = {
+                "id": iid,
+                "label": box["label"],
+                "machine_id": machine,
+                "actual_status": "exited",
+            }
+            self.lingering[iid] = [row, self.listing_lag]
 
 
 class FileVast(FakeVast):

@@ -445,7 +445,6 @@ def test_ssh_config_adds_an_entry_for_the_box_and_down_removes_it(world, tmp_pat
     assert "    HostName 10.0.0." in entry and "    Port 2222\n" in entry
     assert f'    IdentityFile "{keys}/id_ed25519"\n' in entry
     assert f'    UserKnownHostsFile "{keys}/known_hosts"\n' in entry
-    assert State.load(tmp_path).ssh_alias == "77-1"
     assert run(["down"]) == 0
     assert (ssh_dir / "gpubox_config").read_text() == ""
     assert (ssh_dir / "config").read_text() == mine  # the user's file is not touched again
@@ -466,6 +465,53 @@ def test_what_ssh_reads_from_the_entry_is_the_box(world, tmp_path, ssh_dir):
     assert got["hostname"].startswith("10.0.0.") and got["port"] == "2222" and got["user"] == "root"
     assert got["identityfile"] == str((tmp_path / "keys" / run_id / "id_ed25519").resolve())
     assert got["identitiesonly"] == "yes"
+
+
+def test_an_include_that_sits_inside_a_host_block_does_not_count(world, ssh_dir):
+    # There it only applies to that host. Ours has to be the first directive.
+    vast, run = world
+    ssh_dir.mkdir()
+    before = "# mine\nHost other\n    Include gpubox_config\n"
+    (ssh_dir / "config").write_text(before)
+    assert run([*UP, "--ssh-config"]) == 0
+    assert (ssh_dir / "config").read_text() == "Include gpubox_config\n\n" + before
+    assert run(["down"]) == 0 and run([*UP, "--ssh-config"]) == 0
+    assert (ssh_dir / "config").read_text() == "Include gpubox_config\n\n" + before  # once
+    assert run(["down"]) == 0
+
+
+def test_a_config_that_is_a_symbolic_link_stays_one(world, tmp_path, ssh_dir):
+    # Dotfiles: the link's target is what is edited, and the link is kept.
+    vast, run = world
+    ssh_dir.mkdir()
+    target = tmp_path / "dotfiles-ssh-config"
+    target.write_text("Host mine\n    HostName example.org\n")
+    (ssh_dir / "config").symlink_to(target)
+    assert run([*UP, "--ssh-config"]) == 0
+    assert (ssh_dir / "config").is_symlink()
+    assert target.read_text().startswith("Include gpubox_config\n\nHost mine\n")
+    assert run(["down"]) == 0
+
+
+def test_boxes_in_different_state_directories_do_not_lose_each_others_entries(tmp_path, ssh_dir):
+    # They hold different state locks, and share these files.
+    import threading
+
+    from gpubox import sshconfig
+
+    def add(n):
+        run_id = f"dev.box{n}.{n:012x}"
+        sshconfig.add(run_id, f"box{n}", "10.0.0.1", 2000 + n, tmp_path / "k", tmp_path / "h")
+
+    threads = [threading.Thread(target=add, args=(n,)) for n in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    entry = (ssh_dir / "gpubox_config").read_text()
+    assert all(f"Host box{n}\n" in entry for n in range(12))
+    assert (ssh_dir / "config").read_text() == "Include gpubox_config\n"
+    assert not [p.name for p in ssh_dir.iterdir() if "tmp" in p.name]
 
 
 def test_without_the_flag_nothing_is_written_to_the_ssh_directory(world, ssh_dir):
@@ -508,6 +554,16 @@ def test_renew_moves_the_lease(world, tmp_path, capsys):
     assert vast.probers[-1].ran[-1][1] == v.set_expiry_command(after)
     assert "lease now ends" in capsys.readouterr().out
     assert run(["down"]) == 0 and vast.ours() == []
+
+
+def test_renew_with_a_key_of_another_account_changes_nothing_on_the_box(world):
+    vast, run = world
+    assert run([*UP, "--account-id", "111"]) == 0
+    vast.account_id = "222"  # another key in this shell, and no pin
+    assert run(["renew", "--ttl-min", "600"]) == cli.EXIT_CONFIG
+    assert vast.probers[-1].ran == [] and vast.names("relabel") == []
+    vast.account_id = "111"
+    assert run(["down"]) == 0
 
 
 def test_renew_needs_a_live_box(world, tmp_path):

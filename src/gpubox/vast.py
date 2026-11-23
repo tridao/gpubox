@@ -311,7 +311,7 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
     again. That time is read from a file on the box, which `renew` rewrites;
     the file is created with the expiry of the create request unless it is
     already there (a restart must not undo a renewal), and anything in it
-    that is not a number falls back to that first expiry. Once the time has
+    that is not a number of at most ten digits falls back to that first expiry. Once the time has
     passed, the delete is sent every 30 s for as long as the timer runs,
     whatever the answers say: if it works, the loop ends with the box.
     """
@@ -319,7 +319,8 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
     watchdog = (
         f"[ -f {EXPIRY_FILE} ] || echo {expiry} > {EXPIRY_FILE}; "
         f"(while :; do e=$(cat {EXPIRY_FILE} 2>/dev/null); "
-        f'case "$e" in ""|*[!0-9]*) e={expiry};; esac; '
+        # Empty, not a number, or longer than a time: bash could not compare it.
+        f'case "$e" in ""|*[!0-9]*|???????????*) e={expiry};; esac; '
         f'if [ "$(date +%s)" -ge "$e" ]; then'
         f" python3 -c {shlex.quote(SELF_DESTROY)}; fi; sleep 30; done) >/dev/null 2>&1 &"
     )
@@ -383,8 +384,12 @@ def classify_status(msg: str) -> str | None:
 
 
 def endpoint_of(instance: dict) -> tuple[str, int] | None:
-    ip = instance.get("public_ipaddr")
-    mapped = (instance.get("ports") or {}).get("22/tcp") or []
-    if ip and mapped and mapped[0].get("HostPort"):
-        return str(ip).strip(), int(mapped[0]["HostPort"])
-    return None
+    """Where the box's sshd is, or None if the row does not say so in a form we can use.
+    A row we cannot read is one box's problem, never an error for the whole launch."""
+    try:
+        ip = str(instance["public_ipaddr"]).strip()
+        port = int(instance["ports"]["22/tcp"][0]["HostPort"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    usable = ip and not ip.startswith("-") and not any(c.isspace() for c in ip)
+    return (ip, port) if usable and 0 < port < 65536 else None

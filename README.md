@@ -16,8 +16,20 @@ CI:
 gpubox up --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 --ttl-min 60 \
     --image tridao/quack-kernels:cu13.2-DATE --namespace quack-ci --name "$RUN-$ATTEMPT"
 gpubox run --script remote.sh --env SHA=$SHA --timeout-min 40
-gpubox down --run-id "$RUN_ID"     # always; exit 75: something is left, and it says what
+gpubox down                        # always; exit 75: something is left, and it says what
 gpubox reap --namespace quack-ci --destroy    # from a schedule, every 30 minutes
+```
+
+In a GitHub workflow, give the teardown the run id as well, so that it works
+even if the state directory is lost. `up` writes it as a step output, not as
+an environment variable:
+
+```yaml
+- id: up
+  run: gpubox up ...
+- run: gpubox run --script remote.sh
+- if: always() && steps.up.outputs.run_id != ''
+  run: gpubox down --run-id "${{ steps.up.outputs.run_id }}"
 ```
 
 A dev box:
@@ -67,6 +79,8 @@ and `observations.jsonl` (which machines worked).
 - `down` exits 0 only when every id it knows is confirmed gone by lookup and
   two listings in a row show nothing with the run's tag. Otherwise it exits
   75 and prints what is left and what to do.
+- The price cap is checked on each offer again before it is rented, whatever
+  the search returned.
 - Not promised: a maximum lifetime. A box that `down` missed runs until its
   lease ends. A box whose container never started has no timer and waits for
   the reaper. Nothing here finds a box that was renamed, or that no listing

@@ -151,8 +151,7 @@ class State:
         state = cls(Path(state_dir) / STATE, {})
         state._replace({
             "version": 2, "run": run_id, "expiry": int(expiry), "account": account,
-            "meta": dict(meta), "ids": [], "winner": None, "ssh_alias": None,
-            "closing": False, "closed": False,
+            "meta": dict(meta), "ids": [], "winner": None, "closing": False, "closed": False,
         })  # fmt: skip
         return state
 
@@ -163,7 +162,7 @@ class State:
             raise StateError(f"not a run id: {run_id!r}")
         return cls(None, {
             "version": 2, "run": run_id, "expiry": 0, "account": None, "meta": {}, "ids": [],
-            "winner": None, "ssh_alias": None, "closing": True, "closed": False,
+            "winner": None, "closing": True, "closed": False,
         })  # fmt: skip
 
     run = property(lambda self: self.data["run"])
@@ -171,7 +170,6 @@ class State:
     account = property(lambda self: self.data.get("account"))
     meta = property(lambda self: self.data["meta"])
     ids = property(lambda self: list(self.data["ids"]))
-    ssh_alias = property(lambda self: self.data.get("ssh_alias"))
     closing = property(lambda self: bool(self.data.get("closing")))
     closed = property(lambda self: bool(self.data.get("closed")))
 
@@ -211,9 +209,6 @@ class State:
 
     def set_expiry(self, expiry: int) -> None:
         self._set(expiry=int(expiry))
-
-    def set_ssh_alias(self, alias: str | None) -> None:
-        self._set(ssh_alias=alias)
 
     def set_closing(self) -> None:
         if not self.closing:
