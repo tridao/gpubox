@@ -178,8 +178,12 @@ class Vast:
                         200, f"unreadable row in the instance listing: {str(row)[:200]}"
                     )
             rows.extend(page)
-            token = data.get("next_token")
-            if token is None:  # how the provider marks the last page
+            if "next_token" not in data:
+                # The last page says `"next_token": null`. A page without the
+                # field has not told us whether more follow.
+                raise VastError(200, "instance listing page has no next_token")
+            token = data["next_token"]
+            if token is None:
                 return rows
             if not isinstance(token, str) or not token or token in seen_tokens:
                 raise VastError(200, f"instance listing does not advance (token {token!r})")

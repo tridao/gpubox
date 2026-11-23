@@ -30,6 +30,17 @@ def run(tmp_path, behaviour, **kw):
     return result, vast, journal
 
 
+def outcome(launch):
+    """What `launch.run` raised, or None. Unlike `pytest.raises`, this also
+    holds on to a KeyboardInterrupt, which would otherwise end the whole
+    test session instead of failing one test."""
+    try:
+        launch.run({})
+    except BaseException as exc:
+        return exc
+    return None
+
+
 def reasons(result):
     return {a.machine_id: a.reason for a in result.attempts}
 
@@ -162,6 +173,46 @@ def test_after_an_image_error_the_others_get_a_short_while_not_the_whole_timeout
     nothing_left(vast, journal)
 
 
+def test_a_box_that_came_up_while_we_were_busy_is_not_thrown_away_at_the_deadline(tmp_path):
+    # Host 1 reports an image error. Confirming its delete takes longer than
+    # the grace period, and host 2 passes its gate in the meantime. When we
+    # get back to the loop the deadline is behind us, and so is a healthy box.
+    launch, vast, journal = start(tmp_path, {1: "image", 2: "hold"}, image_grace=0.1)
+
+    def slow_delete(iid):
+        if vast.live.get(iid, {}).get("machine") == 1:
+            vast.release.set()
+            assert vast.gate_started(2).wait(5)
+            time.sleep(0.4)  # well past the grace period
+
+    vast.on_destroy = slow_delete
+    result = launch.run({})
+    assert result.winner.machine_id == 2
+    only_winner_left(result, vast, journal)
+
+
+def test_a_queued_worker_does_not_rent_after_an_image_error(tmp_path, monkeypatch):
+    # Worker 2 has been handed its offer but has not sent the request yet.
+    launch, vast, journal = start(tmp_path, {1: "image", 2: "ok"}, image_grace=2)
+    real = v.create_payload
+
+    def paused(spec, label, pubkey):
+        if label.endswith(".a2"):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:  # until the image error has been dealt with
+                first = launch.attempts.get(1)
+                if first and first.state == "destroyed":
+                    break
+                time.sleep(0.002)
+        return real(spec, label, pubkey)
+
+    monkeypatch.setattr(v, "create_payload", paused)
+    with pytest.raises(L.ConfigError):
+        launch.run({})
+    assert vast.creates == 1 and statuses(journal)[2] == "refused"
+    nothing_left(vast, journal)
+
+
 def test_an_image_error_is_reported_when_nothing_else_comes_up(tmp_path):
     launch, vast, journal = start(tmp_path, {1: "image", 2: "bad_gpu", 3: "ok"})
     with pytest.raises(L.ConfigError):
@@ -214,6 +265,16 @@ def test_a_silent_provider_api_is_not_held_against_the_machine(tmp_path):
 # ------------------------------------------------------- signals and failures
 
 
+def held_in_create(launch, vast, machine):
+    """Make `machine`'s create reach the provider only after the race is decided."""
+
+    def before_create(m):
+        if m == machine:
+            assert launch.stop.wait(5)
+
+    vast.before_create = before_create
+
+
 def signal_when(vast, machines, signum=signal.SIGTERM):
     """Deliver a real signal to this process once the given gates are running."""
 
@@ -232,8 +293,7 @@ def test_a_signal_while_both_candidates_are_in_the_gate_rolls_back(tmp_path, sig
     before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
     launch, vast, journal = start(tmp_path, {1: "hold", 2: "hold"})
     signal_when(vast, (1, 2), signum)
-    with pytest.raises(KeyboardInterrupt):
-        launch.run({})
+    assert isinstance(outcome(launch), KeyboardInterrupt)
     assert vast.creates == 2 and vast.peak == 2
     nothing_left(vast, journal)
     assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
@@ -249,8 +309,7 @@ def test_a_signal_during_loser_cleanup_takes_the_candidate_down_too(tmp_path):
             os.kill(os.getpid(), signal.SIGTERM)
 
     vast.on_destroy = on_destroy
-    with pytest.raises(KeyboardInterrupt):
-        launch.run({})
+    assert isinstance(outcome(launch), KeyboardInterrupt)
     assert fired and journal.state().winner is None  # never handed off
     nothing_left(vast, journal)
 
@@ -265,8 +324,7 @@ def test_a_signal_right_after_the_winner_is_recorded_still_leaves_nothing(tmp_pa
             os.kill(os.getpid(), signal.SIGTERM)
 
     monkeypatch.setattr(journal, "append", signal_after_winner)
-    with pytest.raises(KeyboardInterrupt):
-        launch.run({})
+    assert isinstance(outcome(launch), KeyboardInterrupt)
     assert journal.state().winner is not None  # it was handed off, then taken back
     nothing_left(vast, journal)
 
@@ -282,8 +340,27 @@ def test_a_failure_takes_precedence_over_a_signal(tmp_path, monkeypatch):
         real(ev, **fields)
 
     monkeypatch.setattr(journal, "append", fail_and_signal)
-    with pytest.raises(OSError):
-        launch.run({})
+    assert isinstance(outcome(launch), OSError)
+    nothing_left(vast, journal)
+
+
+def test_a_worker_failure_during_cancellation_is_what_gets_reported(tmp_path, monkeypatch):
+    # A signal arrives; while we wait for the workers, one of them rents a box
+    # whose id cannot be journalled. The caller must hear about the journal,
+    # not just about the signal.
+    launch, vast, journal = start(tmp_path, {1: "hold", 2: "ok"})
+    held_in_create(launch, vast, 2)
+    real = journal.append
+
+    def no_id_for_two(ev, **fields):
+        if ev == "created" and fields.get("seq") == 2:
+            raise OSError(5, "Input/output error")
+        real(ev, **fields)
+
+    monkeypatch.setattr(journal, "append", no_id_for_two)
+    signal_when(vast, (1,))
+    assert isinstance(outcome(launch), OSError)
+    assert vast.creates == 2
     nothing_left(vast, journal)
 
 
@@ -325,16 +402,6 @@ def test_a_known_loser_that_will_not_go_away_means_no_winner(tmp_path):
     nothing_left(vast, journal)
 
 
-def held_in_create(launch, vast, machine):
-    """Make `machine`'s create reach the provider only after the race is decided."""
-
-    def before_create(m):
-        if m == machine:
-            assert launch.stop.wait(5)
-
-    vast.before_create = before_create
-
-
 def test_a_box_created_after_the_race_was_decided_is_destroyed(tmp_path):
     launch, vast, journal = start(tmp_path, {1: "ok", 2: "ok"})
     held_in_create(launch, vast, 2)
@@ -357,8 +424,7 @@ def test_a_late_failure_of_another_candidate_undoes_the_launch(tmp_path, monkeyp
         real(ev, **fields)
 
     monkeypatch.setattr(journal, "append", no_id_for_two)
-    with pytest.raises(OSError):
-        launch.run({})
+    assert isinstance(outcome(launch), OSError)
     assert vast.creates == 2 and journal.state().winner is None
     nothing_left(vast, journal)
 

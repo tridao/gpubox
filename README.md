@@ -23,8 +23,9 @@ cache this file between CI runs, and nothing else).
 
 - A box is used only after it passed the health gate, every other box whose
   id is known is confirmed gone, and its id is durably journalled as the
-  winner. Until then any failure or signal destroys everything the launch
-  rented. The one thing that may stay open beside a winner is a create that
+  winner. Until then any failure or signal rolls back everything the launch
+  rented; a box whose delete could not be confirmed stays in the journal for
+  `down`. The one thing that may stay open beside a winner is a create that
   never gave us an id (below).
 - `up` can be interrupted after the winner is journalled and still exit
   non-zero. Always run `down` after `up`, whatever it returned.
@@ -47,8 +48,9 @@ cache this file between CI runs, and nothing else).
 - `reap --destroy` deletes by label in a namespace you declare disposable.
   It does not know or check that this launcher rented those boxes.
 - Not guaranteed: a cap across separate runs; cleanup of a box whose code
-  relabelled it and killed its timer when the launcher's state is also lost
-  (use a provider account of its own for CI to close that).
+  relabelled it and killed its timer when the launcher's state is also lost.
+  `reap` works by label and cannot find such a box either; only a provider
+  account used for nothing else, swept as a whole, closes that.
 
 ## QuACK CI mapping
 

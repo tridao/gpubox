@@ -94,7 +94,8 @@ def test_an_explicit_refusal_in_a_200_is_refused(wire):
 
 
 def test_reads_are_retried_and_listing_follows_pages(wire):
-    w = wire(503, {"instances": [{"id": 1}], "next_token": "t"}, {"instances": [{"id": 2}]})
+    last = {"instances": [{"id": 2}], "next_token": None}
+    w = wire(503, {"instances": [{"id": 1}], "next_token": "t"}, last)
     assert [i["id"] for i in v.Vast("k").instances()] == [1, 2]
     assert "after_token" in w.requests[2][1] and "/v1/instances/" in w.requests[2][1]
 
@@ -257,12 +258,12 @@ def test_an_unreadable_error_body_does_not_change_what_the_status_means(monkeypa
 @pytest.mark.parametrize(
     "page",
     [
-        {"instances": [None]},
-        {"instances": [{"label": "no id"}]},
-        {"instances": [{"id": "7"}]},
-        {"instances": [{"id": True}]},
-        {"instances": [{"id": 0}]},
-        {"instances": [{"id": 1}, "text"]},
+        {"instances": [None], "next_token": None},
+        {"instances": [{"label": "no id"}], "next_token": None},
+        {"instances": [{"id": "7"}], "next_token": None},
+        {"instances": [{"id": True}], "next_token": None},
+        {"instances": [{"id": 0}], "next_token": None},
+        {"instances": [{"id": 1}, "text"], "next_token": None},
     ],
 )
 def test_a_listing_with_an_unreadable_row_is_an_error_not_a_shorter_list(wire, page):
@@ -318,7 +319,7 @@ def test_only_null_ends_a_listing(wire, token):
 
 def test_a_listing_page_that_says_it_failed_is_an_error(wire):
     for success in (False, 0, "true", None):
-        wire({"success": success, "instances": []})
+        wire({"success": success, "instances": [], "next_token": None})
         with pytest.raises(v.VastError):
             v.Vast("k").instances()
     wire({"instances": [{"id": 3}], "next_token": None})  # no discriminator at all is fine
@@ -338,3 +339,12 @@ def test_offers_with_nonpositive_ids_are_not_candidates(wire):
     good = {"id": 1, "machine_id": 2, "dph_total": 0.5}
     wire({"offers": [good, {**good, "id": 0}, {**good, "machine_id": -4}, {**good, "id": True}]})
     assert v.Vast("k").offers({}) == [good]
+
+
+def test_a_page_that_does_not_say_whether_more_follow_is_not_the_last_page(wire):
+    # The provider ends a listing with `"next_token": null`. Without the field
+    # we do not know that we have seen everything, and "nothing else carries
+    # this label" is exactly what callers conclude from a listing.
+    wire({"success": True, "instances": [{"id": 1}]})
+    with pytest.raises(v.VastError, match="next_token"):
+        v.Vast("k").instances()

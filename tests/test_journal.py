@@ -311,17 +311,36 @@ def test_two_intents_for_one_attempt_that_disagree_are_a_problem(tmp_path):
     assert not j2.state().problems  # an exact repeat is harmless
 
 
-def test_a_second_run_in_the_same_file_is_not_this_run(tmp_path):
+@pytest.mark.parametrize(
+    "header",
+    [
+        '{"ev": "run", "run_id": "ns.other.89abcdef", "namespace": "ns"}',  # another run
+        '{"ev": "run", "run_id": "ns.n.0123abcd", "namespace": "ns"}',  # the same header again
+        '{"ev": "run", "namespace": "ns"}',  # a header that lost its run id
+        '{"ev": "run", "run_id": "../../x", "namespace": "ns"}',
+        '{"ev": "run", "run_id": 7}',
+    ],
+)
+def test_nothing_after_a_second_header_is_this_runs(tmp_path, header):
+    # A journal holds one run. Ids after a second header, whatever that header
+    # says or fails to say, may belong to someone else's boxes.
     j = new_run(tmp_path)
     j.append("created", seq=1, instance_id=10)
     raw(
         j,
-        '{"ev": "run", "run_id": "ns.other.89abcdef", "namespace": "ns"}',
+        header,
         '{"ev": "created", "seq": 1, "instance_id": 77}',
+        '{"ev": "destroyed", "instance_id": 10}',
     )
     s = j.state()
-    assert s.run_id == "ns.n.0123abcd" and s.boxes == {10: "created"}  # 77 is not ours to act on
+    assert s.run_id == "ns.n.0123abcd" and s.boxes == {10: "created"}
     assert s.problems and not s.closed
+
+
+def test_two_intents_that_differ_only_in_the_offer_are_a_problem(tmp_path):
+    j = new_run(tmp_path)  # attempt 1 asked for offer 1
+    j.append("intent", seq=1, label="l1", offer_id=2, machine_id=1, host_id=1, dph=1)
+    assert j.state().problems
 
 
 @pytest.mark.parametrize(

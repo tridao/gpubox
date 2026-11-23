@@ -466,14 +466,19 @@ class Launch:
         try:
             fill()
             while pending and candidate is None and not self.cancelled:
+                # Look first, then at the clock: a box that came up while we
+                # were busy elsewhere (confirming a delete, say) still counts,
+                # even if the deadline has passed in the meantime.
                 remaining = give_up_at - time.monotonic()
-                if remaining <= 0:
+                done, _ = wait(
+                    pending,
+                    timeout=max(0, min(remaining, policy.tick)),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done and remaining <= 0:
                     if image_error is None:
                         log(f"giving up: no healthy box within {policy.overall_timeout:g}s")
                     break
-                done, _ = wait(
-                    pending, timeout=min(remaining, policy.tick), return_when=FIRST_COMPLETED
-                )
                 pending.difference_update(done)
                 finished = []
                 for fut in done:
@@ -487,6 +492,9 @@ class Launch:
                             # short while to prove it was this host's problem.
                             image_error = exc
                             give_up_at = min(give_up_at, time.monotonic() + policy.image_grace)
+                            # Nothing more is rented, including by a worker that
+                            # is queued but has not sent its request yet.
+                            self.rent_until = time.monotonic()
                         if owner[fut].state == "created":
                             self._destroy(owner[fut])  # it will never come up
                     else:
@@ -501,10 +509,10 @@ class Launch:
                         log(f"  {tag} failed ({a.reason or 'not blamed'}): {a.detail}")
                         if a.state == "created":
                             self._destroy(a)  # stop paying, and free its slot, now
-                if candidate is None and image_error is None:
-                    # After an image error nothing more is rented, but boxes
-                    # already rented may still come up: a healthy one proves the
-                    # image can be pulled and the error was that host's own.
+                if candidate is None:
+                    # After an image error the renting window is closed, so this
+                    # rents nothing; boxes already rented may still come up, and
+                    # a healthy one proves the error was that host's own.
                     fill()
             if candidate is None and image_error is not None:
                 raise image_error
@@ -516,17 +524,20 @@ class Launch:
         # One exit path. The candidate is kept only if everything below holds.
         keep = candidate  # set only by an error-free pass of the loop
         joined = self._cleanup(pool, keep)
+        late = [f.exception() for f in pending if f.done() and f.exception() is not None]
+        late = [e for e in late if not isinstance(e, ConfigError)]
+        if error is None and late:
+            # A worker failed after the race was decided (or after a signal):
+            # e.g. a box whose id could not be journalled. That is the failure
+            # to report, whether or not there was a candidate.
+            error = late[0]
         if keep is not None and error is None:
-            late = [f.exception() for f in pending if f.done() and f.exception() is not None]
-            late = [e for e in late if not isinstance(e, ConfigError)]
             stuck = [
                 a
                 for a in self.attempts.values()
                 if a is not keep and a.instance_id and a.state != "destroyed"
             ]
-            if late:
-                error = late[0]  # e.g. a loser whose id could not be journalled
-            elif not joined or stuck or self.cancelled:
+            if not joined or stuck or self.cancelled:
                 why = (
                     "a signal arrived"
                     if self.cancelled

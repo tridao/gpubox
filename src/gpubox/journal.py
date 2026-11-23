@@ -85,6 +85,7 @@ class AttemptState:
     # intent|refused|unknown|abandoned, or the status of its box
     status: str = "intent"
     instance_id: int | None = None
+    offer_id: int | None = None
     machine_id: int | None = None
     host_id: int | None = None
     dph: float = 0.0
@@ -253,13 +254,14 @@ class Journal:
             s.winner = {k: e[k] for k in ("seq", "instance_id", "host", "port")}
             return None
         if ev == "run":
+            if s.run_id is not None:
+                # A journal holds one run. Whatever a second header says, or
+                # fails to say, what follows it is not this run's.
+                return "stop"
             run_id = e["run_id"]
             if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
                 raise ValueError(f"bad run id {run_id!r}")
-            if s.run_id is None:
-                s.run_id, s.namespace, s.meta = run_id, str(e["namespace"]), e
-            elif run_id != s.run_id:
-                return "stop"
+            s.run_id, s.namespace, s.meta = run_id, str(e["namespace"]), e
             return None
         if ev in ("closed", "torn_tail"):
             s.closed = s.closed or ev == "closed"
@@ -274,8 +276,9 @@ class Journal:
             label = e["label"]
             if not isinstance(label, str):
                 raise ValueError(f"bad label {label!r}")
+            same = (label, e.get("machine_id"), e.get("offer_id"))
             if a is not None:
-                if (a.label, a.machine_id) != (label, e.get("machine_id")):
+                if (a.label, a.machine_id, a.offer_id) != same:
                     raise ValueError("a second, different intent for the same attempt")
                 return None
             ts = e.get("ts")
@@ -283,6 +286,7 @@ class Journal:
                 seq=seq,
                 label=label,
                 ts=float(ts) if finite_number(ts) else None,
+                offer_id=e.get("offer_id"),
                 machine_id=e.get("machine_id"),
                 host_id=e.get("host_id"),
                 dph=e.get("dph") or 0.0,
