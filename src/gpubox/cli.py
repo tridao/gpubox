@@ -15,6 +15,10 @@ the script's own exit code, except that 255 is taken for a lost connection.
 The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
+
+If GPUBOX_STORE_URL and GPUBOX_STORE_TOKEN are set, observations of machines
+are shared through that reputation store (`store/`). It is advisory: it costs
+a command at most a few seconds and never fails it.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from pathlib import Path
 
 from . import policy as pol
 from . import sshconfig
+from . import store as st
 from . import vast as v
 from .gate import GATE_VERSION, Prober
 from .launch import (
@@ -143,6 +148,37 @@ def observations_path(args) -> Path:
     return Path(args.state_dir) / "observations.jsonl"
 
 
+def open_shared(args) -> st.Shared:
+    """The shared reputation store, if one is configured and its settings make sense."""
+    try:
+        return st.Shared(observations_path(args), st.from_env())
+    except st.StoreError as exc:  # its messages never contain the URL or the token
+        log(f"WARNING: reputation store not used: {exc}")
+    except Exception as exc:
+        log(f"WARNING: reputation store not used: {type(exc).__name__}")
+    return st.Shared(observations_path(args), None)
+
+
+def share(shared: st.Shared, what: str, **kw) -> None:
+    """Talk to the store. Whatever happens there, the command carries on."""
+    if shared.store:
+        try:
+            log(f"reputation store: {shared.sync(**kw)}")
+        except st.StoreError as exc:  # its messages never contain the URL or the token
+            log(f"WARNING: reputation store ({what}): {exc}")
+        except Exception as exc:
+            log(f"WARNING: reputation store ({what}): {type(exc).__name__}")
+
+
+def known_rows(obs: pol.Observations, shared: st.Shared) -> list[dict]:
+    """This client's own rows, then what the store said others saw."""
+    try:
+        return [*obs.rows, *shared.remote_rows()]
+    except Exception as exc:
+        log(f"WARNING: reputation store not used: {type(exc).__name__}")
+        return list(obs.rows)
+
+
 def advisory(what: str, fn, *a, **kw) -> None:
     """Run something whose failure must not fail the command (reports, observations)."""
     try:
@@ -225,14 +261,19 @@ def cmd_up(args) -> int:
         state = State.begin(state_dir, run_id, expiry, account, meta)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
+        shared = open_shared(args)
+        share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
         keys = key_dir(state_dir, run_id)
         prober = Prober(keys)
         launch = Launch(vast, spec, policy, state, prober)
-        result = launch.run(pol.blocklist(obs.rows, time.time()))
+        result = launch.run(pol.blocklist(known_rows(obs, shared), time.time()))
         if result.winner and args.ssh_config:
             advisory("writing the SSH configuration", write_ssh_entry, state, keys)
     # The outcome is decided and in the state file; nothing below may change it.
     advisory("recording observations", observe, result, spec, run_id, obs)
+    if obs.added:
+        advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
+    share(shared, "after the launch", pull=False)  # also anything left from earlier runs
     advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
     advisory("writing the summary", write_summary, spec, result)
     advisory("reporting", report_result, spec, result, state)
@@ -347,6 +388,9 @@ def cmd_run(args) -> int:
             )
             pol.Observations(observations_path(args)).add(row)
             github_output(observations_changed="true")
+            shared = open_shared(args)
+            shared.queue([row])
+            share(shared, "after the run", pull=False)
 
         advisory("recording the observation", record)
     return EXIT_INFRA
@@ -422,7 +466,9 @@ def cmd_reap(args) -> int:
 def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
-    blocked = pol.blocklist(obs.rows, time.time())
+    shared = open_shared(args)
+    share(shared, "search")
+    blocked = pol.blocklist(known_rows(obs, shared), time.time())
     found = v.Vast(api_key(args)).offers(v.offer_query(spec))
     offers = pol.select_offers(v.in_allowed_country(found, spec.exclude_countries), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")

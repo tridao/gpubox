@@ -39,6 +39,7 @@ Each of these is false sometimes. The right-hand column is what happens then.
 | A3 | The state directory is sound. | It is written by one process under a lock; consistency checks on it found nothing in practice. | An unreadable state file: `down --run-id` works from the tag; the box's address and key are lost. |
 | A4 | The listing shows a box once its create has returned. | 65 of 65 boxes in `experiments/pull_time` did. | `down` could miss a box whose id it does not hold. It lists twice, a few seconds apart, to cover a short lag; beyond that, A2. |
 | A5 | The provider does not give an instance id to a second box. | `down` deletes the ids in the state file without looking at their tags, so that it reaches a box whatever its label. | A reused id would be someone else's box, deleted. |
+| A6 | Every holder of a reputation-store token is trusted (today: Tri's laptop and QuACK CI). | Opaque source ids, a revocation list and resumable reads guarded against a hostile or leaked token and a large table; neither is the case. | A leaked token can mark up to 500 machines a day failed for everyone (2 hours to 14 days each). Remove its secret, redeploy, and delete its rows. |
 
 Not assumed, because being wrong is expensive or the code is small:
 
@@ -188,8 +189,25 @@ the same launch. `observations.jsonl` then blocks it for 2 hours (GPU busy),
 1 day (unreachable, no network, died, stalled) or 14 days (wrong hardware,
 CUDA or runtime errors); a later healthy run clears the first two.
 
-The shared reputation store (`store/`, `store.py`) is parked: kept and
-tested on its own, called by no command. It will be wired back later.
+**Shared.** With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, the
+observations are also shared through `store/`: a Cloudflare Worker in front
+of D1, at https://gpubox-reputation.<subdomain>.workers.dev. Rows are facts (machine,
+kind, reason code); the store records who sent each one, from the token, and
+when, from its own clock. The policy stays in `policy.py` and is applied per
+source: a machine is blocked if any source's rows block it, and a source's
+`healthy` takes back only its own soft failures.
+
+- `up` reads before it searches, and sends after the launch; `run` sends a
+  box that died; `search` reads. One budget of 5 s covers all of a command's
+  talking to the store, and nothing about it can fail the command.
+- A read is one request for the last 30 days (failures, and `healthy` rows
+  that follow the same source's failure; at most 5,000, newest kept). It
+  replaces `observations.jsonl.remote` whole; a failed read leaves the
+  previous one in use.
+- Rows to send wait in `observations.jsonl.outbox` until the store has them;
+  a resend is harmless (the row id is unique).
+- The store limits each source to 500 rows a day and one failure per machine
+  per hour, and deletes rows after 90 days.
 
 ## 8. What was removed from revision 4
 

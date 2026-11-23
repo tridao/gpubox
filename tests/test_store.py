@@ -24,9 +24,7 @@ class FakeStore:
     """An HTTP server that behaves like the Worker, or misbehaves on request."""
 
     def __init__(self):
-        self.rows, self.requests, self.revoked = [], [], []
-        self.store_id = "0123456789abcdef"
-        self.page_size = 2
+        self.rows, self.requests = [], []
         self.mode = "ok"
         self.fail_posts_after = None  # POST number from which POSTs fail with 500
         self.reject_post = None  # POST number answered with 400
@@ -92,27 +90,15 @@ class FakeStore:
                     known = {r["id"] for r in owner.rows}
                     new = [r for r in rows if r["id"] not in known]
                     for r in new:
-                        owner.add(r, src="aaaa000000000001")
+                        owner.add(r, src="laptop")
                     return self._send(200, {"accepted": len(new), "ignored": len(rows) - len(new)})
-                after = int(self.path.split("after=")[1])
-                page = [r for r in owner.rows if r["seq"] > after][: owner.page_size]
-                more = len([r for r in owner.rows if r["seq"] > after]) > owner.page_size
-                answer = {
-                    "store": owner.store_id,
-                    "observations": page,
-                    "next": page[-1]["seq"] if more else None,
-                    "revoked": owner.revoked,
-                }
-                if mode == "endless":
-                    answer["next"] = after
-                if mode == "skips_ahead" and page:
-                    answer["next"] = page[-1]["seq"] + 100
-                if mode == "out_of_order" and len(page) > 1:
-                    answer["observations"] = page[::-1]
-                if mode == "no_next":
-                    del answer["next"]
-                if mode == "fail_page_2" and after:
+                if mode == "fail_reads":
                     return self._send(500, {"error": "internal error"})
+                answer = {"observations": owner.rows, "truncated": False}
+                if mode == "no_truncated":
+                    del answer["truncated"]
+                if mode == "rows_not_a_list":
+                    answer["observations"] = {"1": owner.rows}
                 return self._send(200, answer)
 
             def do_GET(self):
@@ -125,7 +111,7 @@ class FakeStore:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def add(self, row, src="bbbb000000000002", ts=None):
+    def add(self, row, src="quack_ci", ts=None):
         """Store a row the way the Worker would serve it."""
         served = {
             "seq": len(self.rows) + 1,
@@ -392,94 +378,31 @@ def test_a_busy_lock_costs_a_second_not_the_launch(tmp_path, remote):
 # ------------------------------------------------------------------- reading
 
 
-def test_reading_is_incremental(tmp_path, remote):
-    for m in range(1, 6):
-        remote.add(failed(m))
-    s = shared(tmp_path, remote)
-    assert s.sync() == "sent 0, read 5"
-    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3, 4, 5]
-    remote.requests.clear()
-    remote.add(failed(6))
-    assert shared(tmp_path, remote).sync() == "sent 0, read 1"
-    assert [r[1].split("after=")[1] for r in remote.requests] == ["5"]  # not from the start again
-    assert json.loads(s.remote.read_text())["cursor"] == 6
-    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3, 4, 5, 6]
-
-
-@pytest.mark.parametrize(
-    "mode", ["fail_page_2", "endless", "no_next", "skips_ahead", "out_of_order"]
-)
-def test_an_interrupted_read_keeps_a_consistent_prefix_and_resumes(tmp_path, remote, mode):
-    for m in range(1, 6):
-        remote.add(failed(m))
-    remote.mode = mode
-    s = shared(tmp_path, remote)
-    try:
-        s.sync()
-    except st.StoreError:
-        pass
-    got = [r["machine_id"] for r in s.remote_rows()]
-    # A prefix, never a subset with holes; and it gave up at once, not when the budget ran out.
-    assert got == list(range(1, len(got) + 1)) and len(got) < 5
-    assert len(remote.requests) <= 3
-    remote.mode = "ok"
-    shared(tmp_path, remote).sync()
-    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3, 4, 5]
-
-
-def test_a_page_out_of_order_is_refused(tmp_path, remote):
-    # Its last row is not its highest: taking it would move our position
-    # backwards and read the rest twice.
-    for m in range(1, 6):
-        remote.add(failed(m))
-    remote.page_size, remote.mode = 50, "out_of_order"
-    s = shared(tmp_path, remote)
-    with pytest.raises(st.StoreError, match="not in order"):
-        s.sync()
-    assert s.remote_rows() == []
-
-
-def test_what_a_revoked_source_wrote_is_dropped(tmp_path, remote):
-    remote.add(failed(1), src="aaaa")
-    remote.add(failed(2), src="bbbb")
-    s = shared(tmp_path, remote)
-    s.sync()
-    remote.revoked = ["aaaa"]
-    remote.add(failed(3), src="bbbb")
-    shared(tmp_path, remote).sync()
-    assert [r["machine_id"] for r in s.remote_rows()] == [2, 3]
-    on_disk = json.loads(s.remote.read_text())
-    assert {r["src"] for r in on_disk["rows"]} == {"bbbb"}  # dropped, not just hidden
-
-
-def test_revocations_are_never_forgotten(tmp_path, remote):
-    # A slow reader that fetched before the revocation applies its page last:
-    # the revoked source's rows must not come back.
-    remote.add(failed(1), src="aaaa")
-    s = shared(tmp_path, remote)
-    s.sync()
-    remote.revoked = ["aaaa"]
-    shared(tmp_path, remote).sync()
-    assert s.remote_rows() == []
-    stale = {
-        "acked": [],
-        "dropped": [],
-        "errors": [],
-        "pages": [(remote.store_id, [remote.rows[0]], 1, [])],
-    }
-    s._apply(stale)
-    assert s.remote_rows() == [] and json.loads(s.remote.read_text())["revoked"] == ["aaaa"]
-
-
-def test_rows_and_position_live_and_die_together(tmp_path, remote):
+def test_a_read_replaces_the_copy_whole(tmp_path, remote):
     for m in range(1, 4):
         remote.add(failed(m))
     s = shared(tmp_path, remote)
+    assert s.sync() == "sent 0, read 3"
+    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3]
+    # Rows the store no longer serves (a source cut off, its rows deleted) are gone here too.
+    del remote.rows[0]
+    remote.add(failed(4))
+    assert shared(tmp_path, remote).sync() == "sent 0, read 3"
+    assert [r["machine_id"] for r in s.remote_rows()] == [2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    "mode", ["fail_reads", "no_truncated", "rows_not_a_list", "garbage", "list"]
+)
+def test_a_failed_read_keeps_the_previous_one(tmp_path, remote, mode):
+    remote.add(failed(1))
+    s = shared(tmp_path, remote)
     s.sync()
-    s.remote.unlink()  # the copy is lost (a cache restored only in part, say)
-    assert s.remote_rows() == []
-    shared(tmp_path, remote).sync()
-    assert [r["machine_id"] for r in s.remote_rows()] == [1, 2, 3]  # read again from the start
+    remote.add(failed(2))
+    remote.mode = mode
+    with pytest.raises(st.StoreError):
+        shared(tmp_path, remote).sync()
+    assert [r["machine_id"] for r in s.remote_rows()] == [1]
 
 
 def test_what_was_read_from_another_store_is_not_used(tmp_path, remote, elsewhere):
@@ -490,20 +413,6 @@ def test_what_was_read_from_another_store_is_not_used(tmp_path, remote, elsewher
     elsewhere.add(failed(2))
     other.sync()
     assert [r["machine_id"] for r in other.remote_rows()] == [2]
-
-
-def test_a_store_that_was_replaced_is_read_from_the_start(tmp_path, remote):
-    for m in range(1, 4):
-        remote.add(failed(m))
-    s = shared(tmp_path, remote)
-    s.sync()
-    remote.rows.clear()  # a new database behind the same address: numbers start over
-    remote.store_id = "fedcba9876543210"
-    remote.add(failed(7))
-    assert "starting over" in shared(tmp_path, remote).sync()
-    assert s.remote_rows() == []  # nothing of the old one is kept...
-    shared(tmp_path, remote).sync()
-    assert [r["machine_id"] for r in s.remote_rows()] == [7]  # ...and the new one is read whole
 
 
 def test_rows_older_than_the_window_are_forgotten(tmp_path, remote):
@@ -533,7 +442,6 @@ def test_remote_rows_are_trusted_less_than_local_ones(tmp_path, remote, change):
     good = remote.add(failed(1))
     remote.rows.append({**remote.add(failed(2)), **change})
     remote.rows.pop(1)
-    remote.page_size = 50
     s = shared(tmp_path, remote)
     s.sync()
     assert [r["machine_id"] for r in s.remote_rows()] == [1]
@@ -576,12 +484,11 @@ def test_an_unreadable_copy_is_no_rows_not_an_error(tmp_path, remote):
         "not json",
         "[1, 2]",
         '{"origin": 5}',
-        json.dumps(
-            {"origin": s.store.identity(), "cursor": "x", "rows": [], "revoked": [], "store": None}
-        ),
+        json.dumps({"origin": s.store.identity(), "rows": "x"}),
+        json.dumps({"origin": s.store.identity(), "rows": [1, None, "x"]}),
     ):
         s.remote.write_text(junk)
-        assert s.remote_rows() == [] and s._load()["cursor"] == 0
+        assert s.remote_rows() == []
     s.remote.unlink()
     s.remote.mkdir()  # something is in the way
     assert s.remote_rows() == []
@@ -734,12 +641,6 @@ UP = [
 ]  # fmt: skip
 
 
-# The store is parked (DESIGN.md, decision 3): `store.py` is kept and tested on its
-# own above, but no command talks to it. The tests below drove it through `up`
-# and `search`; they come back when it is wired in again.
-parked = pytest.mark.skip(reason="the reputation store is parked: no command uses it")
-
-
 @pytest.fixture
 def world(tmp_path, monkeypatch, remote):
     vast = FakeVast({1: "ok", 2: "ok"})
@@ -770,19 +671,17 @@ def world(tmp_path, monkeypatch, remote):
     return vast, lambda argv: cli.main([*argv, "--state-dir", str(tmp_path)])
 
 
-@parked
 def test_up_skips_a_machine_someone_else_reported_and_reports_its_own(world, remote, tmp_path):
     vast, run = world
     remote.add(failed(1))
     assert run(UP) == 0
     assert vast.live[vast.ours()[0]]["machine"] == 2 and vast.creates == 1
-    sent = [r for r in remote.rows if r["src"] == "aaaa000000000001"]
+    sent = [r for r in remote.rows if r["src"] == "laptop"]
     assert [(r["machine_id"], r["kind"]) for r in sent] == [(2, "healthy")]
     assert st._read_lines(tmp_path / "observations.jsonl.outbox") == []
     assert run(["down"]) == 0
 
 
-@parked
 def test_a_setup_failure_of_the_http_stack_is_a_warning(world, monkeypatch, capsys):
     vast, run = world
 
@@ -794,7 +693,6 @@ def test_a_setup_failure_of_the_http_stack_is_a_warning(world, monkeypatch, caps
     assert run(["down"]) == 0
 
 
-@parked
 @pytest.mark.parametrize("mode", ["error", "garbage", "slow", "trickle"])
 def test_a_broken_store_costs_a_launch_a_few_seconds_and_nothing_else(
     world, remote, tmp_path, monkeypatch, capsys, mode
@@ -818,7 +716,6 @@ def test_a_broken_copy_on_disk_does_not_fail_a_launch(world, remote, tmp_path):
     assert run(["down"]) == 0
 
 
-@parked
 def test_the_real_setting_refuses_cleartext_and_says_so_without_the_url(world, monkeypatch, capsys):
     vast, run = world
     monkeypatch.undo()  # back to the real from_env ...
@@ -879,7 +776,6 @@ def test_the_client_and_the_real_worker_agree(tmp_path):
         # Three rows dealt with; one failure for machine 11 counts (the second is
         # spaced out), and the healthy row of an uncomplained-about machine is not served.
         assert mine.sync() == "sent 3, read 1"
-        assert json.loads(mine.remote.read_text())["store"]
         theirs.sync()
         (got,) = theirs.remote_rows()
         assert (got["machine_id"], got["kind"], got["reason_code"]) == (
@@ -887,14 +783,10 @@ def test_the_client_and_the_real_worker_agree(tmp_path):
             "failed_admission",
             "busy_gpu",
         )
-        assert (
-            abs(got["ts"] - time.time()) < 60
-            and len(got["src"]) == 16
-            and "laptop" not in json.dumps(got)
-        )
+        assert abs(got["ts"] - time.time()) < 60 and got["src"] == "laptop"
         assert set(pol.blocklist(theirs.remote_rows(), time.time())) == {11}
         mine.queue(rows)
-        assert mine.sync() == "sent 3, read 0"  # resending changes nothing, reading resumes
+        assert mine.sync() == "sent 3, read 1"  # resending changes nothing
         # The laptop sees machine 11 work again: that takes back its own verdict, for everyone.
         mine.queue([healthy(11)])
         mine.sync()
