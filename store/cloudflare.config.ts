@@ -1,5 +1,6 @@
 // Deployed with the `cf` CLI: `cf deploy` from this directory (see README.md).
-// A plain object, so that nothing has to be installed to read it. Tokens are
+// A plain object, so that nothing has to be installed to read it. Replace
+// <database-uuid> with the id `cf d1 create` printed for your database. Tokens are
 // secrets named TOKEN_<SOURCE>, one per client, uploaded with --secrets-file.
 export default {
   worker: {

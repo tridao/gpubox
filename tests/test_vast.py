@@ -272,19 +272,6 @@ def test_a_timer_is_not_built_from_a_bad_expiry(expiry):
         v.bootstrap_command("KEY", expiry)
 
 
-def test_the_pinned_recording_still_matches_the_reference_launcher_if_present():
-    """Optional: only meaningful in a checkout that sits next to QuACK."""
-    old_dir = Path(__file__).resolve().parents[2] / "cute-kernels/tools/ci/vast"
-    if not (old_dir / "vast_ci.py").exists():
-        pytest.skip("reference launcher not checked out next to this repository")
-    sys.path.insert(0, str(old_dir))
-    import vast_ci as old
-
-    ref = old.Spec(image=SPEC.image, label="LABEL", num_gpus=2, ttl_min=60)
-    assert REFERENCE["search"]["body"] == old.offer_query(ref)
-    assert REFERENCE["create"]["body"] == old.create_payload(ref, "KEY")
-
-
 # ----------------------------------------------------- answers we cannot trust
 
 
@@ -547,7 +534,7 @@ def test_offers_we_cannot_identify_or_price_are_not_candidates(wire):
         v.Vast("k").offers({})
 
 
-# ------------------------------------------------- round three: discriminators
+# ----------------------------------------------------- what counts as an answer
 
 
 @pytest.mark.parametrize("success", [0, "false", None, [], "no"])

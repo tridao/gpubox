@@ -12,7 +12,7 @@ best effort on top of that, and say so when they could not finish.
 
 A box counts as gone only when a lookup of its id says it does not exist.
 
-Assumptions (DESIGN.md, section 2, has the reasons and what each costs):
+Assumptions (DESIGN.md, section 3, has the reasons and what each costs):
 
   A1  Labels are trustworthy: nothing renames a box. So a tag finds every box
       of a run, and the reaper needs to look at nothing but tags.
@@ -23,6 +23,7 @@ Assumptions (DESIGN.md, section 2, has the reasons and what each costs):
       twice, a few seconds apart, to cover a short lag).
   A5  The provider does not give an instance id to a second box: `down`
       deletes the ids in the state file without looking at their tags.
+  A6  Whoever holds a token for the reputation store is trusted.
 
 Not assumed: that a create is answered (an unanswered one keeps its slot),
 that a delete worked (each is confirmed by a lookup), that the provider's
@@ -70,7 +71,7 @@ class Spec:
     must_reach: tuple[str, ...] = ()
     ttl_min: int = 90
     # Hosts in mainland China took a median of 250 s to load the CI image against 65 s
-    # elsewhere, and 2 of 6 never did (experiments/pull_time, 2026-11-23).
+    # elsewhere, and 2 of 6 never did (DESIGN.md, section 10).
     exclude_countries: tuple[str, ...] = ("CN",)
 
 
@@ -81,7 +82,7 @@ class Policy:
     startup_timeout: float = 300
     # A box that is not running yet and whose status has not changed for this long is
     # given up on. Pulls that finished went silent for at most 166 s; the ones that never
-    # finished, for 600 s and more (experiments/pull_time_dev, 2026-11-23).
+    # finished, for 600 s and more (DESIGN.md, section 10).
     stall_timeout: float = 300
     overall_timeout: float = 900
     cleanup_reserve: float = (

@@ -47,7 +47,7 @@ def test_a_tag_round_trips():
 @pytest.mark.parametrize(
     "label",
     [
-        None, 7, "", "quack-ci", "quack-ci-old.x.12345678.a1",  # revision 3's scheme
+        None, 7, "", "quack-ci", "quack-ci-old.x.12345678.a1",  # four parts
         "quack-ci.test.0123456789ab.a3",  # no expiry
         "quack-ci.test.0123456789ab.a3.179540000",  # nine digits
         "quack-ci.test.0123456789ab.a0.1795400000",  # attempts count from one

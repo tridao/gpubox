@@ -159,7 +159,7 @@ def test_each_key_directory_gets_its_own_key(tmp_path):
     assert Prober(tmp_path / "run-a").pubkey == a.pubkey  # stable within a run
 
 
-# ------------------------------------------------------------ round three
+# ------------------------------------------------------ whatever the box prints
 
 
 def test_whatever_bytes_the_box_prints_are_read_without_raising(tmp_path, monkeypatch):

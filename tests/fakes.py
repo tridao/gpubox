@@ -19,7 +19,7 @@ EXPIRY = int(time.time()) + 3600
 FOREIGN = (
     "vast-5090-4x-ca",
     None,
-    "quack-ci-old.x.12345678.a1",  # the label scheme of revision 3
+    "quack-ci-old.x.12345678.a1",  # looks like a tag, and is not one
     make_tag(OTHER_RUN, 1, EXPIRY),
 )
 FAST = Policy(

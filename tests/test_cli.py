@@ -245,7 +245,7 @@ def test_up_rents_nothing_with_a_key_of_another_account(world, monkeypatch, caps
 
 
 def test_down_with_a_key_of_another_account_is_an_error_not_a_clean_result(world, capsys):
-    # T3: the other account's listing is empty of our boxes, which says nothing.
+    # The other account's listing is empty of our boxes, which says nothing.
     vast, run = world
     assert run([*UP, "--account-id", "111"]) == 0
     vast.account_id = "222"
@@ -337,7 +337,7 @@ def test_a_late_teardown_of_an_earlier_run_does_not_touch_the_next_one(world, tm
     before = (tmp_path / "run.json").read_text()
     assert run(["down", "--run-id", first]) == 0  # the retried teardown of the first run
     assert vast.ours() == second_box
-    # T4: by tag alone, and nothing of the directory's current run is touched.
+    # By tag alone, and nothing of the directory's current run is touched.
     assert (tmp_path / "run.json").read_text() == before
     assert (tmp_path / "keys" / second).exists()
     assert run(["down"]) == 0 and vast.ours() == []
@@ -730,7 +730,7 @@ def test_reap_needs_explicit_permission_to_destroy(world, capsys):
     reap = ["reap", "--namespace", "quack-ci"]
     assert run(reap) == 0
     assert 50 in vast.live and "report only" in capsys.readouterr().out
-    assert vast.names("destroy") == []  # R4
+    assert vast.names("destroy") == []
     assert run([*reap, "--destroy"]) == 0
     assert 50 not in vast.live and foreign_untouched(vast)
 
@@ -747,7 +747,7 @@ def test_reap_reports_an_unreadable_listing_as_infrastructure(world):
     vast, run = world
     old_box(vast)
     vast.list_fails = 1
-    assert run(["reap", "--namespace", "quack-ci", "--destroy"]) == cli.EXIT_INFRA  # R5
+    assert run(["reap", "--namespace", "quack-ci", "--destroy"]) == cli.EXIT_INFRA
     assert 50 in vast.live
 
 

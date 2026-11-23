@@ -1,62 +1,68 @@
-# gpubox design, revision 5
+# gpubox design
 
-Status (2026-11-23): implemented on the branch `rev4`. Tested against a fake
-provider; individual API calls were exercised against Vast by the
-measurements in `experiments/`, but `up`, `run`, `renew` and `down` have not
-yet been run end to end on a real box (section 9).
+gpubox rents a GPU box on Vast.ai for a CI job or for development, checks
+that it works, and makes sure it is destroyed afterwards. This document says
+how, what it assumes, and what was decided against.
 
-Revision 4 tried to be correct against every case three reviews could
-construct, and grew to about 2,750 lines. Revision 5 keeps its structure (a
-tag on the box, one loop, one delete routine) and removes what only served
-cases that Tri decided on 2026-11-23 to assume away. Section 2 lists those
-assumptions, why each was made, and what it costs when it is false. The
-history is in git and in QuACK's `AI/gpubox_design.md` (revision 3).
+## 1. The problem
 
-## 1. What it does
+Four things cannot be designed away:
 
-`gpubox up` rents a GPU box on Vast.ai for a CI job or for development:
+1. **Hosts are unreliable.** A rented box may never start, or start broken.
+2. **A create request is not idempotent**, and its outcome can be unknown.
+3. **The controller can die at any moment**, and in CI its disk dies too.
+4. **A leaked box is silent.** It bills until someone looks.
 
-1. Search offers; drop excluded countries and recently failed machines;
-   take the cheapest, one machine per host.
-2. Rent up to `1 + --spare` boxes at once (2 by default) and wait for each to
-   boot, answer SSH and pass the health gate. A box that fails is destroyed
-   and replaced, up to `--max-attempts` rentals (6; an offer that was already
+The answers, in the same order: race a few hosts and health-check them; never
+resend a create, and keep a slot for one that got no answer; put ownership on
+the box itself, as a tag, so that anything can clean up; give every box a
+lease that ends it without help.
+
+## 2. What happens
+
+`gpubox up`:
+
+1. Search offers. Drop excluded countries, offers above the price cap and
+   recently failed machines; take the cheapest first, one machine per host.
+2. Rent up to `1 + --spare` boxes at once (2 by default). Each has to boot,
+   answer SSH and pass the health gate. One that fails is destroyed and
+   replaced, up to `--max-attempts` rentals (6; an offer that was already
    gone does not count).
-3. The first box through the gate is the winner; the others are destroyed.
-4. `gpubox run` runs a script on it; `gpubox down` destroys it.
+3. The first box through the gate is the winner. The others are destroyed.
 
-Every box carries a lease. When it ends the box destroys itself, and a
-scheduled reaper destroys whatever is left.
+`gpubox run` runs a script on the winner, `gpubox renew` moves the end of its
+lease, `gpubox down` destroys everything the run rented, and
+`gpubox reap --namespace NS` destroys boxes of a namespace whose lease has
+ended.
 
-## 2. Assumptions
+## 3. Assumptions
 
-Each of these is false sometimes. The right-hand column is what happens then.
+Each of these is false sometimes. The last column is what happens then.
 
-| # | Assumption | Why it was made | When it is false |
+| # | Assumption | Why | When it is false |
 |---|---|---|---|
-| A1 | Labels are trustworthy: nothing renames a box. | Guarding against it needed a dedicated account whose reaper destroys untagged boxes, with rules to avoid killing boxes seconds old. The only realistic source is hostile code approved into CI. | A renamed box is invisible to `down --run-id` and to the reaper. `down` from the original state directory still destroys it by id. Otherwise it runs until someone notices the bill. |
-| A2 | The lease bounds a leak; `up` and `down` are best effort. | Tracking every rare case precisely (a create with no answer, a lookup that lies, an interrupted hand-off) cost several hundred lines to save, at worst, one box running to the end of its lease (about $2.50 for CI). | A box that `down` missed runs until its lease ends. |
-| A3 | The state directory is sound. | It is written by one process under a lock; consistency checks on it found nothing in practice. | An unreadable state file: `down --run-id` works from the tag; the box's address and key are lost. |
-| A4 | The listing shows a box once its create has returned. | 65 of 65 boxes in `experiments/pull_time` did. | `down` could miss a box whose id it does not hold. It lists twice, a few seconds apart, to cover a short lag; beyond that, A2. |
-| A5 | The provider does not give an instance id to a second box. | `down` deletes the ids in the state file without looking at their tags, so that it reaches a box whatever its label. | A reused id would be someone else's box, deleted. |
-| A6 | Every holder of a reputation-store token is trusted (today: Tri's laptop and QuACK CI). | Opaque source ids, a revocation list and resumable reads guarded against a hostile or leaked token and a large table; neither is the case. | A leaked token can mark up to 500 machines a day failed for everyone (2 hours to 14 days each). Delete its secret (`cf workers secrets delete`; a redeploy keeps it) and its rows. |
+| A1 | Nothing renames a box. | Guarding against it needs a dedicated account whose reaper destroys everything untagged. The realistic source is hostile code that was approved to run in CI. | A renamed box is invisible to `down --run-id` and to the reaper. `down` from the original state directory still destroys it by id. |
+| A2 | The lease bounds a leak; `up` and `down` are best effort. | Chasing every rare case precisely costs far more code than the one box-lease it saves. | A box that `down` missed runs until its lease ends. |
+| A3 | The state directory is sound: one writer, under a lock. | | With an unreadable state file, `down --run-id` works from the tag; the box's address and key are lost. |
+| A4 | The listing shows a box once its create has returned. | Observed for every box rented while testing. | `down` could miss a box whose id it does not hold. It lists twice, seconds apart, for a short lag. |
+| A5 | An instance id is never given to a second box. | `down` deletes the ids in the state file without looking at their tags, to reach a box whatever its label. | A reused id would be someone else's box. |
+| A6 | Every holder of a reputation-store token is trusted. | The store only ever makes a launcher skip an offer. | A token holder can make everyone skip up to 500 machines a day. |
 
-Not assumed, because being wrong is expensive or the code is small:
+Not assumed, because being wrong is expensive or the check is small:
 
 - **A create may get no answer.** The attempt keeps its slot for the rest of
-  the launch, in memory, so a bad minute at the provider cannot rent six
-  boxes.
-- **A delete is not done until a lookup of that id says the box does not
+  the launch, so a bad minute at the provider cannot rent six boxes.
+- **A delete is done only when a lookup of that id says the box does not
   exist.** An accepted delete, an error or an empty listing is not that.
-- **The provider's answers may be malformed.** Every answer is read
-  strictly; a listing is complete or it raises.
-- **One host may be wrong about the image.** See section 4.
+- **The provider's answers may be malformed.** Each is read strictly; a
+  listing is complete or it is an error.
+- **The search may return what was not asked for.** The price cap and the
+  cheapest-first order are applied again locally.
+- **One host may be wrong about the image** (section 5).
 - **A box may die just after its gate.** It is looked up once more before
   the hand-off.
-- **The search may return what was not asked for.** The price cap and the
-  cheapest-first order are applied again locally before anything is rented.
 
-## 3. The tag and the lease
+## 4. The tag and the lease
 
 ```
 run id   <namespace>.<name>.<12 random hex>      quack-ci.19283746-1.3f9c2a1b5d7e
@@ -64,8 +70,8 @@ tag      <run id>.a<attempt>.<expiry>            quack-ci.19283746-1.3f9c2a1b5d7
 ```
 
 The tag is the instance's label, set by the create request. `expiry` is Unix
-time: `up`'s start plus `--ttl-min`. Parsing is exact; a label that does not
-parse is not ours. The random part means two runs never share an id, so a
+time: when `up` started plus `--ttl-min`. Parsing is exact; a label that does
+not parse is not ours. The random part means two runs never share an id, so a
 late teardown of one cannot touch another.
 
 Three things end a box:
@@ -76,35 +82,31 @@ Three things end a box:
 | timer in the box | in the container, started before anything else | the time in `/etc/gpubox-expiry` has passed |
 | `reap --namespace NS --destroy` | a scheduled job | the expiry in the tag passed more than 60 s ago |
 
-The timer uses the key Vast injects into each container to delete its own
-instance, and repeats the delete every 30 s. The expiry file is created from
-the create request unless it already exists (a container restart must not
-undo a renewal); content that is not a number falls back to the original
-expiry.
+The timer uses the key Vast gives each container to delete its own instance,
+and repeats the delete every 30 s. The expiry file is created from the create
+request unless it already exists, so that a container restart does not undo
+a renewal; content that is not a time falls back to the original expiry.
 
-`gpubox renew --ttl-min N` moves the lease: it rewrites the expiry file over
-SSH, then relabels the box with the new expiry, then updates the state file.
-The file comes first so that if the relabel is refused, the reaper still goes
-by the old expiry and the box can end early, not late. Two outcomes are not
-clean: a relabel that took effect but whose answer was lost, and a state file
-that could not be written afterwards. Both leave the box renewed while this
-directory shows the old expiry; `renew` says so, and running it again
-settles it.
+`renew` rewrites the expiry file over SSH, then relabels the box, then
+updates the state file. The file comes first so that if the relabel is
+refused, the reaper still goes by the old expiry and the box can end early,
+not late. If the relabel took effect but its answer was lost, or the state
+file could not be written, the box is renewed while the directory shows the
+old expiry; `renew` says so, and running it again settles it.
 
-What is not covered: a box whose container never starts (stuck pulling) has
-no timer, so only `down` and the reaper end it; and nothing finds a box that
+Not covered: a box whose container never starts (stuck pulling its image)
+has no timer, so only `down` and the reaper end it. Nothing finds a box that
 no listing shows.
 
-CI and dev boxes use different namespaces, and CI its own subaccount. The
-reaper only looks at one namespace, so it works the same on a shared account.
-`--account-id` pins the account: with it, `up`, `down`, `renew` and `reap`
-refuse a key that belongs to another one.
+Use one namespace per purpose (CI, dev), since the reaper works per
+namespace. `--account-id` pins the provider account: `up`, `down`, `renew`
+and `reap` then refuse a key that belongs to another one.
 
-## 4. The launch loop
+## 5. The launch loop
 
 One thread. Each pass:
 
-1. Look each candidate up by id and advance it: `booting` (wait for
+1. Look each candidate up by id and move it on: `booting` (wait for
    `running`), `probing` (SSH answers), `gating` (the health gate), then
    `healthy` or `failed`. Probes and gates are child processes that are
    polled, never waited for.
@@ -113,56 +115,56 @@ One thread. Each pass:
    billable boxes that we know of.
 3. If a candidate is healthy, look it up once more (still running, at least
    10 minutes of lease left) and hand over the cheapest.
-4. Otherwise rent into free slots, until 60 s before `--overall-timeout`.
+4. Otherwise rent into the free slots, until 60 s before `--overall-timeout`.
 
-A box fails when: the provider reports a machine error or `exited`; it is not
-reachable after `--startup-timeout` (300 s); its status has not changed for
-`--stall-timeout` (300 s) while it is still loading; or the gate says so.
-Stall and timeout values come from `experiments/`: pulls that finished went
-silent for at most 166 s, and the ones that never finished for 600 s or more.
+A box fails when the provider reports a machine error or `exited`; when it
+is not reachable after `--startup-timeout` (300 s, counted from the create,
+so it includes the image pull); when it is still loading and its status has
+not changed for `--stall-timeout` (300 s); or when the gate says so.
 
-**Image errors.** A host that says the image cannot be pulled is a failed
-box, blamed on nobody. When two different hosts have said so (boxes whose
-host the offer does not name do not count as different), the launch
-stops as a configuration error (exit 2). With a wrong tag that is about 40 s
-in; a single misconfigured host is simply replaced. If the launch ends with
-no box and any host blamed the image, that is what is reported.
-
-A box that is running and whose sshd refuses the run's key is treated the
-same way: our own sshd is started with that key, so a refusal means the image
-runs something else in place of our start-up command, and waiting for the
-start-up timeout cannot help.
+**The image is the problem** when a host says it cannot be pulled, or when a
+box is running and its sshd refuses the run's key (our own sshd is started
+with that key, so the image must be running something else). Either fails
+that box, blamed on nobody. When two different hosts have shown it, the
+launch stops as a configuration error (exit 2): with a wrong tag that is
+about 45 s in, and one misconfigured host is simply replaced. Boxes whose
+host the offer does not name do not count as different hosts.
 
 **The hand-off** is the write that puts the winner into the state file.
-Before it, a failure or a signal rolls back everything the launch rented;
-after it the winner is kept. The rollback aims at 10 s (what a cancelled CI
-step gets): it stops the child processes, sends every delete before waiting
-for any, and gives up at the deadline. The timeouts it passes on are socket
-timeouts with a floor of half a second, so 10 s is a target, not a bound.
-`down` must always follow `up`.
+Before it, a failure or a signal rolls back what the launch rented; after it
+the winner is kept. The rollback aims at 10 s, which is what a cancelled CI
+step gets: it stops the child processes, sends every delete before waiting
+for any, and gives up at the deadline. It is an attempt, so `down` must
+always follow `up`.
 
-When `up` ends, either way, it destroys the ids it holds, using at most half
-its time on them, then lists once for anything else carrying the run's tag,
-which is how the box of a create that got no answer is found.
+A healthy winner is kept even if a loser's delete is not confirmed:
+destroying it would remove no leak, and would need the call that is failing.
 
-## 5. Teardown
+When `up` ends, either way, it destroys the ids it holds and then lists once
+for anything else with the run's tag. That is how the box of a create that
+got no answer is found.
+
+**SSH.** The bootstrap writes the run's public key to a file of its own and
+starts sshd reading only that file. Root's `authorized_keys` cannot be used:
+Vast replaces it with the account's registered key as the container starts.
+Each run has its own key pair, removed when the run is closed.
+
+## 6. Teardown
 
 `down` works in rounds for up to a minute: a short delete-and-lookup round
 for every id known so far (first those in the state file), then a listing,
 whose boxes with the run's tag join the next round. A box that will not go
 away therefore cannot keep one found later from being deleted. It is done
-when two listings in a row, a few seconds apart, show nothing with the run's
-tag (a box already confirmed gone that a lagging listing still shows does
-not count as nothing). Then it exits 0, closes the run, and removes the
-run's key and SSH entry.
+when two listings in a row, seconds apart, show nothing with the run's tag.
+Then it exits 0, closes the run, and removes the run's key and SSH entry.
 
-If it cannot get there it exits 75 and prints the ids that are left, the
-command to retry, the console URL, and when the boxes' own lease ends.
+Otherwise it exits 75 and prints the ids that are left, the command to
+retry, where to delete them by hand, and when their lease ends.
 
-`down --run-id ID` for a run the directory has no state for does the same
+`down --run-id ID` for a run the directory has no state of does the same
 from the tag alone. That is the CI case: a runner whose disk is gone.
 
-## 6. Local state
+## 7. Local state
 
 `<state-dir>/run.json`, replaced whole at each change:
 
@@ -173,73 +175,101 @@ winner                         id, attempt, host, port, machine, host_id
 closing, closed
 ```
 
-Plus `keys/<run id>/` (an SSH key and known-hosts file per run), a lock
+Beside it: `keys/<run id>/` (the run's SSH key and known-hosts file), a lock
 taken by `up`, `down` and `renew`, and `observations.jsonl`.
 
 `up --ssh-config` writes a `Host <name>` block for the winner to
 `~/.ssh/gpubox_config` and makes sure the first directive of `~/.ssh/config`
-is `Include gpubox_config`. Nothing else in the user's file is changed; if it
-is a symbolic link, its target is written. Boxes in different state
-directories share these files, so changes are made under a lock of their own.
+is `Include gpubox_config`. Nothing else in that file is changed, and a
+symbolic link is followed, not replaced. Boxes in different state
+directories share these files, so they are changed under a lock of their own.
 
-## 7. Gate and blocklist
+## 8. Health gate and blocklist
 
-The gate is revision 3's: GPU count, model and VRAM; required URLs
-reachable; GPU idle before our first CUDA context; CUDA initialises; per GPU
-a matmul checked against the CPU, and 80% of free VRAM allocated and filled,
-with its first and last bytes read back.
+The gate runs on the box with the image's own Python and PyTorch: GPU count,
+model and VRAM; required URLs reachable; the GPU idle before our first CUDA
+context; CUDA initialises; and per GPU a matmul checked against the CPU and
+80% of free VRAM allocated and filled. It checks the machine, not the
+project under test.
 
 A machine is recorded as failed only if another candidate became healthy in
-the same launch. `observations.jsonl` then blocks it for 2 hours (GPU busy),
-1 day (unreachable, no network, died, stalled) or 14 days (wrong hardware,
-CUDA or runtime errors); a later healthy run clears the first two.
+the same launch; otherwise the cause may be ours. `observations.jsonl` then
+blocks it for 2 hours (GPU busy), 1 day (unreachable, no network, died,
+stalled) or 14 days (wrong hardware, CUDA or runtime errors). A later
+healthy run clears the first two, and they are let back in when too few
+hosts are left. The 2 hours come from measurement; the other two are guesses.
 
-**Shared.** With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, the
-observations are also shared through `store/`: a Cloudflare Worker in front
-of D1, at https://gpubox-reputation.<subdomain>.workers.dev. Rows are facts (machine,
-kind, reason code); the store records who sent each one, from the token, and
-when, from its own clock. The policy stays in `policy.py` and is applied per
-source: a machine is blocked if any source's rows block it, and a source's
-`healthy` takes back only its own soft failures.
+## 9. Reputation store
 
-- `up` reads before it searches, and sends after the launch; `run` sends a
-  box that died; `search` reads. One budget of 5 s covers all of a command's
-  talking to the store, and nothing about it can fail the command.
-- A read is one request for the last 30 days (failures, and `healthy` rows
-  that follow the same source's failure; at most 5,000, newest kept). It
-  replaces `observations.jsonl.remote` whole; a failed read leaves the
-  previous one in use.
-- Rows to send wait in `observations.jsonl.outbox` until the store has them;
-  a resend is harmless (the row id is unique). The store times a row from
-  when it arrives, so a failure whose block is already over is not sent.
-- A row of ours that the store has is judged as the store has it, under the
-  source that sent it: CI runners share one token, and one runner's local
-  copy must not outvote what the same source reported later.
+Optional. With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, observations
+are shared through `store/`: a Cloudflare Worker in front of a D1 database.
+Clients send observations (machine id, kind, reason code); the store records
+who sent each one, from the token, and when, from its own clock. The
+blocklist policy stays in the client.
+
+- It is advisory. A command waits at most 5 s in total for it, and nothing
+  about it can fail the command. It can only make an offer be skipped.
+- `up` and `search` read the last 30 days in one request. If that fails, the
+  previous read is used.
+- Rows to send wait in `observations.jsonl.outbox` until the store has them.
+  A resend is harmless: a row's id is unique.
+- Rows are judged per source. A machine is blocked if any source's rows block
+  it, and a `healthy` row only takes back failures of its own source.
 - The store limits each source to 500 rows a day and one failure per machine
-  per hour, and deletes rows after 90 days.
+  per hour.
 
-## 8. What was removed from revision 4
+## 10. Measured
 
-| Removed | Covered by |
-|---|---|
-| `reap --exclusive`, its two-look and max-age rules | A1 |
-| attempt states on disk, `--abandon-unseen`, exit 75 for a create with no answer | A2; the slot is held in memory |
-| correcting a lookup that wrongly said "gone" | A2 |
-| keeping a winner whose hand-off cannot be read back | A2 |
-| state-file consistency checks, directory-sync error handling | A3 |
-| a listing on every pass of the loop (adoption, blind timeout) | candidates are looked up by id; one listing when `up` ends |
-| the 90 s grace after an image error | the two-host rule |
+On Vast, November 2026. Small samples, one day.
 
-## 9. Not yet verified against the provider
+- **Loading a 1.3 GB image** (50 hosts, time from create to running): median
+  69 s, 90th percentile 226 s; 46 of 50 running within 300 s. Outside
+  mainland China, location made no visible difference. Advertised bandwidth
+  only mattered below about 500 Mbps.
+- **Mainland China**: median 250 s, and 2 of 6 hosts never finished. Hence
+  the default `--exclude-country CN`.
+- **Racing** (resampling those 50 hosts): the first of two is running after
+  72 s on average (90th percentile 107 s), against 130 s (278 s) for one.
+- **A 4 GB image** (6 hosts): 80 to 350 s where the pull finished; two
+  stalled for ten minutes or more. Pulls that finished were silent for at
+  most 166 s, which is where the stall rule comes from.
+- **Gate failures**: in an earlier sample 4 of 14 rentals had a busy GPU
+  before we touched it; two of those machines were fine 25 and 90 minutes
+  later.
+- **The listing** answers 429 at about one call every 3 s, which is why the
+  loop polls by id.
 
-- `PUT /instances/{id}/` with `{"label": ...}` (used by `renew`): from the
-  documentation only.
-- The timer in the bootstrap: its loop is tested in bash with a stand-in for
-  the delete; it has never fired on a real box.
-- Whether `/etc/gpubox-expiry` survives a container restart on Vast.
-- Whether a Vast subaccount has its own instance list and key.
-- `up`, `run`, `renew`, `down` end to end.
+Exercised end to end on real boxes: `up`, `run`, `renew`, `down`; the in-box
+timer destroying a box 19 s after its lease ended; a container restart
+(expiry, timer, address and host key kept); the reaper; a race with a loser;
+an interrupt mid-launch (exit after 7 s, nothing left); a killed controller
+cleaned up with `down --run-id` from an empty directory; a wrong image tag;
+and a full test suite on 2x RTX 5090.
 
-Seen against the real API on 2026-11-23: the strict listing (204 calls), the
-account lookup, create, lookup and delete; the listing answers 429 at about
-one call every 3 s, which is why the loop polls by id.
+Not yet seen on a real box: a create that got no answer, a delete that did
+not take, and a provider subaccount.
+
+## 11. Considered, and decided against
+
+- **A local journal as the authority on what a run owns.** It needs replay,
+  damage handling and a manual step for creates with no answer, and it is
+  gone exactly when it matters most, with the CI runner's disk.
+- **A dedicated account whose reaper destroys anything untagged.** It is the
+  defence against a box that renames itself (A1). It needs the account to be
+  used for nothing else, and rules to avoid killing boxes that are seconds
+  old.
+- **Listing the account on every pass of the loop.** It allows adopting the
+  box of a create that got no answer mid-race, but the listing is rate
+  limited; one listing when `up` ends finds that box as well.
+- **Destroying the winner when a loser's delete is unconfirmed.** A cleaner
+  postcondition, at the price of a failed launch and no leak removed.
+- **Giving the slot of an unanswered create back after a while.** Repeated
+  timeouts could then stack up unseen boxes.
+- **Waiting, after one host's image error, for the others to prove it
+  wrong.** The two-host rule is faster and needs no timer.
+- **The provider's SDK.** It retries create requests and rewrites search and
+  create payloads; the client here is one standard-library module.
+- **A provider interface.** There is one provider. What the launcher needs
+  from it is seven calls (`offers`, `create`, `instances`, `instance`,
+  `destroy`, `relabel`, `account`), which is where a second provider would
+  start.

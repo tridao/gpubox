@@ -1,7 +1,6 @@
 # gpubox reputation store
 
-A Cloudflare Worker in front of a D1 database, at
-`https://gpubox-reputation.<subdomain>.workers.dev`. Clients
+A Cloudflare Worker in front of a D1 database. Clients
 post what they observed about rented machines and read back what everyone
 observed; the blocklist policy stays in the Python package. The store is
 advisory: nothing depends on it for cleanup, and a launch never fails because
@@ -35,7 +34,7 @@ GET  /v1/health
   about stay in the database. At most 5,000 rows, the newest.
 - Rows are deleted after 90 days by a daily scheduled run.
 
-Every token holder is trusted (DESIGN.md, A6). What one token can do: mark up
+Every token holder is trusted (DESIGN.md, assumption A6). What one token can do: mark up
 to 500 machines a day as failed for everyone, for as long as the policy
 blocks on one source's word (two hours to 14 days). It cannot unblock a
 machine for anyone else. To cut a source off (say `laptop`):
@@ -63,14 +62,15 @@ needs a newer one than 0.15.
 
 ```bash
 export CLOUDFLARE_ACCOUNT_ID=<your-account-id>
+npx cf d1 create --name gpubox-reputation       # once; put its uuid in cloudflare.config.ts
 npx cf d1 migrations apply <database-uuid>
 npx cf deploy --secrets-file ~/.config/gpubox/store-secrets.json
 ```
 
-The database was created once with `npx cf d1 create --name gpubox-reputation`
-(its uuid is in `cloudflare.config.ts`). The account's workers.dev subdomain,
-`gpubox`, was registered once through the API (`PUT
-/accounts/{id}/workers/subdomain`); `cf` has no command for it.
+The Worker is then served at `https://gpubox-reputation.<subdomain>.workers.dev`.
+An account that has no workers.dev subdomain yet needs one registered first,
+through the dashboard or the API (`PUT /accounts/{id}/workers/subdomain`);
+`cf` has no command for it.
 
 The secrets file is JSON, mode 600, and stays out of the repository:
 
@@ -78,8 +78,8 @@ The secrets file is JSON, mode 600, and stays out of the repository:
 {"TOKEN_LAPTOP": "...", "TOKEN_QUACK_CI": "..."}
 ```
 
-A client is configured with `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN`; for
-CI, put them in the repository's secrets.
+A client is configured with `GPUBOX_STORE_URL` (the Worker's address) and
+`GPUBOX_STORE_TOKEN`; for CI, put them in the repository's secrets.
 
 The Worker's entry module must export nothing but the default handler object;
 the runtime rejects any other export (the tests catch this, `cf deploy

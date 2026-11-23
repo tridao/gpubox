@@ -1,137 +1,137 @@
 # gpubox
 
-Rent a verified GPU box from Vast.ai, and make sure it is destroyed afterwards.
+Rent a GPU box from [Vast.ai](https://vast.ai), check that it works, and make
+sure it is destroyed afterwards. For CI jobs and dev boxes.
 
-For a CI job or a dev box. Standard library only (Python 3.10+). `DESIGN.md`
-is the design, including the assumptions it rests on.
+Marketplace hosts are unreliable: some never finish pulling the image, some
+come up with a GPU that is already busy. gpubox rents two at once, keeps the
+first that passes a health check, and destroys the other. Every box carries
+a lease, and destroys itself when the lease ends even if nothing else is
+left to do it.
+
+Standard library only, Python 3.10+. `DESIGN.md` explains how it works, what
+it assumes, and what was measured.
+
+## Install
 
 ```bash
+pip install git+https://github.com/tridao/gpubox@<commit>
 export VASTAI_API_KEY=...
-export GPUBOX_ACCOUNT_ID=...       # optional: refuse a key of any other account
-export GPUBOX_STORE_URL=https://gpubox-reputation.<subdomain>.workers.dev   # optional: share what machines did
-export GPUBOX_STORE_TOKEN=...      # this client's token for the store
 ```
 
-CI:
+In CI, pin a commit: the job that runs gpubox holds your Vast key.
+
+## A dev box
 
 ```bash
-gpubox up --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 --ttl-min 60 \
-    --image tridao/quack-kernels:cu13.2-DATE --namespace quack-ci --name "$RUN-$ATTEMPT"
-gpubox run --script remote.sh --env SHA=$SHA --timeout-min 40
-gpubox down                        # always; exit 75: something is left, and it says what
-gpubox reap --namespace quack-ci --destroy    # from a schedule, every 30 minutes
+gpubox up --gpu "RTX 4090" --max-dph-per-gpu 0.60 --image my/image:tag \
+    --namespace dev --name mybox --ttl-min 480 --ssh-config
+ssh mybox                      # also scp, rsync, editors
+gpubox renew --ttl-min 480     # the lease now ends 8 hours from now
+gpubox down
 ```
 
-In a GitHub workflow, give the teardown the run id as well, so that it works
-even if the state directory is lost. `up` writes it as a step output, not as
-an environment variable:
+`--ssh-config` adds a `Host mybox` entry to `~/.ssh/gpubox_config` and one
+`Include` line at the top of `~/.ssh/config`. `down` removes the entry.
+
+A large image needs a longer `--startup-timeout` than the default 300 s,
+which counts from the rental and so includes the image pull.
+
+## A CI job
 
 ```yaml
 - id: up
-  run: gpubox up ...
-- run: gpubox run --script remote.sh
+  run: >
+    gpubox up --gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25
+    --image my/ci-image:tag --namespace my-ci
+    --name "${{ github.run_id }}-${{ github.run_attempt }}" --ttl-min 60
+- run: gpubox run --script remote.sh --env "SHA=${{ github.sha }}" --timeout-min 40
 - if: always() && steps.up.outputs.run_id != ''
   run: gpubox down --run-id "${{ steps.up.outputs.run_id }}"
 ```
 
-A dev box:
+and, from a schedule every half hour:
 
 ```bash
-gpubox up --gpu "RTX 4090" --max-dph-per-gpu 0.60 --ttl-min 480 --startup-timeout 600 \
-    --image tridao/quack-kernels-dev:DATE --namespace dev --name mybox --ssh-config
-ssh mybox                          # also scp, rsync, editors
-gpubox renew --ttl-min 480         # the lease now ends 8 hours from now
-gpubox down
+gpubox reap --namespace my-ci --destroy
 ```
 
-`up` prints the run id and writes it to the step outputs (`run_id`) before it
-rents anything, and refuses to start if it cannot. State lives in
-`--state-dir` (default `.gpubox`): `run.json`, a throwaway SSH key per run,
-and `observations.jsonl` (which machines worked).
+`up` writes the run id as a step output before it rents anything. Passing it
+to `down` lets the teardown work even from a runner that has lost the state
+directory. Always run `down` after `up`, whatever `up` returned.
+
+## Commands
+
+| | |
+|---|---|
+| `up` | rent a box and wait until it passes the health gate |
+| `run` | run a local script on the box over SSH, streaming its output |
+| `renew` | move the end of the box's lease |
+| `down` | destroy everything the run rented |
+| `reap` | destroy boxes of a namespace whose lease has ended (without `--destroy`: report) |
+| `search` | show the offers `up` would try; rents nothing |
+
+Exit codes: 0 ok; 2 configuration (bad arguments, no API key, an image that
+cannot be pulled or does not start our sshd); 75 infrastructure (no healthy
+box, box lost mid-run, teardown not confirmed); 124 script timeout. `run`
+otherwise returns the script's own exit code.
+
+State lives in `--state-dir` (default `.gpubox`): `run.json`, an SSH key per
+run, and `observations.jsonl`.
 
 ## How it works
 
-- `up` races `1 + --spare` hosts (2 by default), cheapest first, one machine
-  per host. The first to boot, answer SSH and pass the health gate wins; the
-  others are destroyed. A box that fails is replaced, up to `--max-attempts` rentals (an offer that
-  was already gone does not count).
-- Every box carries a tag as its label,
-  `<namespace>.<name>.<random>.a<attempt>.<expiry>`. Anything that knows the
-  run id can find the run's boxes and destroy them. `down --run-id` needs
-  nothing else, which is what cleans up after a CI runner whose disk is gone.
-- Every box has a lease (`--ttl-min`). A timer inside the box destroys it
-  when the lease ends; `reap` destroys boxes of a namespace whose lease has
-  ended. `renew` moves the end of the lease.
-- Hosts in mainland China are skipped (`--exclude-country`, default `CN`;
-  `none` to skip none): they took a median of 250 s to load the CI image
-  against 65 s elsewhere.
-- A box still loading whose status has not changed for `--stall-timeout`
-  (300 s) is replaced. That matters when `--startup-timeout` is longer, as a
-  large image needs.
-- If two hosts say the image cannot be pulled, or two boxes come up and
-  refuse the run's SSH key (the image does not run gpubox's start-up
-  command), `up` stops with exit 2.
+- **Race.** `up` rents `1 + --spare` hosts (2 by default), cheapest first,
+  one machine per host. A box that fails is destroyed and replaced, up to
+  `--max-attempts` rentals.
+- **Health gate.** GPU model, count and VRAM; required URLs reachable
+  (`--must-reach`); the GPU idle before we touch it; CUDA works; a matmul on
+  every GPU matches the CPU; most of the VRAM can be allocated. It needs
+  PyTorch in the image.
+- **Tag.** Every box is labelled `<namespace>.<name>.<random>.a<n>.<expiry>`
+  when it is rented. Anything that knows the run id can find the run's boxes
+  and destroy them.
+- **Lease.** `--ttl-min` after `up` started, a timer inside the box destroys
+  it. `reap` destroys boxes whose lease has ended, in case the timer could
+  not. `renew` moves the end.
+- **Blocklist.** A machine that failed while another succeeded in the same
+  launch is skipped for 2 hours to 14 days, depending on why
+  (`observations.jsonl`; cache it between CI runs).
+- **Defaults from measurement.** Hosts in mainland China are skipped
+  (`--exclude-country`, default `CN`; `none` to skip none). A box whose
+  loading status has not changed for `--stall-timeout` (300 s) is replaced.
 
 ## What it promises, and what it does not
 
-- `up` exits 0 only with a box that passed the health gate, was still running
-  when looked up afterwards, and is recorded in `run.json`. Before that point
-  a failure or a signal rolls back what the launch rented; the rollback has
-  ten seconds and is an attempt. Always run `down` after `up`.
-- At most `1 + --spare` attempts hold a slot. A failed box keeps its slot
-  until a lookup says it is gone; a create that got no answer keeps its slot
-  for the rest of the launch.
-- `down` exits 0 only when every id it knows is confirmed gone by lookup and
+- `up` exits 0 only with a box that passed the gate, was still running when
+  looked up afterwards, and is recorded in `run.json`. Before that, a failure
+  or Ctrl-C rolls back what was rented. The rollback gets about ten seconds
+  and is an attempt; `down` finishes it.
+- At most `1 + --spare` boxes are billable at once, as far as gpubox can
+  know. A rental request that got no answer keeps its slot.
+- No offer above the price cap is rented, whatever the search returned.
+- `down` exits 0 only when every box it knows of is confirmed gone by id and
   two listings in a row show nothing with the run's tag. Otherwise it exits
-  75 and prints what is left and what to do.
-- The price cap is checked on each offer again before it is rented, whatever
-  the search returned.
+  75 and says what is left and what to do.
 - Not promised: a maximum lifetime. A box that `down` missed runs until its
-  lease ends. A box whose container never started has no timer and waits for
-  the reaper. Nothing here finds a box that was renamed, or that no listing
-  shows. There is no cap across separate runs.
+  lease ends. A box stuck pulling its image has no timer yet and waits for
+  the reaper. Nothing here finds a box that was renamed, or that the
+  provider does not list. There is no spending cap across runs.
 
-## Not yet verified against the provider
+`--account-id` (or `GPUBOX_ACCOUNT_ID`) makes every command refuse an API key
+that belongs to another account.
 
-`up`, `run`, `renew` and `down` have not been run end to end on a real box.
-The fake provider in the tests follows Vast's documentation and what was
-measured. `DESIGN.md`, section 9, lists what is still from documentation
-only: the relabel call that `renew` uses, the in-box timer, and whether a
-subaccount is separate from its parent.
+## Sharing what machines did
 
-## Machines that failed
-
-A machine is recorded as failed only if another candidate became healthy in
-the same launch. `observations.jsonl` blocks it for 2 hours (GPU busy), a day
-(unreachable, no network, died, stalled) or 14 days (wrong hardware, CUDA or
-runtime errors); a later healthy run clears the first two.
-
-With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, these observations are
-shared through the reputation store (`store/`, a Cloudflare Worker and D1):
-`up` and `search` read what every client reported in the last 30 days, and
-send what is waiting; `up` and `run` send what they observed. A machine any
-client blocks is skipped (a soft block is waived if too few hosts are left).
-The store is advisory: it costs a command about 5 seconds at most and never
-fails it; when it cannot be reached, the last read is used and unsent rows
-wait in `observations.jsonl.outbox`, which an ephemeral CI runner loses
-unless it caches it. Without a store, cache `observations.jsonl` between CI
-runs.
-
-## QuACK CI mapping
-
-The flags that reproduce `tools/ci/vast/vast_ci.py` (checked against a pinned
-recording of its requests in `tests/fixtures/reference_requests.json`; the
-create payload differs in the label and the timer only):
-
-```
---gpu "RTX 5090" --num-gpus 2 --max-dph-per-gpu 1.25 --capability 12.0
---min-vram-mib 30000 --min-cuda 13.2 --ttl-min 60
---must-reach https://github.com/ --must-reach https://pypi.org/simple/pip/
-```
+Optional. With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, observations
+of machines are shared through a small Cloudflare Worker (`store/`), so that
+a machine that failed for one client is skipped by the others. It is
+advisory: it costs a command a few seconds at most and never fails it.
 
 ## Tests
 
 ```bash
 python3 -m pytest          # fake provider and fake SSH; rents nothing
 python3 tests/mutations.py # breaks each behaviour in turn; a test named for it must fail
+cd store && npm ci && npm test
 ```
