@@ -1,7 +1,7 @@
 // gpubox reputation store: storage and validation, no policy.
 //
 //   POST /v1/observations   {"observations": [...]}   at most MAX_BATCH
-//   GET  /v1/observations?provider=vast[&after=SEQ][&limit=N]
+//   GET  /v1/observations?provider=vast   the last 30 days, in one answer
 //   GET  /v1/health
 //
 // Every client has its own bearer token, a Worker secret named TOKEN_<SOURCE>.
@@ -14,7 +14,7 @@
 
 const MAX_BATCH = 50;
 const MAX_BODY_BYTES = 64 * 1024;
-const MAX_PAGE = 1000;
+const MAX_READ = 5000; // rows in one read; beyond this the oldest are left out
 const WINDOW_DAYS = 30; // how far back a read goes
 const RETENTION_DAYS = 90; // rows older than this are deleted
 const MAX_ROWS_PER_SOURCE_PER_DAY = 500;
@@ -75,8 +75,6 @@ async function digest(text) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
 }
 
-const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-
 /** The source a bearer token belongs to, or null. Compares digests in constant time. */
 async function sourceOf(request, env) {
   const header = request.headers.get("authorization") || "";
@@ -91,12 +89,6 @@ async function sourceOf(request, env) {
     if (diff === 0) found = name.slice(6).toLowerCase(); // no early exit
   }
   return found;
-}
-
-/** What readers see instead of a source's name: stable, and meaningless without the salt. */
-async function opaque(source, env) {
-  const salt = env.SOURCE_SALT; // checked in fetch(); must never change, or old ids stop matching
-  return hex(await digest(`gpubox-source:${salt}:${source}`)).slice(0, 16);
 }
 
 /** The request body as text, or null if it is longer than `limit` bytes. Stops reading there. */
@@ -212,54 +204,36 @@ async function post(request, env, source) {
 async function get(url, env) {
   const provider = url.searchParams.get("provider");
   if (!PROVIDERS.includes(provider)) return json(400, { error: "provider" });
-  const limit = Number(url.searchParams.get("limit") || MAX_PAGE);
-  if (!isInt(limit, 1, MAX_PAGE)) return json(400, { error: "limit" });
-  const afterText = url.searchParams.get("after") ?? "0";
-  if (!/^\d{1,15}$/.test(afterText)) return json(400, { error: "after" });
-  const after = Number(afterText);
   // What a reader needs to decide whom to skip: every failure, and a healthy
   // row only where the same source had failed that machine before (it then
   // takes back that source's own soft verdict). Healthy rows of machines
   // nobody complained about, the bulk of the table, are not sent.
-  const [page, revoked, meta] = await env.DB.batch([
-    env.DB.prepare(
-      "SELECT o.seq, o.id, o.received_at, o.source, o.provider, o.machine_id, o.kind," +
-        " o.reason_code, o.policy_version FROM observations o" +
-        ` WHERE o.provider = ?1 AND o.seq > ?2 AND o.received_at > ${NOW_SQL} - ?3` +
-        " AND o.source NOT IN (SELECT source FROM revoked_sources)" +
-        " AND (o.kind != 'healthy' OR EXISTS (SELECT 1 FROM observations f" +
-        "      WHERE f.source = o.source AND f.provider = o.provider" +
-        "        AND f.machine_id = o.machine_id AND f.kind != 'healthy' AND f.seq < o.seq" +
-        `        AND f.received_at > ${NOW_SQL} - ?3))` +
-        " ORDER BY o.seq LIMIT ?4",
-    ).bind(provider, after, WINDOW_DAYS * DAY_MS, limit + 1),
-    env.DB.prepare("SELECT source FROM revoked_sources"),
-    env.DB.prepare("SELECT value FROM meta WHERE key = 'store_id'"),
-  ]);
-  const rows = page.results.slice(0, limit);
-  const names = new Map();
-  for (const name of [...rows.map((r) => r.source), ...revoked.results.map((r) => r.source)]) {
-    if (!names.has(name)) names.set(name, await opaque(name, env));
-  }
+  const { results } = await env.DB.prepare(
+    "SELECT o.seq, o.id, o.received_at, o.source, o.provider, o.machine_id, o.kind," +
+      " o.reason_code, o.policy_version FROM observations o" +
+      ` WHERE o.provider = ?1 AND o.received_at > ${NOW_SQL} - ?2` +
+      " AND (o.kind != 'healthy' OR EXISTS (SELECT 1 FROM observations f" +
+      "      WHERE f.source = o.source AND f.provider = o.provider" +
+      "        AND f.machine_id = o.machine_id AND f.kind != 'healthy' AND f.seq < o.seq" +
+      `        AND f.received_at > ${NOW_SQL} - ?2))` +
+      " ORDER BY o.seq DESC LIMIT ?3",
+  )
+    .bind(provider, WINDOW_DAYS * DAY_MS, MAX_READ + 1)
+    .all();
+  const rows = results.slice(0, MAX_READ).reverse(); // the newest, oldest first
   return json(200, {
-    // Which database these sequence numbers belong to: a client that sees
-    // another value must forget what it read and start from 0.
-    store: meta.results[0].value,
     observations: rows.map((r) => ({
       seq: r.seq,
       id: r.id,
       ts: r.received_at / 1000, // when we received it: the only time clients may rely on
-      src: names.get(r.source),
+      src: r.source,
       provider: r.provider,
       machine_id: r.machine_id,
       kind: r.kind,
       reason_code: r.reason_code,
       policy_version: r.policy_version,
     })),
-    // Resume after this sequence number; null when there is nothing more for now.
-    next: page.results.length > limit ? rows[rows.length - 1].seq : null,
-    // Rows of these sources are no longer served; drop the ones you kept.
-    revoked: revoked.results.map((r) => names.get(r.source)),
+    truncated: results.length > MAX_READ,
   });
 }
 
@@ -269,15 +243,8 @@ export default {
     try {
       if (url.pathname === "/v1/health") return json(200, { ok: true });
       if (url.pathname !== "/v1/observations") return json(404, { error: "not found" });
-      if (typeof env.SOURCE_SALT !== "string" || env.SOURCE_SALT.length < 16) {
-        return json(500, { error: "the store is not configured (SOURCE_SALT)" });
-      }
       const source = await sourceOf(request, env);
       if (!source) return json(401, { error: "unauthorized" });
-      const revoked = await env.DB.prepare("SELECT 1 AS hit FROM revoked_sources WHERE source = ?1")
-        .bind(source)
-        .first("hit");
-      if (revoked) return json(403, { error: "this source is revoked" });
       if (request.method === "POST") return await post(request, env, source);
       if (request.method === "GET") return await get(url, env);
       return json(405, { error: "method" });

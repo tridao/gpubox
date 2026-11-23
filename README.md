@@ -8,6 +8,8 @@ is the design, including the assumptions it rests on.
 ```bash
 export VASTAI_API_KEY=...
 export GPUBOX_ACCOUNT_ID=...       # optional: refuse a key of any other account
+export GPUBOX_STORE_URL=https://gpubox-reputation.<subdomain>.workers.dev   # optional: share what machines did
+export GPUBOX_STORE_TOKEN=...      # this client's token for the store
 ```
 
 CI:
@@ -102,11 +104,18 @@ subaccount is separate from its parent.
 A machine is recorded as failed only if another candidate became healthy in
 the same launch. `observations.jsonl` blocks it for 2 hours (GPU busy), a day
 (unreachable, no network, died, stalled) or 14 days (wrong hardware, CUDA or
-runtime errors); a later healthy run clears the first two. Cache the file
-between CI runs.
+runtime errors); a later healthy run clears the first two.
 
-The shared reputation store (`store/`, `src/gpubox/store.py`) is parked: its
-code and tests are kept, and no command talks to it.
+With `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` set, these observations are
+shared through the reputation store (`store/`, a Cloudflare Worker and D1):
+`up` and `search` read what every client reported in the last 30 days, and
+send what is waiting; `up` and `run` send what they observed. A machine any
+client blocks is skipped (a soft block is waived if too few hosts are left).
+The store is advisory: it costs a command about 5 seconds at most and never
+fails it; when it cannot be reached, the last read is used and unsent rows
+wait in `observations.jsonl.outbox`, which an ephemeral CI runner loses
+unless it caches it. Without a store, cache `observations.jsonl` between CI
+runs.
 
 ## QuACK CI mapping
 

@@ -8,15 +8,11 @@ nothing here touches ownership or cleanup.
 Beside an observations file `NAME` live:
 
     NAME.outbox   rows observed here and not yet accepted by the store
-    NAME.remote   what has been read from the store: one JSON document with
-                  the rows, how far the reading has got, which store that was,
-                  and which sources have been revoked
+    NAME.remote   the last complete read from the store, replaced whole
     NAME.lock     serializes changes to the two files above
 
-Reading is incremental: the store numbers rows in commit order and we ask for
-what comes after the last number we have. Rows and position are written
-together, so an interrupted read leaves a shorter, still consistent, picture
-and the next one continues from there.
+A read is one request for the store's last 30 days (at most a few thousand
+rows; in practice tens). If it fails, the previous read is used.
 """
 
 from __future__ import annotations
@@ -42,7 +38,6 @@ LOCK_WAIT = 1.0  # how long to wait for another gpubox process to release the si
 BATCH = 50
 OUTBOX_LIMIT = 1000  # beyond this the oldest unsent rows are dropped
 WINDOW = 30 * 86400  # rows older than this are forgotten
-MAX_REMOTE_ROWS = 50_000  # beyond this the oldest rows read are dropped
 SENT_FIELDS = (
     "id", "provider", "machine_id", "host_id", "kind", "reason_code",
     "gpu", "num_gpus", "gate_version", "policy_version", "secs_to_ready",
@@ -148,35 +143,17 @@ class Store:
         if accepted < 0 or ignored < 0 or accepted + ignored != len(rows):
             raise StoreError("POST /v1/observations: the counts do not add up")
 
-    def page(self, after: int, deadline: float, provider: str = "vast"):
-        """One page after sequence number `after`.
+    def read(self, deadline: float, provider: str = "vast") -> list:
+        """Everything the store serves for `provider`: its last 30 days, as sent.
 
-        Returns (store id, rows, position reached, more to come, revoked sources).
-        The page must be in order and say exactly where it ends, or we could
-        step over rows we have not seen.
+        Rows are checked one by one later (remote_row); here only the shape of
+        the answer.
         """
-        what = "GET /v1/observations"
-        answer = self._call("GET", f"/v1/observations?provider={provider}&after={after}", deadline)
-        store_id, rows, revoked = (
-            answer.get("store"),
-            answer.get("observations"),
-            answer.get("revoked"),
-        )
-        if not isinstance(store_id, str) or not re.fullmatch(r"[0-9a-f]{8,64}", store_id):
-            raise StoreError(f"{what}: unexpected answer")
-        if not isinstance(rows, list) or "next" not in answer or not isinstance(revoked, list):
-            raise StoreError(f"{what}: unexpected answer")
-        if not all(isinstance(s, str) and 0 < len(s) <= 64 for s in revoked):
-            raise StoreError(f"{what}: unexpected answer")
-        seqs = [r.get("seq") if isinstance(r, dict) else None for r in rows]
-        if any(type(q) is not int for q in seqs) or seqs != sorted(set(seqs)):
-            raise StoreError(f"{what}: the page is not in order")
-        if seqs and seqs[0] <= after:
-            raise StoreError(f"{what}: the page does not follow the position asked for")
-        nxt = answer["next"]
-        if nxt is not None and (not seqs or nxt != seqs[-1]):
-            raise StoreError(f"{what}: the listing does not say where it stopped")
-        return store_id, rows, (seqs[-1] if seqs else after), nxt is not None, revoked
+        answer = self._call("GET", f"/v1/observations?provider={provider}", deadline)
+        rows = answer.get("observations")
+        if not isinstance(rows, list) or not isinstance(answer.get("truncated"), bool):
+            raise StoreError("GET /v1/observations: unexpected answer")
+        return rows
 
 
 def remote_row(row, now: float) -> dict | None:
@@ -213,6 +190,18 @@ def remote_row(row, now: float) -> dict | None:
         return {k: row[k] for k in KEPT_FIELDS} if ok else None
     except (KeyError, TypeError, IndexError, OverflowError):
         return None
+
+
+def expired(row, now: float) -> bool:
+    """A failure whose block is over already. The store times a row from when it
+    receives it, so sending this late would block the machine again, for everyone."""
+    reason, ts = row.get("reason_code"), row.get("ts")
+    return (
+        row.get("kind") != "healthy"
+        and reason in REASONS
+        and type(ts) in (int, float)
+        and ts + REASONS[reason][1] <= now
+    )
 
 
 def from_env(environ=os.environ) -> Store | None:
@@ -305,39 +294,21 @@ class Shared:
             waiting = _read_lines(self.outbox, strict=True)
             _write(self.outbox, _lines([*waiting, *rows][-OUTBOX_LIMIT:]))
 
-    def _load(self) -> dict:
-        """What we have read from this store so far; empty if there is nothing usable."""
-        empty = {"cursor": 0, "revoked": [], "rows": [], "store": None}
-        try:
-            doc = json.loads(self.remote.read_text(errors="replace"))
-            if doc["origin"] != self.store.identity():
-                return empty  # read from another store: none of it applies here
-            if type(doc["cursor"]) is not int or doc["cursor"] < 0:
-                return empty
-            if not isinstance(doc["rows"], list) or not isinstance(doc["revoked"], list):
-                return empty
-            store_id = doc["store"] if isinstance(doc["store"], str) else None
-            revoked = [s for s in doc["revoked"] if isinstance(s, str)]
-            return {
-                "cursor": doc["cursor"],
-                "revoked": revoked,
-                "rows": doc["rows"],
-                "store": store_id,
-            }
-        except (OSError, ValueError, KeyError, TypeError):
-            return empty
-
     def remote_rows(self) -> list[dict]:
-        """What others observed, as far as we have read it. Empty without a store. Never raises."""
+        """What others observed, as of the last read. Empty without a store. Never raises."""
         if not self.store:
             return []
-        doc, now = self._load(), time.time()
-        revoked = set(doc["revoked"])
-        rows = (remote_row(r, now) for r in doc["rows"])
-        return [r for r in rows if r and r["src"] not in revoked]
+        try:
+            doc = json.loads(self.remote.read_text(errors="replace"))
+            if doc["origin"] != self.store.identity() or not isinstance(doc["rows"], list):
+                return []  # read from another store: none of it applies here
+            now = time.time()
+            return [r for r in (remote_row(x, now) for x in doc["rows"]) if r]
+        except (OSError, ValueError, KeyError, TypeError):
+            return []
 
     def sync(self, *, pull: bool = True) -> str:
-        """Send the outbox and read what is new, within what is left of the budget.
+        """Send the outbox and, with `pull`, read the store, within what is left of the budget.
 
         Returns a short account of what happened. Raises StoreError only if
         nothing useful happened; partial progress is kept and reported.
@@ -356,12 +327,13 @@ class Shared:
                 raise StoreError("no time left for the store in this command")
             with self._locked(min(LOCK_WAIT, self._left)):
                 waiting = _read_lines(self.outbox)
-                doc = self._load()
-            result = {"acked": [], "dropped": [], "pages": [], "errors": []}
+            now = time.time()
+            late = [r.get("id") for r in waiting if expired(r, now)]
+            waiting = [r for r in waiting if not expired(r, now)]
+            result = {"acked": [], "dropped": late, "read": [], "errors": []}
             worker = threading.Thread(
-                target=self._exchange, args=(waiting, doc["cursor"], pull, deadline, result),
-                daemon=True,
-            )  # fmt: skip
+                target=self._exchange, args=(waiting, pull, deadline, result), daemon=True
+            )
             worker.start()
             worker.join(max(0.0, deadline - time.monotonic()))
             if worker.is_alive():
@@ -371,7 +343,7 @@ class Shared:
         finally:
             self._left -= time.monotonic() - started
 
-    def _exchange(self, waiting, after, pull, deadline, result) -> None:
+    def _exchange(self, waiting, pull, deadline, result) -> None:
         """Network only. Appends to `result`; never touches the files."""
         try:
             for i in range(0, len(waiting), BATCH):
@@ -390,11 +362,10 @@ class Shared:
                     break
         except Exception as exc:
             result["errors"].append(type(exc).__name__)
+        if not pull:
+            return
         try:
-            more = pull
-            while more:
-                store_id, rows, after, more, revoked = self.store.page(after, deadline)
-                result["pages"].append((store_id, rows, after, revoked))
+            result["read"].append(self.store.read(deadline))
         except StoreError as exc:
             result["errors"].append(str(exc))
         except Exception as exc:
@@ -403,50 +374,24 @@ class Shared:
     def _apply(self, result) -> str:
         now = time.time()
         gone = {i for i in [*result["acked"], *result["dropped"]] if isinstance(i, str)}
-        read = 0
+        read = None
+        if not gone and not result["read"]:  # no file to change: no lock to wait for
+            if result["errors"]:
+                raise StoreError("; ".join(result["errors"]))
+            return "sent 0"
         with self._locked():
             if gone:
                 # Remove what was dealt with from the queue as it is now: rows
                 # queued by another process in the meantime stay.
                 waiting = _read_lines(self.outbox, strict=True)
                 _write(self.outbox, _lines([r for r in waiting if r.get("id") not in gone]))
-            if result["pages"]:
-                doc = self._load()
-                rows = [r for r in (remote_row(x, now) for x in doc["rows"]) if r]
-                cursor, revoked, store_id = doc["cursor"], set(doc["revoked"]), doc["store"]
-                for page_store, page, reached, page_revoked in result["pages"]:
-                    if store_id is not None and page_store != store_id:
-                        # Another database behind the same address: its numbers
-                        # mean something else. Forget ours; the next sync starts over.
-                        rows, cursor, revoked, store_id, read = [], 0, set(), None, 0
-                        result["errors"].append("the store was replaced; starting over")
-                        break
-                    store_id = page_store
-                    revoked |= set(page_revoked)  # only ever grows
-                    for raw in page:
-                        if raw["seq"] > cursor:
-                            row = remote_row(raw, now)
-                            if row:
-                                rows.append(row)
-                                read += 1
-                    cursor = max(cursor, reached)
-                rows = [r for r in rows if r["src"] not in revoked][-MAX_REMOTE_ROWS:]
-                # Rows and position in one file: neither can be restored without the other.
-                _write(
-                    self.remote,
-                    json.dumps(
-                        {
-                            "origin": self.store.identity(),
-                            "store": store_id,
-                            "cursor": cursor,
-                            "revoked": sorted(revoked),
-                            "rows": rows,
-                        }
-                    ),
-                )
-        account = f"sent {len(result['acked'])}, read {read}"
+            if result["read"]:
+                rows = [r for r in (remote_row(x, now) for x in result["read"][0]) if r]
+                read = len(rows)
+                _write(self.remote, json.dumps({"origin": self.store.identity(), "rows": rows}))
+        account = f"sent {len(result['acked'])}" + (f", read {read}" if read is not None else "")
         if result["errors"]:
-            if not gone and not result["pages"]:
+            if not gone and read is None:
                 raise StoreError("; ".join(result["errors"]))
             account += f" ({'; '.join(result['errors'])})"
         return account

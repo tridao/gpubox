@@ -103,7 +103,7 @@ def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
     """machine_id -> {"until", "class", "reason"} for machines blocked at `now`.
 
     Rows are judged per source: this client's own (no `src` field) and, for
-    the parked reputation store, each remote source separately. A machine is
+    the reputation store, each remote source separately. A machine is
     blocked if any source's rows block it, so a `healthy` row takes back soft
     failures of its own source only. Rows of the same moment are ordered by
     the store's sequence number where they have one, else by id. A row that

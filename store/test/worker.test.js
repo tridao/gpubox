@@ -12,6 +12,7 @@ const CI = "ci-token-0123456789abcdef0123456789abcdef0123";
 const NOT_A_TOKEN = "some-other-secret-0123456789abcdef0123456789";
 const DAY = 86400 * 1000;
 const QUOTA = 500;
+const MAX_READ = 5000;
 let mf, db;
 
 export async function migrate(database) {
@@ -30,8 +31,7 @@ before(async () => {
     compatibilityDate: "2025-09-01", // the date in cloudflare.config.ts
     d1Databases: { DB: "gpubox-reputation-test" },
     bindings: {
-      TOKEN_LAPTOP: LAPTOP, TOKEN_QUACK_CI: CI, TOKEN_SHORT: "short",
-      UNRELATED_SECRET: NOT_A_TOKEN, SOURCE_SALT: "salt-for-tests-0123456789abcdef0123456789",
+      TOKEN_LAPTOP: LAPTOP, TOKEN_QUACK_CI: CI, TOKEN_SHORT: "short", UNRELATED_SECRET: NOT_A_TOKEN,
     },
   });
   db = await mf.getD1Database("DB");
@@ -40,7 +40,6 @@ before(async () => {
 after(() => mf.dispose());
 beforeEach(async () => {
   await db.prepare("DELETE FROM observations").run();
-  await db.prepare("DELETE FROM revoked_sources").run();
 });
 
 let counter = 0;
@@ -61,7 +60,7 @@ async function call(method, path, { token = LAPTOP, body, raw } = {}) {
   return { status: res.status, json: await res.json() };
 }
 const post = (observations, opts) => call("POST", "/v1/observations", { body: { observations }, ...opts });
-const list = (query = "", opts) => call("GET", `/v1/observations?provider=vast${query}`, opts);
+const list = (opts) => call("GET", "/v1/observations?provider=vast", opts);
 const stored = async (where = "1=1") =>
   (await db.prepare(`SELECT * FROM observations WHERE ${where} ORDER BY seq`).all()).results;
 const seed = (row) =>
@@ -76,10 +75,9 @@ test("health needs no token and says nothing", async () => {
 });
 
 test("anything else needs a known token", async () => {
-  // Other secrets of the Worker, however long, are not tokens; nor is the salt.
-  const others = [NOT_A_TOKEN, "salt-for-tests-0123456789abcdef0123456789"];
-  for (const token of [null, "", "wrong", "short", ...others, LAPTOP + "x", LAPTOP.slice(1), "x".repeat(700)]) {
-    assert.equal((await list("", { token })).status, 401, `token ${String(token).slice(0, 12)}`);
+  // Other secrets of the Worker, however long, are not tokens.
+  for (const token of [null, "", "wrong", "short", NOT_A_TOKEN, LAPTOP + "x", LAPTOP.slice(1), "x".repeat(700)]) {
+    assert.equal((await list({ token })).status, 401, `token ${String(token).slice(0, 12)}`);
     assert.equal((await post([obs()], { token })).status, 401);
   }
   assert.equal((await stored()).length, 0);
@@ -103,21 +101,17 @@ test("a row is stored once, with the source and time the store decides", async (
   assert.equal(rows[0].gpu, "RTX 5090");
 });
 
-test("readers get reason codes and an opaque source, nothing else", async () => {
+test("readers get reason codes and who said so, nothing else", async () => {
   await post([failed(101)]);
   await post([failed(101)], { token: CI });
   const { json } = await list();
-  assert.equal(json.observations.length, 2);
+  assert.deepEqual(Object.keys(json).sort(), ["observations", "truncated"]);
+  assert.equal(json.truncated, false);
   for (const row of json.observations) {
     assert.deepEqual(Object.keys(row).sort(), ["id", "kind", "machine_id", "policy_version", "provider", "reason_code", "seq", "src", "ts"]);
-    assert.match(row.src, /^[0-9a-f]{16}$/);
     assert.ok(Math.abs(row.ts * 1000 - Date.now()) < 5000);
   }
-  const [a, b] = json.observations;
-  assert.notEqual(a.src, b.src); // two sources stay distinguishable...
-  assert.ok(!JSON.stringify(json).includes("laptop") && !JSON.stringify(json).includes("quack")); // ...and nameless
-  assert.equal(json.next, null);
-  assert.deepEqual(json.revoked, []);
+  assert.deepEqual(json.observations.map((o) => o.src), ["laptop", "quack_ci"]); // in commit order
 });
 
 test("rows that do not fit the schema reject the whole batch", async () => {
@@ -224,7 +218,6 @@ test("reads go back thirty days and no further", async () => {
   await seed({ at: now - 1000, machine: 3 });
   const { json } = await list();
   assert.deepEqual(json.observations.map((o) => o.machine_id), [2, 3]);
-  assert.deepEqual((await list("&after=0")).json.observations.map((o) => o.machine_id), [2, 3]);
 });
 
 test("a healthy row is served only where it takes back the same source's failure", async () => {
@@ -241,40 +234,26 @@ test("a healthy row is served only where it takes back the same source's failure
   assert.equal(new Set(json.observations.slice(0, 2).map((o) => o.src)).size, 1);
 });
 
-test("paging by sequence returns every row once and can be resumed", async () => {
-  for (let i = 0; i < 25; i++) await seed({ machine: i + 1 });
-  const seen = [];
-  let after = 0;
-  for (let guard = 0; guard < 20; guard++) {
-    const { status, json } = await list(`&limit=7&after=${after}`);
-    assert.equal(status, 200);
-    assert.ok(json.observations.length <= 7);
-    seen.push(...json.observations.map((o) => o.machine_id));
-    if (json.next === null) break;
-    assert.equal(json.next, json.observations.at(-1).seq);
-    after = json.next;
+test("one read returns the newest rows, oldest first, and says when it left some out", async () => {
+  const stmt = db.prepare(
+    "INSERT INTO observations (id, received_at, source, provider, machine_id, kind, reason_code, policy_version)" +
+      " VALUES (?1, ?2, 'laptop', 'vast', ?3, 'failed_admission', 'busy_gpu', 1)",
+  );
+  for (let i = 0; i < MAX_READ / 100; i++) {
+    await db.batch(Array.from({ length: 100 }, (_, j) => stmt.bind(id(), Date.now(), i * 100 + j + 1)));
   }
-  assert.deepEqual(seen, Array.from({ length: 25 }, (_, i) => i + 1));
-  // A row committed after a reader finished is found by resuming where it stopped.
-  const last = (await list()).json.observations.at(-1).seq;
-  await seed({ machine: 99 });
-  assert.deepEqual((await list(`&after=${last}`)).json.observations.map((o) => o.machine_id), [99]);
-  for (const bad of ["&after=x", "&after=-1", "&after=1.5", "&after=12:ab", "&limit=0", "&limit=1001", "&limit=abc"]) {
-    assert.equal((await list(bad)).status, 400, bad);
-  }
+  let { json } = await list();
+  assert.equal(json.observations.length, MAX_READ);
+  assert.equal(json.truncated, false);
+  await seed({ machine: 999999 });
+  ({ json } = await list());
+  assert.equal(json.observations.length, MAX_READ);
+  assert.equal(json.truncated, true);
+  assert.equal(json.observations[0].machine_id, 2); // the oldest row is the one left out
+  assert.equal(json.observations.at(-1).machine_id, 999999);
+  const seqs = json.observations.map((o) => o.seq);
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
   assert.equal((await call("GET", "/v1/observations?provider=aws")).status, 400);
-});
-
-test("a revoked source can neither write nor be read, and readers are told", async () => {
-  await post([failed(1)]);
-  await post([failed(2)], { token: CI });
-  const laptopSrc = (await list()).json.observations.find((o) => o.machine_id === 1).src;
-  await db.prepare("INSERT INTO revoked_sources (source, revoked_at) VALUES ('laptop', ?1)").bind(Date.now()).run();
-  assert.equal((await post([obs()])).status, 403);
-  assert.equal((await list()).status, 403);
-  const { json } = await list("", { token: CI });
-  assert.deepEqual(json.observations.map((o) => o.machine_id), [2]);
-  assert.deepEqual(json.revoked, [laptopSrc]); // so that clients drop what they kept of it
 });
 
 test("the daily job deletes rows older than ninety days", async () => {
@@ -302,30 +281,10 @@ test("a request is stored whole or told to come back, never half", async () => {
   assert.deepEqual((await post([obs({ machine_id: 9001 }), obs({ machine_id: 9002 })])).json, { accepted: 2, ignored: 0 });
 });
 
-test("readers learn which database they are reading", async () => {
-  const a = (await list()).json.store;
-  assert.match(a, /^[0-9a-f]{16}$/);
-  assert.equal((await list()).json.store, a);
-});
-
-test("without its salt the store refuses to serve", async () => {
-  const bare = new Miniflare({
-    modules: true, scriptPath: "src/worker.js", compatibilityDate: "2025-09-01",
-    d1Databases: { DB: "gpubox-reputation-nosalt" }, bindings: { TOKEN_LAPTOP: LAPTOP },
-  });
-  try {
-    await migrate(await bare.getD1Database("DB"));
-    const res = await bare.dispatchFetch("http://store/v1/observations?provider=vast", { headers: { authorization: `Bearer ${LAPTOP}` } });
-    assert.equal(res.status, 500);
-  } finally {
-    await bare.dispose();
-  }
-});
-
 test("the queries use their indexes", async () => {
   const plan = async (sql, ...args) =>
     (await db.prepare("EXPLAIN QUERY PLAN " + sql).bind(...args).all()).results.map((r) => r.detail).join(" | ");
   assert.match(await plan("DELETE FROM observations WHERE received_at < ?1", 0), /observations_by_age/);
   assert.match(await plan("SELECT COUNT(*) FROM observations WHERE source = ?1 AND received_at > ?2", "x", 0), /observations_by_source/);
-  assert.match(await plan("SELECT * FROM observations WHERE provider = ?1 AND seq > ?2 ORDER BY seq LIMIT 5", "vast", 0), /observations_by_provider/);
+  assert.match(await plan("SELECT * FROM observations WHERE provider = ?1 ORDER BY seq DESC LIMIT 5", "vast"), /observations_by_provider/);
 });
