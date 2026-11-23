@@ -209,10 +209,19 @@ of machines are shared through a small Cloudflare Worker (`store/`), so that
 a machine that failed for one client is skipped by the others. It is
 advisory: it costs a command a few seconds at most and never fails it.
 
-## Tests
+## Development checks
 
 ```bash
+python3 -m pip install pytest pre-commit
+pre-commit install         # lint and format staged Python files with Ruff
+pre-commit run --all-files
+(cd store && npm ci && npm test)  # Node 24 LTS; also enables the Python/Worker integration test
 python3 -m pytest          # fake provider and fake SSH; rents nothing
 python3 tests/mutations.py # breaks each behaviour in turn; a test named for it must fail
-cd store && npm ci && npm test
 ```
+
+On PRs and pushes to `main`, GitHub Actions runs the hooks, tests Python 3.10
+and current Python 3, and checks the installed wheel's `gpubox` entry point.
+The current-Python job also tests the Worker and Python client against local D1.
+All jobs use GitHub-hosted Ubuntu runners; no GPUs or cloud credentials are
+needed. Mutation tests run weekly or on demand (Actions → Mutation tests).
