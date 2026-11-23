@@ -501,7 +501,7 @@ def test_boxes_in_different_state_directories_do_not_lose_each_others_entries(tm
 
     def add(n):
         run_id = f"dev.box{n}.{n:012x}"
-        sshconfig.add(run_id, f"box{n}", "10.0.0.1", 2000 + n, tmp_path / "k", tmp_path / "h")
+        sshconfig.add(run_id, [(f"box{n}", "10.0.0.1", 2000 + n)], tmp_path / "k", tmp_path / "h")
 
     threads = [threading.Thread(target=add, args=(n,)) for n in range(12)]
     for t in threads:
@@ -831,3 +831,41 @@ def test_a_registry_login_takes_its_token_from_the_environment(world, monkeypatc
     assert run([*UP, "--registry-user", "bot"]) == 0
     assert {p["image_login"] for p in vast.payloads} == {"-u bot -p ghp_secret docker.io"}
     assert run(["down"]) == 0
+
+
+# ------------------------------------------------------------- several boxes
+
+
+def test_several_boxes_are_named_listed_and_each_reachable(
+    world, tmp_path, ssh_dir, capsys, monkeypatch
+):
+    vast, run = world
+    vast.behaviour.update({1: "ok", 2: "ok", 3: "ok"})
+    vast._offers.append(dict(vast._offers[-1], id=1003, machine_id=3, host_id=3))
+    assert run([*UP, "--count", "2", "--ssh-config"]) == 0
+    state = State.load(tmp_path)
+    assert len(state.winners) == 2 and state.meta["count"] == 2
+    out = capsys.readouterr().out
+    assert "77-1-0 is instance" in out and "77-1-1 is instance" in out
+    entry = (ssh_dir / "gpubox_config").read_text()
+    assert entry.count(f"# gpubox run {state.run}") == 1
+    for i, w in enumerate(state.winners):
+        r = subprocess.run(["ssh", "-F", str(ssh_dir / "gpubox_config"), "-G", f"77-1-{i}"],
+                           capture_output=True, text=True)  # fmt: skip
+        assert f"hostname {w['host']}" in r.stdout
+    assert run(["status"]) == 0
+    status = capsys.readouterr().out
+    assert "2 box(es)" in status and "77-1-0" in status and "77-1-1" in status
+
+    calls = fake_ssh(monkeypatch, rc=0)
+    assert run(script(tmp_path)) == cli.EXIT_CONFIG  # which box?
+    assert calls == []
+    assert run([*script(tmp_path), "--box", "1"]) == 0
+    w = state.winners[1]
+    assert calls[0][0][2] == f"{w['host']}:{w['port']}"
+    assert run([*script(tmp_path), "--box", "2"]) == cli.EXIT_CONFIG
+
+
+def test_status_of_a_directory_without_a_run(world, capsys):
+    vast, run = world
+    assert run(["status"]) == 0 and "no run" in capsys.readouterr().out

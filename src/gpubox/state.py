@@ -5,7 +5,7 @@ set by the create request, so any process that knows the run id can find the
 run's boxes in the provider's listing and destroy them.
 
 The state file (`run.json`) is a convenience for this directory: the run id,
-the instance ids that creates returned, and where the winner is. Losing it
+the instance ids that creates returned, and where the winners are. Losing it
 loses the use of the box (its address and key), never the ability to destroy
 it: `down --run-id` works from the tag alone.
 """
@@ -55,6 +55,13 @@ def name_of(run_id: str) -> str:
     return run_id.split(".")[1]
 
 
+def box_name(run_id: str, index: int, count: int) -> str:
+    """What box `index` of a run with `count` boxes is called: the run's name for a run
+    of one box, else the name and the index (`mybox-0`, `mybox-1`, ...)."""
+    name = name_of(run_id)
+    return name if count == 1 else f"{name}-{index}"
+
+
 @dataclass(frozen=True)
 class Tag:
     run: str
@@ -99,12 +106,33 @@ def state_lock(state_dir: Path):
         os.close(fd)
 
 
+def _box(w) -> bool:
+    return (
+        isinstance(w, dict)
+        and positive_int(w.get("id"))
+        and positive_int(w.get("attempt"))
+        and isinstance(w.get("host"), str)
+        and positive_int(w.get("port"))
+    )
+
+
+def _upgrade(data):
+    """A version 2 file (one `winner`, or none) read as version 3 (a list of `winners`).
+    It is written back as version 3 at its next change."""
+    if isinstance(data, dict) and data.get("version") == 2 and "winners" not in data:
+        data = dict(data)
+        w = data.pop("winner", None)
+        data["winners"] = [] if w is None else [w]
+        data["version"] = 3
+    return data
+
+
 def _usable(data) -> bool:
     """Enough of a state file to act on. Not a consistency check: just the shapes we index."""
-    w = data.get("winner") if isinstance(data, dict) else None
+    winners = data.get("winners") if isinstance(data, dict) else None
     return (
         isinstance(data, dict)
-        and data.get("version") == 2
+        and data.get("version") == 3
         and isinstance(data.get("run"), str)
         and RUN_ID.fullmatch(data["run"]) is not None
         and type(data.get("expiry")) is int
@@ -112,16 +140,8 @@ def _usable(data) -> bool:
         and all(positive_int(i) for i in data["ids"])
         and isinstance(data.get("meta"), dict)
         and (data.get("account") is None or isinstance(data["account"], str))
-        and (
-            w is None
-            or (
-                isinstance(w, dict)
-                and positive_int(w.get("id"))
-                and positive_int(w.get("attempt"))
-                and isinstance(w.get("host"), str)
-                and positive_int(w.get("port"))
-            )
-        )
+        and isinstance(winners, list)
+        and all(_box(w) for w in winners)
     )
 
 
@@ -137,7 +157,7 @@ class State:
         """The directory's state, None if there is none, StateError if it cannot be used."""
         path = Path(state_dir) / STATE
         try:
-            data = json.loads(path.read_text())
+            data = _upgrade(json.loads(path.read_text()))
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as exc:
@@ -150,8 +170,8 @@ class State:
     def begin(cls, state_dir, run_id: str, expiry: int, account: str | None, meta: dict):
         state = cls(Path(state_dir) / STATE, {})
         state._replace({
-            "version": 2, "run": run_id, "expiry": int(expiry), "account": account,
-            "meta": dict(meta), "ids": [], "winner": None, "closing": False, "closed": False,
+            "version": 3, "run": run_id, "expiry": int(expiry), "account": account,
+            "meta": dict(meta), "ids": [], "winners": [], "closing": False, "closed": False,
         })  # fmt: skip
         return state
 
@@ -161,8 +181,8 @@ class State:
         if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
             raise StateError(f"not a run id: {run_id!r}")
         return cls(None, {
-            "version": 2, "run": run_id, "expiry": 0, "account": None, "meta": {}, "ids": [],
-            "winner": None, "closing": True, "closed": False,
+            "version": 3, "run": run_id, "expiry": 0, "account": None, "meta": {}, "ids": [],
+            "winners": [], "closing": True, "closed": False,
         })  # fmt: skip
 
     run = property(lambda self: self.data["run"])
@@ -174,8 +194,14 @@ class State:
     closed = property(lambda self: bool(self.data.get("closed")))
 
     @property
+    def winners(self) -> list[dict]:
+        """The boxes handed over, in order: box i is `box_name(run, i, len(winners))`."""
+        return copy.deepcopy(self.data["winners"])
+
+    @property
     def winner(self) -> dict | None:
-        return copy.deepcopy(self.data["winner"])
+        """The first box, for a run of one."""
+        return copy.deepcopy(self.data["winners"][0]) if self.data["winners"] else None
 
     def _replace(self, data: dict) -> None:
         if self.path is not None:
@@ -203,9 +229,9 @@ class State:
         if instance_id not in self.data["ids"]:
             self._set(ids=[*self.data["ids"], instance_id])
 
-    def publish(self, winner: dict) -> None:
-        """The hand-off: once this is on disk the winner is kept."""
-        self._set(winner=dict(winner))
+    def publish(self, winners: list[dict]) -> None:
+        """The hand-off: once this is on disk the winners are kept."""
+        self._set(winners=[dict(w) for w in winners])
 
     def set_expiry(self, expiry: int) -> None:
         self._set(expiry=int(expiry))

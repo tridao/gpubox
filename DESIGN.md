@@ -24,11 +24,14 @@ lease that ends it without help.
 
 1. Search offers. Drop excluded countries, offers above the price cap and
    recently failed machines; take the cheapest first, one machine per host.
-2. Rent up to `1 + --spare` boxes at once (2 by default). Each has to boot,
-   answer SSH and pass the health gate. One that fails is destroyed and
-   replaced, up to `--max-attempts` rentals (6; an offer that was already
-   gone does not count).
-3. The first box through the gate is the winner. The others are destroyed.
+2. Rent up to `--count + --spare` boxes at once (2 by default). Each has to
+   boot, answer SSH and pass the health gate. One that fails is destroyed and
+   replaced, up to `--max-attempts` rentals (`2 * count + 4`, so 6 for one
+   box; an offer that was already gone does not count).
+3. Once `--count` boxes are through the gate, they are the winners. The
+   others are destroyed. A launch that cannot get that many destroys the
+   healthy ones too: all or nothing, since a job split over N boxes cannot
+   use fewer.
 
 `gpubox run` runs a script on the winner, `gpubox renew` moves the end of its
 lease, `gpubox down` destroys everything the run rented, and
@@ -113,8 +116,10 @@ One thread. Each pass:
 2. Send a delete for each failed box and look it up. It keeps its slot until
    the lookup says it is gone, so there are never more than `1 + spare`
    billable boxes that we know of.
-3. If a candidate is healthy, look it up once more (still running, at least
-   10 minutes of lease left) and hand over the cheapest.
+3. If `--count` candidates are healthy, look them up once more (still
+   running, at least 10 minutes of lease left) and hand over the cheapest
+   `--count`. A healthy box waits, billing, for the others; one that dies
+   meanwhile is caught by that lookup and replaced.
 4. Otherwise rent into the free slots, until 60 s before `--overall-timeout`.
 
 A box fails when the provider reports a machine error or `exited`; when it
@@ -171,14 +176,17 @@ from the tag alone. That is the CI case: a runner whose disk is gone.
 ```
 run, expiry, account, meta     what was asked for
 ids                            every instance id a create returned
-winner                         id, attempt, host, port, machine, host_id
+winners                        per box: id, attempt, host, port, machine, host_id, gpu
 closing, closed
 ```
 
 Beside it: `keys/<run id>/` (the run's SSH key and known-hosts file), a lock
 taken by `up`, `down` and `renew`, and `observations.jsonl`.
 
-`up --ssh-config` writes a `Host <name>` block for the winner to
+Box `i` of a run of `n` is called `<name>` if `n` is 1, else `<name>-<i>`.
+A version 2 file (one `winner`) is read as a run of one box.
+
+`up --ssh-config` writes a `Host` entry for each winner, in one block per run, to
 `~/.ssh/gpubox_config` and makes sure the first directive of `~/.ssh/config`
 is `Include gpubox_config`. Nothing else in that file is changed, and a
 symbolic link is followed, not replaced. Boxes in different state

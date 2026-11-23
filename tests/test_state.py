@@ -76,12 +76,12 @@ def test_the_state_reads_back_what_was_written(tmp_path):
     state.add_id(41)
     state.add_id(42)
     state.add_id(41)  # once is enough
-    state.publish(WINNER)
+    state.publish([WINNER])
     state.set_expiry(EXPIRY + 60)
     disk = State.load(tmp_path)
     assert disk.data == state.data
     assert (disk.run, disk.account, disk.expiry) == (RUN_ID, "111", EXPIRY + 60)
-    assert disk.ids == [41, 42] and disk.winner == WINNER
+    assert disk.ids == [41, 42] and disk.winner == WINNER and disk.winners == [WINNER]
     assert not disk.closing and not disk.closed
     state.close()
     assert State.load(tmp_path).closed and State.load(tmp_path).closing
@@ -95,11 +95,12 @@ def test_no_state_is_none_and_an_unusable_one_is_an_error(tmp_path):
         "garbage",
         "[]",
         good[: len(good) // 2],
-        good.replace('"version": 2', '"version": 1'),
+        good.replace('"version": 3', '"version": 1'),
     ]
     bad.append(good.replace(RUN_ID, "../../etc"))
     bad.append(json.dumps({**json.loads(good), "ids": ["41"]}))
-    bad.append(json.dumps({**json.loads(good), "winner": {"id": 41}}))
+    bad.append(json.dumps({**json.loads(good), "winners": [{"id": 41}]}))
+    bad.append(json.dumps({**json.loads(good), "winners": None}))
     for text in bad:
         (tmp_path / "run.json").write_text(text)
         with pytest.raises(StateError):
@@ -114,12 +115,33 @@ def test_a_change_that_cannot_be_written_changes_nothing(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(os, "replace", fail)
-    for change in (lambda: state.add_id(41), lambda: state.publish(WINNER), state.set_closing):
+    for change in (lambda: state.add_id(41), lambda: state.publish([WINNER]), state.set_closing):
         with pytest.raises(OSError):
             change()
     assert state.path.read_text() == before_disk
     assert json.dumps(state.data, sort_keys=True) == before_memory
     assert [p.name for p in tmp_path.iterdir()] == ["run.json"]  # no temporary file left behind
+
+
+def test_a_state_file_of_the_previous_version_is_read_as_one_box(tmp_path):
+    good = json.loads(begin(tmp_path).path.read_text())
+    old = {k: v for k, v in good.items() if k != "winners"}
+    for winner, winners in [(WINNER, [WINNER]), (None, [])]:
+        (tmp_path / "run.json").write_text(json.dumps({**old, "version": 2, "winner": winner}))
+        state = State.load(tmp_path)
+        assert state.winners == winners and state.winner == winner
+        state.set_closing()
+        assert json.loads(state.path.read_text())["version"] == 3  # written back as it is now
+    (tmp_path / "run.json").write_text(json.dumps({**old, "version": 2, "winner": {"id": 41}}))
+    with pytest.raises(StateError):
+        State.load(tmp_path)
+
+
+def test_boxes_are_named_after_the_run_and_numbered_when_there_are_several():
+    from gpubox.state import box_name
+
+    assert box_name(RUN_ID, 0, 1) == "test"
+    assert [box_name(RUN_ID, i, 3) for i in range(3)] == ["test-0", "test-1", "test-2"]
 
 
 def test_an_ephemeral_state_is_never_written(tmp_path):

@@ -1,4 +1,4 @@
-"""Rent one verified box: a small race, a health gate, and teardown by tag.
+"""Rent verified boxes: a small race, a health gate, and teardown by tag.
 
 One thread. The race is a loop: each pass looks each candidate up by id, polls
 the child processes (SSH probes and health gates), and then decides what to
@@ -101,8 +101,9 @@ class Spec:
 
 @dataclass(frozen=True)
 class Policy:
-    spare: int = 1  # candidates raced beyond the one we keep
-    max_attempts: int = 6
+    count: int = 1  # healthy boxes wanted, all or nothing
+    spare: int = 1  # candidates raced beyond the ones we keep
+    max_attempts: int | None = None  # rentals in all; None: 2 * count + 4
     startup_timeout: float = 300
     # A box that is not running yet and whose status has not changed for this long is
     # given up on. Pulls that finished went silent for at most 166 s; the ones that never
@@ -126,10 +127,14 @@ class Policy:
 
     @property
     def max_live(self) -> int:
-        return 1 + self.spare
+        return self.count + self.spare
+
+    @property
+    def attempts(self) -> int:
+        return 2 * self.count + 4 if self.max_attempts is None else self.max_attempts
 
 
-@dataclass
+@dataclass(eq=False)  # one attempt is one object: `in` is by identity
 class Attempt:
     seq: int
     tag: str
@@ -170,13 +175,17 @@ class Attempt:
 
 @dataclass
 class Result:
-    winner: Attempt | None
+    winners: list[Attempt]  # all that were asked for, or none
     attempts: list[Attempt]
     seconds: float
     left: list[int] = field(
         default_factory=list
     )  # ids, other than the winner's, not confirmed gone
     unanswered: list[Attempt] = field(default_factory=list)  # creates that got no answer
+
+    @property
+    def winner(self) -> Attempt | None:
+        return self.winners[0] if self.winners else None
 
 
 # ------------------------------------------------------------------ destroying
@@ -268,32 +277,31 @@ class Launch:
     # ------------------------------------------------------------ the frame
 
     def run(self, blocked: dict[int, dict]) -> Result:
-        """Race candidates; return with at most one box, published as the winner.
+        """Race candidates; return with `policy.count` boxes, published as the winners, or
+        with none.
 
         Raises whatever failed, or KeyboardInterrupt on a signal, after
-        trying to roll back. A winner that reached the state file is kept
+        trying to roll back. Winners that reached the state file are kept
         whatever was raised; everything else the run rented is destroyed.
         """
         t0 = time.monotonic()
         try:
-            winner = self._race(blocked, t0)
-            if winner is not None:
-                self.state.publish({
-                    "id": winner.instance_id, "attempt": winner.seq,
-                    "host": winner.endpoint[0], "port": winner.endpoint[1],
-                    "machine": winner.machine_id, "host_id": winner.host_id,
-                    "gpu": winner.gpu,
-                })  # fmt: skip
+            winners = self._race(blocked, t0) or []
+            if winners:
+                self.state.publish([{
+                    "id": w.instance_id, "attempt": w.seq,
+                    "host": w.endpoint[0], "port": w.endpoint[1],
+                    "machine": w.machine_id, "host_id": w.host_id, "gpu": w.gpu,
+                } for w in winners])  # fmt: skip
         except BaseException:
             deadline = time.monotonic() + self.policy.rollback  # one budget for all of it
             self._kill_children()
             self._rollback(deadline)
             raise
         self._kill_children()
-        keep = winner.instance_id if winner else None
-        left = self._sweep(keep, self.policy.confirm_timeout)
+        left = self._sweep({w.instance_id for w in winners}, self.policy.confirm_timeout)
         for a in self.attempts.values():
-            if a is winner:
+            if a in winners:
                 continue
             if a.phase == "healthy":
                 a.reason, a.detail = None, "healthy, but not kept"
@@ -301,7 +309,7 @@ class Launch:
                 a.reason, a.detail = None, a.detail or "cancelled"
         ordered = [self.attempts[k] for k in sorted(self.attempts)]
         return Result(
-            winner=winner,
+            winners=winners,
             attempts=ordered,
             seconds=time.monotonic() - t0,
             left=left,
@@ -316,16 +324,16 @@ class Launch:
         for a in self.attempts.values():
             a.check = None
 
-    def _sweep(self, keep: int | None, budget: float) -> list[int]:
-        """Destroy every box of the run except `keep`: the ids we hold, then whatever the
-        listing shows with the run's tag (a box whose create gave no answer)."""
+    def _sweep(self, keep: set[int], budget: float) -> list[int]:
+        """Destroy every box of the run except those in `keep`: the ids we hold, then
+        whatever the listing shows with the run's tag (a box whose create gave no answer)."""
         deadline = time.monotonic() + budget
         remaining = lambda: max(0.0, deadline - time.monotonic())
         # Half the time for the ids we hold, so that one that will not go away
         # leaves room for the listing and for what it finds.
-        left = set(destroy_confirmed(self.vast, self.held - {keep}, budget / 2, self.policy))
+        left = set(destroy_confirmed(self.vast, self.held - keep, budget / 2, self.policy))
         found = tagged(self.vast, self.state.run, self.policy, remaining()) or set()
-        extra = found - self.held  # the winner is among those we hold
+        extra = found - self.held  # the winners are among those we hold
         for iid in sorted(extra):
             log(f"  instance {iid} carries this run's tag and was not known: destroying it")
         left = sorted(destroy_confirmed(self.vast, left | extra, remaining(), self.policy))
@@ -335,14 +343,15 @@ class Launch:
 
     def _rollback(self, deadline: float) -> None:
         """An attempt within the budget, not a promise. Never masks what was raised, except
-        by a second signal. A winner that is in the state file on disk is kept."""
-        keep = None
+        by a second signal. Winners that are in the state file on disk are kept."""
+        keep = set()
         try:
             on_disk = State.load(self.state.path.parent) if self.state.path else None
-            if on_disk is not None and on_disk.run == self.state.run and on_disk.winner:
-                keep = on_disk.winner["id"]
+            if on_disk is not None and on_disk.run == self.state.run and on_disk.winners:
+                keep = {w["id"] for w in on_disk.winners}
                 self.state.data = on_disk.data
-                log(f"keeping instance {keep}: it was handed over before the failure")
+                ids = ", ".join(map(str, sorted(keep)))
+                log(f"keeping instance(s) {ids}: handed over before the failure")
         except Exception as exc:
             log(f"WARNING: cannot read the state file back: {exc}")
         try:
@@ -352,7 +361,7 @@ class Launch:
 
     # ------------------------------------------------------------- the race
 
-    def _race(self, blocked: dict[int, dict], t0: float) -> Attempt | None:
+    def _race(self, blocked: dict[int, dict], t0: float) -> list[Attempt] | None:
         spec, policy = self.spec, self.policy
         deadline = t0 + policy.overall_timeout - policy.cleanup_reserve
         found = self.vast.offers(v.offer_query(spec))
@@ -362,11 +371,12 @@ class Launch:
         found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
         allowed = v.in_allowed_country(found, spec.exclude_countries)
         offers = collections.deque(pol.select_offers(allowed, blocked, policy.max_live))
+        want = f"{policy.count} boxes" if policy.count > 1 else "a box"
         log(
             f"{len(offers)} candidate host(s) for {spec.gpu_text} "
             f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
-            f"excluded countries); racing {policy.max_live}, "
-            f"up to {policy.max_attempts} attempts"
+            f"excluded countries); {want}: racing {policy.max_live}, "
+            f"up to {policy.attempts} attempts"
         )
         image_errors: dict = {}  # host -> what it said
         image_said = None  # the same, from any box, also one whose host we cannot name
@@ -383,19 +393,21 @@ class Launch:
                 # One host can be wrong about an image (a broken mirror, stale
                 # credentials). Several saying the same are not.
                 raise ConfigError(image_said)
-            winner = self._choose()
-            if winner is not None:
-                return winner
+            winners = self._choose()
+            if winners is not None:
+                return winners
             out_of_time = time.monotonic() >= deadline
             if not out_of_time:
                 self._rent(offers, deadline)
             if out_of_time or not self._worth_waiting(offers, deadline):
                 if image_said:
                     raise ConfigError(image_said)
+                healthy = sum(a.phase == "healthy" for a in self.attempts.values())
+                short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
                 log(
-                    f"giving up: no healthy box within {policy.overall_timeout:g}s"
+                    f"giving up: not enough healthy boxes within {policy.overall_timeout:g}s{short}"
                     if out_of_time
-                    else "giving up: nothing left to try"
+                    else f"giving up: nothing left to try{short}"
                 )
                 return None
             time.sleep(policy.poll)
@@ -548,10 +560,15 @@ class Launch:
                 _try_destroy(self.vast, a.instance_id, self.policy.call_timeout)
                 a.gone = _is_gone(self.vast, a.instance_id, self.policy.call_timeout)
 
-    def _choose(self) -> Attempt | None:
-        """The cheapest candidate whose gate passed and that a lookup says is still running,
-        with enough of its lease left."""
+    def _choose(self) -> list[Attempt] | None:
+        """The `policy.count` cheapest candidates whose gate passed and that a lookup says
+        are still running, with enough of the lease left; None until there are that many.
+        Nobody is looked up before enough have passed the gate."""
+        count = self.policy.count
         healthy = [a for a in self.attempts.values() if a.phase == "healthy"]
+        if len(healthy) < count:
+            return None
+        chosen = []
         for a in sorted(healthy, key=lambda a: (a.dph, a.seq)):
             answered, inst = self._lookup(a.instance_id)
             if not answered:
@@ -562,19 +579,22 @@ class Launch:
             elif str(inst.get("actual_status")) != "running":
                 self._fail(a, None, f"passed the gate, then was {inst.get('actual_status')}")
             else:
-                if self.state.expiry - time.time() < self.policy.min_lease:
-                    raise ConfigError(
-                        f"less than {self.policy.min_lease:g}s of the lease is left; "
-                        "raise --ttl-min"
-                    )
-                return a
-        return None
+                chosen.append(a)
+                if len(chosen) == count:
+                    break
+        if len(chosen) < count:
+            return None
+        if self.state.expiry - time.time() < self.policy.min_lease:
+            raise ConfigError(
+                f"less than {self.policy.min_lease:g}s of the lease is left; raise --ttl-min"
+            )
+        return chosen
 
     def _rent(self, offers: collections.deque, deadline: float) -> None:
         spec, state = self.spec, self.state
         while (
             sum(a.holds_slot for a in self.attempts.values()) < self.policy.max_live
-            and self._sent() < self.policy.max_attempts
+            and self._sent() < self.policy.attempts
             and offers
             and time.monotonic() < deadline
         ):
@@ -612,7 +632,7 @@ class Launch:
             log(f"  {a.tag_name} rented instance {iid}: ${a.dph:.2f}/hr, host {a.host_id}, {a.geo}")
 
     def _sent(self) -> int:
-        """Creates that count against `max_attempts`: those that may have rented a box. An
+        """Creates that count against the attempts: those that may have rented a box. An
         offer that was already gone ("refused") cost nothing, and a burst of them must not
         end the launch; the list of offers is what bounds those."""
         return sum(a.state != "refused" for a in self.attempts.values())
@@ -625,17 +645,22 @@ class Launch:
         of sitting on them until the deadline.
         """
         policy, now = self.policy, time.monotonic()
+        healthy = 0
         for a in self.attempts.values():
             if a.state != "rented":
                 continue
-            if a.phase in PENDING or a.phase == "healthy":
+            if a.phase in PENDING:
                 return True
+            if a.phase == "healthy":
+                healthy += 1
             if a.phase == "failed" and not a.gone and now - a.failed_at < policy.confirm_timeout:
                 return True  # its delete may still show, and free its slot
+        if healthy >= policy.count:
+            return True  # enough; a lookup did not answer, and the next one may
         return bool(
             offers
             and sum(a.holds_slot for a in self.attempts.values()) < policy.max_live
-            and self._sent() < policy.max_attempts
+            and self._sent() < policy.attempts
             and now < deadline
         )
 
@@ -653,17 +678,17 @@ def gpu_model(rented: str | None, asked) -> str | None:
 def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> None:
     """Record what this launch taught us about machines.
 
-    A failure is blamed on the machine only if another candidate, with the
-    same image, GPU request and gate, became healthy in this launch. If
-    nothing came up the cause may be ours, and blaming every machine tried
-    would shrink the pool for no reason.
+    A failure is blamed on the machine only if the launch succeeded: other
+    candidates, with the same image, GPU request and gate, became healthy. If
+    it did not, the cause may be ours, and blaming every machine tried would
+    shrink the pool for no reason.
     """
-    if not result.winner:
+    if not result.winners:
         return
     for a in result.attempts:
         common = {"gpu": gpu_model(a.gpu, spec.gpus), "num_gpus": spec.num_gpus,
                   "gate_version": GATE_VERSION}  # fmt: skip
-        if a is result.winner:
+        if a in result.winners:
             secs = a.timings.get("healthy")
             obs.add(
                 pol.observation(
@@ -791,29 +816,33 @@ def reap(vast, policy: Policy, namespace: str, *, destroy: bool = False, now=Non
 
 
 def renew(vast, state: State, prober, expiry: int) -> None:
-    """Move the end of the winner's lease to `expiry`.
+    """Move the end of the lease of every box of the run to `expiry`.
 
-    The box's own timer reads the expiry from a file on the box; the reaper
-    reads it from the tag. The file is written first, so that if the relabel
+    A box's own timer reads the expiry from a file on the box; the reaper
+    reads it from the tag. The files are written first, so that if a relabel
     is refused the reaper still acts on the old expiry: a refused renewal
-    can end the box early, not late. A relabel whose answer is lost, or a
-    state file that cannot be written afterwards, leaves the box renewed and
+    can end a box early, not late. A relabel whose answer is lost, or a
+    state file that cannot be written afterwards, leaves boxes renewed and
     this directory showing the old expiry; running `renew` again settles it.
     """
-    w = state.winner
-    if not w:
+    boxes = state.winners
+    if not boxes:
         raise ConfigError("this run has no box to renew")
     v.check_expiry(expiry)
-    r = prober.run((w["host"], w["port"]), v.set_expiry_command(expiry))
-    if r != 0:
-        raise v.VastError(0, f"could not set the expiry on the box (ssh exit {r}); nothing changed")
+    for i, w in enumerate(boxes):
+        r = prober.run((w["host"], w["port"]), v.set_expiry_command(expiry))
+        if r != 0:
+            done = "nothing changed" if i == 0 else f"{i} box(es) have the new expiry on the box"
+            raise v.VastError(0, f"could not set the expiry on instance {w['id']} (ssh exit {r}); "
+                              f"{done}; run `gpubox renew` again")  # fmt: skip
     try:
-        vast.relabel(w["id"], make_tag(state.run, w["attempt"], expiry))
+        for w in boxes:
+            vast.relabel(w["id"], make_tag(state.run, w["attempt"], expiry))
         state.set_expiry(expiry)
     except Exception:
         log(
-            "WARNING: the renewal is half done. The box's own timer has the new expiry; its "
-            "tag, which the reaper goes by, may still have the old one, and this directory "
-            "still shows the old one. Run `gpubox renew` again."
+            "WARNING: the renewal is half done. The boxes' own timers have the new expiry; "
+            "their tags, which the reaper goes by, may still have the old one, and this "
+            "directory still shows the old one. Run `gpubox renew` again."
         )
         raise

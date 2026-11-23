@@ -1,8 +1,9 @@
 """gpubox: rent a verified GPU box from Vast.ai, and make sure it is destroyed.
 
-    up      rent a box and wait until it is reachable and passes the health gate
-    run     run a local script on that box over SSH, streaming its output
-    renew   move the end of the box's lease
+    up      rent boxes and wait until they are reachable and pass the health gate
+    status  show the run's boxes: names, addresses, lease
+    run     run a local script on a box over SSH, streaming its output
+    renew   move the end of the boxes' lease
     down    destroy everything this state directory's run rented
     reap    report, or destroy, boxes of a namespace whose lease has ended
     search  show the offers `up` would try (rents nothing)
@@ -53,7 +54,7 @@ from .launch import (
     reap,
     renew,
 )
-from .state import NAMESPACE, RUN_ID, State, StateError, name_of, new_run_id, state_lock
+from .state import NAMESPACE, RUN_ID, State, StateError, box_name, new_run_id, state_lock
 
 EXIT_CONFIG = 2
 EXIT_INFRA = 75
@@ -85,10 +86,11 @@ def github_output(**values) -> None:
 def write_summary(spec: Spec, result: Result) -> None:
     if not (path := os.environ.get("GITHUB_STEP_SUMMARY")):
         return
-    w = result.winner
+    ws = result.winners
     head = (
-        f"healthy box after {result.seconds:.0f}s: machine {w.machine_id}, ${w.dph:.2f}/hr"
-        if w
+        f"{len(ws)} healthy box(es) after {result.seconds:.0f}s: "
+        + ", ".join(f"machine {w.machine_id} (${w.dph:.2f}/hr)" for w in ws)
+        if ws
         else f"no healthy box after {result.seconds:.0f}s"
     )
     lines = [
@@ -100,7 +102,7 @@ def write_summary(spec: Spec, result: Result) -> None:
         "|---|---|---|---|---|---|---|",
     ]
     for a in result.attempts:
-        outcome = "healthy" if a is w else (a.reason or "not blamed")
+        outcome = "healthy" if a in ws else (a.reason or "not blamed")
         secs = a.timings.get("healthy") or a.timings.get("ssh") or ""
         detail = a.detail.replace("|", "/").replace("\n", " ")[:160]
         lines.append(
@@ -267,6 +269,7 @@ def cmd_up(args) -> int:
     state_dir = Path(args.state_dir)
     spec = spec_from(args, args.image)
     policy = Policy(
+        count=args.count,
         spare=args.spare,
         max_attempts=args.max_attempts,
         startup_timeout=args.startup_timeout,
@@ -298,7 +301,10 @@ def cmd_up(args) -> int:
                 f"cannot write the run id to GITHUB_OUTPUT ({exc}); nothing was rented"
             ) from None
         expiry = int(time.time()) + spec.ttl_min * 60
-        meta = {"image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus}
+        meta = {
+            "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
+            "count": policy.count,
+        }  # fmt: skip
         state = State.begin(state_dir, run_id, expiry, account, meta)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
@@ -308,7 +314,7 @@ def cmd_up(args) -> int:
         prober = Prober(keys)
         launch = Launch(vast, spec, policy, state, prober)
         result = launch.run(pol.blocklist(known_rows(obs, shared), time.time()))
-        if result.winner and args.ssh_config:
+        if result.winners and args.ssh_config:
             advisory("writing the SSH configuration", write_ssh_entry, state, keys)
     # The outcome is decided and in the state file; nothing below may change it.
     advisory("recording observations", observe, result, spec, run_id, obs)
@@ -318,15 +324,21 @@ def cmd_up(args) -> int:
     advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
     advisory("writing the summary", write_summary, spec, result)
     advisory("reporting", report_result, spec, result, state)
-    return 0 if result.winner else EXIT_INFRA
+    return 0 if result.winners else EXIT_INFRA
+
+
+def boxes_of(state: State) -> list[tuple[str, dict]]:
+    """(name, box) for each box of the run, in order."""
+    ws = state.winners
+    return [(box_name(state.run, i, len(ws)), w) for i, w in enumerate(ws)]
 
 
 def write_ssh_entry(state: State, keys: Path) -> None:
-    w, alias = state.winner, name_of(state.run)
-    path = sshconfig.add(
-        state.run, alias, w["host"], w["port"], keys / "id_ed25519", keys / "known_hosts"
-    )
-    log(f"`ssh {alias}` now reaches the box (entry in {path})")
+    named = boxes_of(state)
+    hosts = [(name, w["host"], w["port"]) for name, w in named]
+    path = sshconfig.add(state.run, hosts, keys / "id_ed25519", keys / "known_hosts")
+    names = " / ".join(f"`ssh {name}`" for name, _ in named)
+    log(f"{names} now reach{'es' if len(named) == 1 else ''} the box(es) (entries in {path})")
 
 
 def report_result(spec: Spec, result: Result, state: State) -> None:
@@ -337,17 +349,19 @@ def report_result(spec: Spec, result: Result, state: State) -> None:
             f"::warning::attempt {a.seq} got no answer to its create. If a box was rented it "
             f"carries the tag {a.tag}: `gpubox down` looks for it, and its lease ends it"
         )
-    w = result.winner
-    if not w:
+    if not result.winners:
         log(f"::error::no healthy {spec.gpu_text} box")
         return
-    r = w.report
     until = time.strftime("%H:%M UTC", time.gmtime(state.expiry))
-    log(
-        f"READY in {result.seconds:.0f}s: instance {w.instance_id} on machine {w.machine_id} "
-        f"(${w.dph:.2f}/hr, {w.geo}); {len(r.get('gpus') or [])}x GPU, {r.get('cpus')} CPUs, "
-        f"driver {r.get('driver')}, torch {r.get('torch')}; lease until {until}"
-    )
+    n = len(result.winners)
+    for i, w in enumerate(result.winners):
+        r = w.report
+        log(
+            f"READY in {result.seconds:.0f}s: {box_name(state.run, i, n)} is instance "
+            f"{w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo}); "
+            f"{len(r.get('gpus') or [])}x {w.gpu or 'GPU'}, {r.get('cpus')} CPUs, "
+            f"driver {r.get('driver')}, torch {r.get('torch')}; lease until {until}"
+        )
 
 
 # Provider states that mean the box is over, as opposed to missing or in transition.
@@ -363,18 +377,31 @@ def _still_ours(state_dir: Path, run_id: str) -> bool:
     return state is not None and state.run == run_id and not state.closing
 
 
-def live_box(state_dir: Path) -> tuple[State, dict]:
-    """The directory's run and its winner, or StateError if there is no box to use."""
+def live_run(state_dir: Path) -> State:
+    """The directory's run, or StateError if it has no boxes to use."""
     state = State.load(state_dir)
-    w = state.winner if state is not None else None
-    if not w or state.closing:
+    if state is None or not state.winners or state.closing:
         raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
-    return state, w
+    return state
+
+
+def live_box(state_dir: Path, box: int | None = None) -> tuple[State, dict]:
+    """The directory's run and box number `box` of it (the only one if None), or StateError."""
+    state = live_run(state_dir)
+    ws = state.winners
+    if box is None:
+        if len(ws) > 1:
+            raise StateError(f"the run has {len(ws)} boxes: say which with --box 0..{len(ws) - 1}")
+        box = 0
+    if not 0 <= box < len(ws):
+        raise StateError(f"no box {box}: the run has {len(ws)} (--box 0..{len(ws) - 1})")
+    return state, ws[box]
 
 
 def cmd_run(args) -> int:
     state_dir = Path(args.state_dir)
-    state, w = live_box(state_dir)  # no lock: `down` must be able to end a run in progress
+    # No lock: `down` must be able to end a run in progress.
+    state, w = live_box(state_dir, args.box)
     run_id, iid = state.run, w["id"]
     exports = []
     for item in args.env:
@@ -442,7 +469,7 @@ def cmd_run(args) -> int:
 def cmd_renew(args) -> int:
     state_dir = Path(args.state_dir)
     with state_lock(state_dir):
-        state, w = live_box(state_dir)
+        state = live_run(state_dir)
         vast = v.Vast(api_key(args))
         account = check_account(vast, pinned_account(args))
         same_account(vast, state, account)  # before anything on the box is changed
@@ -453,7 +480,26 @@ def cmd_renew(args) -> int:
         expiry = int(time.time()) + args.ttl_min * 60
         renew(vast, state, prober, expiry)
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry))
-    log(f"instance {w['id']}: lease now ends at {until}")
+    ids = ", ".join(str(w["id"]) for w in state.winners)
+    log(f"instance(s) {ids}: lease now ends at {until}")
+    return 0
+
+
+def cmd_status(args) -> int:
+    state = State.load(Path(args.state_dir))
+    if state is None:
+        print(f"no run in {args.state_dir}")
+        return 0
+    if state.closed:
+        print(f"run {state.run}: closed")
+        return 0
+    until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(state.expiry))
+    left = (state.expiry - time.time()) / 60
+    what = "closing" if state.closing else f"lease ends {until} ({left:.0f} min)"
+    print(f"run {state.run}: {len(state.winners)} box(es), {what}")
+    for i, (name, w) in enumerate(boxes_of(state)):
+        gpu = f"  {w['gpu']}" if w.get("gpu") else ""
+        print(f"  {i}  {name:<20} instance {w['id']:<10} root@{w['host']} -p {w['port']}{gpu}")
     return 0
 
 
@@ -600,13 +646,18 @@ def main(argv=None) -> int:
     s.add_argument("--image", required=True)
     s.add_argument("--namespace", required=True, help="who owns the box, e.g. quack-ci")
     s.add_argument("--name", required=True, help="this run, e.g. the CI run id")
+    s.add_argument(
+        "--count", type=number(int, 1), default=1, help="boxes to rent: all of them, or none"
+    )
     s.add_argument("--spare", type=number(int, 0), default=DEFAULTS.spare)
     s.add_argument(
         "--ssh-config",
         action="store_true",
         help="add the box to ~/.ssh/gpubox_config under its --name, so `ssh NAME` works",
     )
-    s.add_argument("--max-attempts", type=number(int, 1), default=DEFAULTS.max_attempts)
+    s.add_argument(
+        "--max-attempts", type=number(int, 1), help="rentals in all (default: 2 * count + 4)"
+    )
     s.add_argument(
         "--startup-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.startup_timeout
     )
@@ -640,8 +691,13 @@ def main(argv=None) -> int:
     )
     s.set_defaults(fn=cmd_up)
 
+    s = sub.add_parser("status")
+    state_args(s)
+    s.set_defaults(fn=cmd_status)
+
     s = sub.add_parser("run")
     state_args(s)
+    s.add_argument("--box", type=number(int, 0), help="which box of the run (0, 1, ...)")
     s.add_argument("--script", required=True)
     s.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     s.add_argument("--timeout-min", type=number(float, 0, exclusive=True), default=60)

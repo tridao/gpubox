@@ -88,24 +88,31 @@ def _included_at_the_top(text: str) -> bool:
     return False
 
 
-def add(run_id: str, alias: str, host: str, port: int, key: Path, known_hosts: Path) -> Path:
-    """Write the block for a run and make sure the user's config includes our file."""
-    block = [
-        _marker(run_id),
-        f"Host {alias}",
-        f"    HostName {host}",
-        f"    Port {port}",
-        "    User root",
-        f"    IdentityFile {_quoted(Path(key).resolve())}",
-        "    IdentitiesOnly yes",
-        f"    UserKnownHostsFile {_quoted(Path(known_hosts).resolve())}",
-        "    StrictHostKeyChecking accept-new",
-    ]
+def add(run_id: str, hosts, key: Path, known_hosts: Path) -> Path:
+    """Write the block for a run, a `Host` entry for each (alias, host, port) in `hosts`,
+    and make sure the user's config includes our file."""
+    block = [_marker(run_id)]
+    for alias, host, port in hosts:
+        block += [
+            f"Host {alias}",
+            f"    HostName {host}",
+            f"    Port {port}",
+            "    User root",
+            f"    IdentityFile {_quoted(Path(key).resolve())}",
+            "    IdentitiesOnly yes",
+            f"    UserKnownHostsFile {_quoted(Path(known_hosts).resolve())}",
+            "    StrictHostKeyChecking accept-new",
+        ]
+    aliases = [alias for alias, _, _ in hosts]
     with _locked() as d:
         owned = d / OWNED
         old = owned.read_text() if owned.exists() else ""
         # Not this run's earlier block, and not a stale box of the same name.
-        others = [b for b in _blocks(old) if b[0] != _marker(run_id) and not _is_host(b, alias)]
+        others = [
+            b
+            for b in _blocks(old)
+            if b[0] != _marker(run_id) and not any(_is_host(b, a) for a in aliases)
+        ]
         _write(owned, "".join("\n".join(b) + "\n" for b in [*others, block]))
         config = d / "config"
         text = config.read_text() if config.exists() else ""

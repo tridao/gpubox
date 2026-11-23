@@ -24,13 +24,13 @@ close the gaps found when comparing the two. Work them in order; each is one or 
 
 ## 3. N boxes in one run [R]
 
-- [ ] `up --count N`: one run id, one race with `N + --spare` slots, all-or-nothing (a launch
+- [x] `up --count N`: one run id, one race with `N + --spare` slots, all-or-nothing (a launch
   that cannot get N healthy boxes rolls back like today's). `--max-attempts` defaults to
   `2N + 4` (6 for one box, as now).
-- [ ] State file v3: `winners` list (v2 files with one `winner` still load).
-- [ ] Names: one box is `NAME`, as now; N boxes are `NAME-0` ... `NAME-(N-1)`. `--ssh-config`
+- [x] State file v3: `winners` list (v2 files with one `winner` still load).
+- [x] Names: one box is `NAME`, as now; N boxes are `NAME-0` ... `NAME-(N-1)`. `--ssh-config`
   writes one `Host` entry each. `gpubox status` prints the boxes (alias, address, lease).
-  `run`, `ssh`, `logs` take `--box I`; `renew` and `down` act on all of them.
+  `run` takes `--box I` (`ssh`, `logs` will too); `renew` and `down` act on all of them.
 
 ## 4. Detached jobs; ssh in [R]
 

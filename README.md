@@ -45,6 +45,21 @@ the host's docker daemon see the token, so make it a read-only pull token.
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 
+## Several boxes
+
+```bash
+gpubox up --count 4 --gpu "RTX 5090" --max-dph-per-gpu 0.80 --image my/image:tag \
+    --namespace eval --name shard --ttl-min 240 --ssh-config
+gpubox status                  # shard-0 ... shard-3: addresses, lease
+ssh shard-2
+gpubox run --box 2 --script job.sh
+gpubox down                    # all of them
+```
+
+All or nothing: `up` races `count + --spare` hosts and returns 0 only with
+`--count` healthy boxes; otherwise it destroys the ones it had. A run of one
+box is called `NAME`; a run of several, `NAME-0`, `NAME-1`, ...
+
 ## A CI job
 
 ```yaml
@@ -72,9 +87,10 @@ directory. Always run `down` after `up`, whatever `up` returned.
 
 | | |
 |---|---|
-| `up` | rent a box and wait until it passes the health gate |
-| `run` | run a local script on the box over SSH, streaming its output |
-| `renew` | move the end of the box's lease |
+| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate |
+| `status` | show the run's boxes: names, addresses, lease |
+| `run` | run a local script on a box over SSH, streaming its output |
+| `renew` | move the end of the boxes' lease |
 | `down` | destroy everything the run rented |
 | `reap` | destroy boxes of a namespace whose lease has ended (without `--destroy`: report) |
 | `search` | show the offers `up` would try; rents nothing |
@@ -89,9 +105,9 @@ run, and `observations.jsonl`.
 
 ## How it works
 
-- **Race.** `up` rents `1 + --spare` hosts (2 by default), cheapest first,
-  one machine per host. A box that fails is destroyed and replaced, up to
-  `--max-attempts` rentals.
+- **Race.** `up` rents `--count + --spare` hosts (2 by default), cheapest
+  first, one machine per host. A box that fails is destroyed and replaced, up
+  to `--max-attempts` rentals (default `2 * count + 4`).
 - **Health gate.** GPU model, count and VRAM; required URLs reachable
   (`--must-reach`); the GPU idle before we touch it. Where the image has a
   CUDA build of PyTorch, also: CUDA works, a matmul on every GPU matches the
@@ -117,12 +133,12 @@ run, and `observations.jsonl`.
 
 ## What it promises, and what it does not
 
-- `up` exits 0 only with a box that passed the gate, was still running when
-  looked up afterwards, and is recorded in `run.json`. Before that, a failure
+- `up` exits 0 only with `--count` boxes that passed the gate, were still
+  running when looked up afterwards, and are recorded in `run.json`. Before that, a failure
   or Ctrl-C rolls back what was rented. The rollback gets about ten seconds
   and is an attempt; `down` finishes it.
-- At most `1 + --spare` boxes are billable at once, as far as gpubox can
-  know. A rental request that got no answer keeps its slot.
+- At most `--count + --spare` boxes are billable at once, as far as gpubox
+  can know. A rental request that got no answer keeps its slot.
 - No offer above the price cap is rented, whatever the search returned.
 - `down` exits 0 only when every box it knows of is confirmed gone by id and
   two listings in a row show nothing with the run's tag. Otherwise it exits

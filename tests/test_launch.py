@@ -422,7 +422,7 @@ def test_an_interrupt_during_the_hand_off_is_decided_by_what_is_on_disk(
     real_replace = os.replace
 
     def replace(src, dst):
-        if '"winner": {' not in open(src).read():
+        if '"winners": []' in open(src).read():
             return real_replace(src, dst)
         if when == "after the rename":
             real_replace(src, dst)
@@ -932,3 +932,87 @@ def test_a_spec_needs_a_model_and_takes_a_single_name():
     for bad in ((), ("",), [None]):
         with pytest.raises(ValueError):
             L.Spec(image="i", gpus=bad, max_dph_per_gpu=1)
+
+
+# ------------------------------------------------------------- several boxes
+
+
+def test_several_boxes_are_raced_with_spares_and_handed_over_together(tmp_path):
+    behaviour = dict.fromkeys(range(1, 7), "ok")
+    vast = FakeVast(behaviour, offers=[offer(m, dph=m / 10) for m in behaviour])
+    result, vast, state = run(tmp_path, {}, vast=vast, count=3)
+    assert len(result.winners) == 3
+    assert sorted(vast.ours()) == sorted(w.instance_id for w in result.winners)
+    disk = on_disk(state)
+    assert [w["id"] for w in disk.winners] == [w.instance_id for w in result.winners]
+    assert [w.dph for w in result.winners] == sorted(
+        w.dph for w in result.winners
+    )  # cheapest first
+    assert vast.peak <= 4  # count + spare
+    assert not result.left
+
+
+def test_a_failure_among_several_is_replaced_and_blamed(tmp_path):
+    result, vast, state = run(tmp_path, {1: "ok", 2: "bad_gpu", 3: "ok"}, count=2, spare=0)
+    assert {w.machine_id for w in result.winners} == {1, 3}
+    assert observed(result) == {
+        (1, "healthy", None), (3, "healthy", None), (2, "failed_admission", "cuda_init"),
+    }  # fmt: skip
+
+
+def test_too_few_healthy_boxes_rolls_back_all_of_them_and_blames_nobody(tmp_path):
+    t0 = time.monotonic()
+    result, vast, state = run(tmp_path, {1: "ok", 2: "bad_gpu", 3: "bad_gpu"}, count=2, spare=0)
+    assert result.winners == [] and result.winner is None
+    assert vast.ours() == [] and on_disk(state).winners == []
+    assert observed(result) == set()
+    assert time.monotonic() - t0 < FAST.overall_timeout / 2  # nothing left to try: no waiting
+    assert reasons(result)[1] is None  # healthy, but not kept
+
+
+def test_attempts_grow_with_the_number_of_boxes():
+    assert L.Policy().attempts == 6 and L.Policy(count=3).attempts == 10
+    assert L.Policy(count=3, max_attempts=4).attempts == 4
+    assert L.Policy(count=3, spare=2).max_live == 5
+
+
+def test_a_healthy_box_that_dies_while_the_others_race_is_replaced(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "hold", 3: "ok"}, count=2, spare=0)
+
+    def kill_the_first_then_release():
+        for iid, box in list(vast.live.items()):
+            if box["machine"] == 1:
+                vast.live.pop(iid)
+        vast.release = True
+
+    at_call(vast, "gate_poll", 3, kill_the_first_then_release)
+    result = launch.run({})
+    assert {w.machine_id for w in result.winners} == {2, 3}
+    assert sorted(vast.ours()) == sorted(w.instance_id for w in result.winners)
+
+
+def test_an_interrupt_with_some_boxes_healthy_rolls_back_all_of_them(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "hold", 3: "hold"}, count=3, spare=0)
+    at_call(vast, "gate_poll", 4, interrupt)
+    assert isinstance(outcome(launch), KeyboardInterrupt)
+    assert vast.ours() == [] and on_disk(state).winners == []
+
+
+def test_renewing_several_boxes_moves_the_lease_of_each(tmp_path):
+    result, vast, state = up(tmp_path, {1: "ok", 2: "ok"}, count=2, spare=0)
+    prober, later = FakeProber(vast), EXPIRY + 7200
+    L.renew(vast, state, prober, later)
+    assert len(prober.ran) == 2
+    for w in result.winners:
+        assert parse_tag(vast.live[w.instance_id]["label"]).expiry == later
+    assert on_disk(state).expiry == later
+
+
+def test_a_renewal_that_reaches_only_some_boxes_relabels_none(tmp_path):
+    result, vast, state = up(tmp_path, {1: "ok", 2: "ok"}, count=2, spare=0)
+    prober = FakeProber(vast)
+    rcs = iter([0, 255])
+    prober.run = lambda ep, remote, timeout=60: next(rcs)
+    with pytest.raises(v.VastError, match="1 box"):
+        L.renew(vast, state, prober, EXPIRY + 7200)
+    assert vast.names("relabel") == [] and on_disk(state).expiry == EXPIRY
