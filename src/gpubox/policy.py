@@ -7,7 +7,8 @@ file can be shared.
 
 The durations are guesses (see the design notes) except the two-hour cooldown
 for a busy GPU, which follows from two machines seen recovering in 25 and 90
-minutes.
+minutes. A repeat does not lengthen a block: there is no data yet that says it
+should.
 """
 
 from __future__ import annotations
@@ -20,18 +21,18 @@ from pathlib import Path
 
 POLICY_VERSION = 1
 HOUR, DAY = 3600, 86400
-STRIKE_WINDOW = 30 * DAY
 
-# reason -> (class, first block, cap). Repeats within STRIKE_WINDOW double it.
+# reason -> (class, how long the machine is blocked). A later `healthy`
+# observation takes back a soft block, never a hard one.
 REASONS = {
-    "busy_gpu": ("soft", 2 * HOUR, 2 * DAY),
-    "unreachable": ("soft", 1 * DAY, 14 * DAY),
-    "no_network": ("soft", 1 * DAY, 14 * DAY),
-    "died": ("soft", 1 * DAY, 14 * DAY),
-    "runtime_error": ("hard", 14 * DAY, 60 * DAY),
-    "wrong_hardware": ("hard", 14 * DAY, 60 * DAY),
-    "cuda_init": ("hard", 14 * DAY, 60 * DAY),
-    "compute_mismatch": ("hard", 14 * DAY, 60 * DAY),
+    "busy_gpu": ("soft", 2 * HOUR),
+    "unreachable": ("soft", 1 * DAY),
+    "no_network": ("soft", 1 * DAY),
+    "died": ("soft", 1 * DAY),
+    "runtime_error": ("hard", 14 * DAY),
+    "wrong_hardware": ("hard", 14 * DAY),
+    "cuda_init": ("hard", 14 * DAY),
+    "compute_mismatch": ("hard", 14 * DAY),
 }
 KINDS = ("healthy", "failed_admission", "died_after_admission")
 
@@ -101,33 +102,20 @@ def _valid(row) -> bool:
 def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
     """machine_id -> {"until", "class", "reason"} for machines blocked at `now`.
 
-    Rows are judged per source: this client's own (no `src` field) and each
-    remote source separately, and a machine is blocked if any source's rows
-    block it. So a `healthy` row takes back soft failures of its own source
-    only: nobody else's report can unblock a machine that failed here, and
-    several sources cannot pile their strikes into one long block.
-
-    Within a source, repeats are counted per class (soft, hard), not per
-    reason: a machine that was busy yesterday and is unreachable today is on
-    its second soft strike. A row seen twice under one source (same id)
-    counts once. Our own rows also come back from the store under our
-    source's id; they are then judged a second time there, which changes
-    nothing but lets our own "healthy" take back what that source said about
-    the machine earlier. Rows of the same moment are ordered by the store's
-    sequence number where they have one, else by id.
+    Rows are judged per source: this client's own (no `src` field) and, for
+    the parked reputation store, each remote source separately. A machine is
+    blocked if any source's rows block it, so a `healthy` row takes back soft
+    failures of its own source only. Rows of the same moment are ordered by
+    the store's sequence number where they have one, else by id. A row that
+    appears twice changes nothing, since a repeat does not lengthen a block.
     """
     by_source: dict[str, dict[int, list[dict]]] = {}
-    seen = set()
     for row in rows:
         if not _valid(row) or row.get("policy_version", 1) > POLICY_VERSION:
             continue
         src = row.get("src", "")
         if not isinstance(src, str):
             continue
-        if row.get("id") is not None:
-            if (src, row["id"]) in seen:
-                continue
-            seen.add((src, row["id"]))
         by_source.setdefault(src, {}).setdefault(row["machine_id"], []).append(row)
     out: dict[int, dict] = {}
     rank = lambda b: (b["class"] == "hard", b["until"])
@@ -147,18 +135,15 @@ def _order(o: dict):
 def _block(obs: list[dict], now: float) -> dict | None:
     """What one source's rows about one machine amount to at `now`."""
     block = {"soft": (0, None), "hard": (0, None)}  # class -> (until, reason)
-    strikes: dict[str, list[int]] = {"soft": [], "hard": []}
     for o in sorted(obs, key=_order):
         if o["kind"] == "healthy":
-            block["soft"] = (0, None)  # it works now; history still counts
+            block["soft"] = (0, None)  # it works now
             continue
         reason = o.get("reason_code")
         if reason not in REASONS:
             continue
-        cls, first, cap = REASONS[reason]
-        recent = [t for t in strikes[cls] if o["ts"] - t <= STRIKE_WINDOW]
-        strikes[cls] = [*recent, o["ts"]]
-        until = o["ts"] + min(first * 2 ** len(recent), cap)
+        cls, duration = REASONS[reason]
+        until = o["ts"] + duration
         if until > block[cls][0]:
             block[cls] = (until, reason)
     cls = "hard" if block["hard"][0] > now else "soft"

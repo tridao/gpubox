@@ -8,8 +8,13 @@ test must fail its tests, not get machines blocked.
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
 import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .policy import REASONS
@@ -175,27 +180,13 @@ class Prober:
             argv += ["-o", f"{k}={v}"]
         return [*argv, f"root@{ep[0]}", remote]
 
-    def ready(self, ep: tuple[str, int]) -> tuple[bool, str]:
-        try:
-            r = subprocess.run(
-                self.ssh(ep, "true", connect_timeout=8),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=25,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "ssh timed out"
-        return r.returncode == 0, r.stderr.strip()[-200:]
+    def start_ready(self, ep: tuple[str, int]) -> Check:
+        """Start an SSH probe. Its result is (ok, last words of ssh)."""
+        child = Child(self.ssh(ep, "true", connect_timeout=8), timeout=READY_TIMEOUT)
+        return Check(child, read_ready)
 
-    def gate(self, ep: tuple[str, int], spec) -> tuple[bool, str | None, str, dict]:
-        """Returns (ok, reason_code, detail, report).
-
-        A box is admitted only on a clean exit with an explicit `ok: true`.
-        A reason code is returned only for a verdict the script itself gave;
-        output we cannot read (a crash, garbage, an unknown code) fails the
-        box without a reason, so nobody is blamed for our own bugs.
-        """
+    def start_gate(self, ep: tuple[str, int], spec) -> Check:
+        """Start the health gate. Its result is (ok, reason_code, detail, report)."""
         want = {
             "num_gpus": spec.num_gpus,
             "gpu": spec.gpu,
@@ -203,32 +194,141 @@ class Prober:
             "capability": list(spec.capability) if spec.capability else None,
             "must_reach": list(spec.must_reach),
         }
+        argv = self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want)))
+        return Check(Child(argv, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT), read_gate)
+
+
+READY_TIMEOUT = 25
+GATE_TIMEOUT = 240
+
+
+@dataclass
+class Done:
+    """How a child process ended."""
+
+    rc: int | None  # None: it was killed at its deadline
+    stdout: str
+    stderr: str
+
+    @property
+    def timed_out(self) -> bool:
+        return self.rc is None
+
+
+class Child:
+    """A process that is polled, never waited for.
+
+    What it reads comes from a file and what it writes goes to files, so
+    neither side can block on a pipe however much the box prints. It runs in
+    a session of its own: a Ctrl-C at the terminal reaches the launcher, which
+    decides what happens to its children.
+    """
+
+    def __init__(self, argv: list[str], *, stdin: str | None = None, timeout: float):
+        self._out, self._err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+        self._in = None
+        if stdin is not None:
+            self._in = tempfile.TemporaryFile()
+            self._in.write(stdin.encode())
+            self._in.seek(0)
+        self.deadline = time.monotonic() + timeout
+        self.done: Done | None = None
         try:
-            r = subprocess.run(
-                self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want))),
-                input=GATE_SCRIPT,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",  # whatever the box prints, we get a string
-                timeout=240,
+            self.proc = subprocess.Popen(
+                argv,
+                stdin=self._in if self._in is not None else subprocess.DEVNULL,
+                stdout=self._out,
+                stderr=self._err,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            return False, "unreachable", "health gate hung for 240s", _clean_report({})
-        if r.returncode == 255:
-            detail = f"ssh dropped during gate: {r.stderr.strip()[-200:]}"
-            return False, "unreachable", detail, _clean_report({})
+        except BaseException:
+            self._close()
+            raise
+
+    def _close(self) -> None:
+        for f in (self._in, self._out, self._err):
+            if f is not None:
+                f.close()
+
+    def _read(self, f) -> str:
+        f.seek(0)
+        return f.read(1 << 20).decode("utf-8", errors="replace")  # whatever the box printed
+
+    def poll(self) -> Done | None:
+        """None while it runs. At its deadline it is killed, and that is its result."""
+        if self.done is not None:
+            return self.done
+        rc = self.proc.poll()
+        if rc is None:
+            if time.monotonic() < self.deadline:
+                return None
+            self.kill()
+            return self.done
+        self.done = Done(rc, self._read(self._out), self._read(self._err))
+        self._close()
+        return self.done
+
+    def kill(self) -> None:
+        """Stop it now and collect it. Safe to call twice, and after it ended."""
+        if self.done is not None:
+            return
         try:
-            raw = json.loads(r.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            raw = None
-        if r.returncode != 0 or not isinstance(raw, dict) or type(raw.get("ok")) is not bool:
-            tail = (r.stderr or r.stdout).strip()[-300:]
-            detail = f"health gate gave no verdict (rc={r.returncode}): {tail}"
-            return False, None, detail, _clean_report({})
-        report = _clean_report(raw)
-        if raw["ok"]:
-            return True, None, "", report
-        reason, detail = raw.get("reason"), str(raw.get("detail") or "")[:400]
-        if not isinstance(reason, str) or reason not in REASONS:
-            return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
-        return False, reason, detail, report
+            os.killpg(self.proc.pid, signal.SIGKILL)  # its own session: ssh and anything it started
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        self.done = Done(None, self._read(self._out), self._read(self._err))
+        self._close()
+
+
+class Check:
+    """A child process together with how to read its result."""
+
+    def __init__(self, child: Child, read):
+        self.child, self._read = child, read
+
+    def poll(self):
+        done = self.child.poll()
+        return None if done is None else self._read(done)
+
+    def kill(self) -> None:
+        self.child.kill()
+
+
+def read_ready(done: Done) -> tuple[bool, str]:
+    if done.timed_out:
+        return False, "ssh timed out"
+    return done.rc == 0, done.stderr.strip()[-200:]
+
+
+def read_gate(done: Done) -> tuple[bool, str | None, str, dict]:
+    """(ok, reason_code, detail, report) from how the gate's process ended.
+
+    A box is admitted only on a clean exit with an explicit `ok: true`.
+    A reason code is returned only for a verdict the script itself gave;
+    output we cannot read (a crash, garbage, an unknown code) fails the
+    box without a reason, so nobody is blamed for our own bugs.
+    """
+    if done.timed_out:
+        return False, "unreachable", f"health gate hung for {GATE_TIMEOUT}s", _clean_report({})
+    if done.rc == 255:
+        detail = f"ssh dropped during gate: {done.stderr.strip()[-200:]}"
+        return False, "unreachable", detail, _clean_report({})
+    try:
+        raw = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raw = None
+    if done.rc != 0 or not isinstance(raw, dict) or type(raw.get("ok")) is not bool:
+        tail = (done.stderr or done.stdout).strip()[-300:]
+        detail = f"health gate gave no verdict (rc={done.rc}): {tail}"
+        return False, None, detail, _clean_report({})
+    report = _clean_report(raw)
+    if raw["ok"]:
+        return True, None, "", report
+    reason, detail = raw.get("reason"), str(raw.get("detail") or "")[:400]
+    if not isinstance(reason, str) or reason not in REASONS:
+        return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
+    return False, reason, detail, report

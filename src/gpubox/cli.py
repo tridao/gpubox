@@ -11,9 +11,9 @@ directory in use, bad arguments); 75 infrastructure (no healthy box, box lost
 mid-run, teardown not confirmed); 124 script timeout. `run` otherwise returns
 the script's own exit code, except that 255 is taken for a lost connection.
 
-The API key is read from VASTAI_API_KEY. If GPUBOX_STORE_URL and
-GPUBOX_STORE_TOKEN are set, observations of machines are shared through that
-store; it is advisory and never fails a command.
+The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
+pins the provider account: `up`, `down` and `reap` then refuse to act with a
+key that belongs to another one.
 """
 
 from __future__ import annotations
@@ -30,22 +30,10 @@ import time
 from pathlib import Path
 
 from . import policy as pol
-from . import store as st
 from . import vast as v
 from .gate import GATE_VERSION, Prober
-from .journal import RUN_ID, Journal, StateError, new_run_id, state_lock
-from .launch import (
-    ConfigError,
-    Launch,
-    Policy,
-    Result,
-    Spec,
-    compile_legacy,
-    down,
-    log,
-    observe,
-    reap,
-)
+from .launch import ConfigError, Launch, Policy, Result, Spec, down, log, observe, reap
+from .state import NAMESPACE, RUN_ID, Snapshot, StateError, new_run_id, state_lock
 
 EXIT_CONFIG = 2
 EXIT_INFRA = 75
@@ -128,30 +116,8 @@ def observations_path(args) -> Path:
     return Path(args.state_dir) / "observations.jsonl"
 
 
-def open_shared(args) -> st.Shared:
-    """The shared reputation store, if one is configured and its settings make sense."""
-    try:
-        return st.Shared(observations_path(args), st.from_env())
-    except st.StoreError as exc:  # its messages never contain the URL or the token
-        log(f"WARNING: reputation store not used: {exc}")
-    except Exception as exc:
-        log(f"WARNING: reputation store not used: {type(exc).__name__}")
-    return st.Shared(observations_path(args), None)
-
-
-def share(shared: st.Shared, what: str, **kw) -> None:
-    """Talk to the store. Whatever happens there, the command carries on."""
-    if shared.store:
-        try:
-            log(f"reputation store: {shared.sync(**kw)}")
-        except st.StoreError as exc:  # its messages never contain the URL or the token
-            log(f"WARNING: reputation store ({what}): {exc}")
-        except Exception as exc:
-            log(f"WARNING: reputation store ({what}): {type(exc).__name__}")
-
-
 def advisory(what: str, fn, *a, **kw) -> None:
-    """Run something whose failure must not fail the command (reports, reputation)."""
+    """Run something whose failure must not fail the command (reports, observations)."""
     try:
         fn(*a, **kw)
     except Exception as exc:  # whatever it is, it is not worth a box
@@ -167,6 +133,22 @@ def key_dir(state_dir: Path, run_id: str) -> Path:
     return Path(state_dir) / "keys" / run_id
 
 
+def pinned_account(args) -> str | None:
+    return getattr(args, "account_id", None) or os.environ.get("GPUBOX_ACCOUNT_ID") or None
+
+
+def check_account(vast, expected: str | None) -> str | None:
+    """Stop, before anything is rented or destroyed, if the key is another account's."""
+    if expected is None:
+        return None
+    actual = vast.account()
+    if actual != expected:
+        raise ConfigError(
+            f"the API key belongs to account {actual}, not to the expected account {expected}"
+        )
+    return actual
+
+
 def cmd_up(args) -> int:
     state_dir = Path(args.state_dir)
     spec = spec_from(args, args.image)
@@ -176,48 +158,34 @@ def cmd_up(args) -> int:
         startup_timeout=args.startup_timeout,
         overall_timeout=args.overall_timeout,
     )
-    key = api_key(args)
-    with state_lock(state_dir):
-        journal = Journal(state_dir)
-        if journal.exists():
-            old = journal.state()
-            if old.is_live():
-                raise StateError(
-                    f"run {old.run_id} in {state_dir} still has boxes; run `gpubox down` first"
-                )
-            if old.problems:
-                raise StateError(
-                    f"the journal in {state_dir} is damaged ({old.problems[0]}); check the "
-                    "provider for leftover boxes, then remove the directory"
-                )
-            journal.rotate()
-        run_id = new_run_id(args.namespace, args.name)
-        journal.append(
-            "run",
-            run_id=run_id,
-            namespace=args.namespace,
-            image=spec.image,
-            gpu=spec.gpu,
-            num_gpus=spec.num_gpus,
+    if spec.ttl_min * 60 < policy.overall_timeout + policy.min_lease:
+        raise ConfigError(
+            f"--ttl-min {spec.ttl_min} leaves no lease after a launch of up to "
+            f"{policy.overall_timeout:g}s; it must cover that plus {policy.min_lease:g}s"
         )
+    vast = v.Vast(api_key(args))
+    with state_lock(state_dir):
+        old = Snapshot.load(state_dir)  # StateError if it is damaged
+        if old is not None and not old.closed:
+            raise StateError(f"run {old.run} in {state_dir} is not closed; run `gpubox down` first")
+        account = check_account(vast, pinned_account(args))
+        # A key that cannot list could never find its boxes again: learn that
+        # before renting one.
+        vast.instances()
+        run_id = new_run_id(args.namespace, args.name)
+        expiry = int(time.time()) + spec.ttl_min * 60
+        meta = {"image": spec.image, "gpu": spec.gpu, "num_gpus": spec.num_gpus}
+        snap = Snapshot.begin(state_dir, run_id, expiry, account, meta)
+        # Before any create: the teardown step is given this, and must have it
+        # whenever a box may exist.
         advisory("writing outputs", github_output, run_id=run_id)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
-        shared = open_shared(args)
-        share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
-        known = list(obs.rows)  # this client's own rows first: see policy.blocklist
-        try:
-            known += shared.remote_rows()
-        except Exception as exc:
-            log(f"WARNING: reputation store not used: {type(exc).__name__}")
         prober = Prober(key_dir(state_dir, run_id))
-        launch = Launch(v.Vast(key), spec, policy, journal, prober, run_id)
-        result = launch.run(pol.blocklist(known, time.time()))
-    # The outcome is decided and journalled; nothing below may change it.
+        launch = Launch(vast, spec, policy, snap, prober)
+        result = launch.run(pol.blocklist(obs.rows, time.time()))
+    # The outcome is decided and in the snapshot; nothing below may change it.
     advisory("recording observations", observe, result, spec, run_id, obs)
-    if obs.added:
-        advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
-        share(shared, "after the launch", pull=False)
     advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
     advisory("writing the summary", write_summary, spec, result)
     advisory("reporting", report_result, spec, result)
@@ -225,9 +193,10 @@ def cmd_up(args) -> int:
 
 
 def report_result(spec: Spec, result: Result) -> None:
-    for a in result.unresolved:
-        where = f"instance {a.instance_id}" if a.instance_id else f"label {a.label}"
-        log(f"::warning::attempt {a.seq} may have left a box ({where}); `gpubox down` retries")
+    for iid in result.left:
+        log(f"::warning::instance {iid} is not confirmed destroyed; `gpubox down` retries")
+    for a in result.unseen:
+        log(f"::warning::attempt {a.seq} got no answer to its create (tag {a.tag}); see `down`")
     w = result.winner
     if not w:
         log(f"::error::no healthy {spec.num_gpus}x {spec.gpu} box")
@@ -244,22 +213,28 @@ def report_result(spec: Spec, result: Result) -> None:
 DEAD_STATUSES = ("exited", "offline")
 
 
-def _ours_to_blame(journal: Journal, run_id: str, instance_id: int) -> bool:
-    """False if this run (or its teardown) is why the box went away."""
-    state = journal.state()
-    return state.run_id == run_id and state.boxes.get(instance_id) == "created"
+def _still_ours(state_dir: Path, run_id: str, instance_id: int) -> bool:
+    """False once this run's teardown has started, or the box is known to be gone."""
+    try:
+        snap = Snapshot.load(state_dir)
+    except StateError:
+        return False
+    return (
+        snap is not None
+        and snap.run == run_id
+        and not snap.closing
+        and snap.status(instance_id) == "live"
+    )
 
 
 def cmd_run(args) -> int:
     state_dir = Path(args.state_dir)
-    journal = Journal(state_dir)
-    state = journal.state()
-    w = state.winner
-    if state.problems:
-        raise StateError(f"the journal in {state_dir} is damaged ({state.problems[0]})")
-    if not state.run_id or not w or state.boxes.get(w["instance_id"]) != "created":
+    snap = Snapshot.load(state_dir)  # no lock: `down` must be able to end a run in progress
+    w = snap.winner if snap is not None else None
+    if not w or snap.closing or snap.status(w["id"]) != "live":
         raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
-    box = state.attempt_of(w["instance_id"])
+    run_id, iid = snap.run, w["id"]
+    box = snap.attempts().get(w["attempt"], {})
     exports = []
     for item in args.env:
         name, sep, value = item.partition("=")
@@ -272,9 +247,9 @@ def cmd_run(args) -> int:
     remote = 'f=$(mktemp /tmp/gpubox-script.XXXXXX) && cat > "$f" && exec bash "$f" </dev/null'
     # The key belongs to this run: it is gone once the run is torn down.
     try:
-        prober = Prober(key_dir(state_dir, state.run_id), create=False)
+        prober = Prober(key_dir(state_dir, run_id), create=False)
     except FileNotFoundError:
-        raise StateError(f"run {state.run_id} has no SSH key in {state_dir} (torn down?)") from None
+        raise StateError(f"run {run_id} has no SSH key in {state_dir} (torn down?)") from None
     argv = prober.ssh((w["host"], w["port"]), remote)
     try:
         rc = subprocess.run(argv, input=script.encode(), timeout=args.timeout_min * 60).returncode
@@ -283,8 +258,7 @@ def cmd_run(args) -> int:
         return EXIT_TIMEOUT
     if rc != 255:  # 255 is ssh's own failure code (a script exiting 255 reads the same)
         return rc
-    iid = w["instance_id"]
-    if not _ours_to_blame(journal, state.run_id, iid):
+    if not _still_ours(state_dir, run_id, iid):
         log("::error::the box was destroyed by `gpubox down` while the script ran")
         return EXIT_INFRA
     status = None
@@ -295,27 +269,26 @@ def cmd_run(args) -> int:
         log(f"WARNING: could not ask the provider what happened: {exc}")
     log(f"::error::lost the SSH connection to the box (instance status: {status or 'unknown'})")
     # Blame the machine only on the provider's word that the box is over, and
-    # only if our own teardown did not start in the meantime. A missing or
-    # transitional status, or an API error, is not evidence.
-    if (status == "gone" or status in DEAD_STATUSES) and _ours_to_blame(journal, state.run_id, iid):
-        meta = state.meta
+    # only if our own teardown did not start in the meantime. An instance
+    # that no longer exists was destroyed by someone (a teardown elsewhere,
+    # its own timer, the reaper), which says nothing about the machine. A
+    # missing or transitional status, or an API error, is not evidence either.
+    if status in DEAD_STATUSES and _still_ours(state_dir, run_id, iid):
+        meta = snap.meta
         extra = {k: meta[k] for k in ("gpu", "num_gpus") if k in meta}
 
         def record():
             row = pol.observation(
                 "died_after_admission",
-                box.machine_id if box else None,
-                box.host_id if box else None,
-                state.run_id,
+                box.get("machine"),
+                box.get("host"),
+                run_id,
                 reason="died",
                 gate_version=GATE_VERSION,
                 **extra,
             )
             pol.Observations(observations_path(args)).add(row)
             github_output(observations_changed="true")
-            shared = open_shared(args)
-            shared.queue([row])
-            share(shared, "after the run", pull=False)
 
         advisory("recording the observation", record)
     return EXIT_INFRA
@@ -323,31 +296,66 @@ def cmd_run(args) -> int:
 
 def cmd_down(args) -> int:
     state_dir = Path(args.state_dir)
+    run_id = args.run_id
+    if run_id is not None and not RUN_ID.fullmatch(run_id):
+        # Also an empty one: a job whose `up` never got as far as a run id has
+        # rented nothing, and must not tear down whatever else is here.
+        raise StateError(f"not a run id: {run_id!r}")
     with state_lock(state_dir):
-        journal = Journal(state_dir, run_id=args.run_id)
-        if not journal.exists():
+        damaged = None
+        try:
+            snap = Snapshot.load(state_dir)
+        except StateError as exc:
+            if run_id is None:
+                raise  # T3: we cannot even tell which run this is
+            snap, damaged = None, exc
+        if snap is None and run_id is None:
             log(f"no run in {state_dir}: nothing to destroy")
             return 0
-        run_id = journal.state().run_id
-        left = down(v.Vast(api_key(args)), journal, Policy(), abandon_unseen=args.abandon_unseen)
-        if not left and run_id:
-            # Nothing of this run is left to log in to. (A journal whose header
-            # is damaged has no run id, and nothing is removed for it.)
-            shutil.rmtree(key_dir(state_dir, run_id), ignore_errors=True)
+        vast = v.Vast(api_key(args))
+        check_account(vast, pinned_account(args))
+        ours = snap is not None and (run_id is None or snap.run == run_id)
+        if ours:
+            if snap.account is not None and vast.account() != snap.account:
+                # T3: an empty listing on another account says nothing about this run.
+                raise ConfigError(
+                    f"run {snap.run} was rented on account {snap.account}; "
+                    "the API key belongs to another account"
+                )
+            left = down(vast, snap, Policy(), abandon_unseen=args.abandon_unseen)
+            if not left:
+                # Nothing of this run is left to log in to.
+                shutil.rmtree(key_dir(state_dir, snap.run), ignore_errors=True)
+        else:
+            # T4: by tag alone. The directory's own snapshot and keys are not touched.
+            log(f"run {run_id} has no snapshot in {state_dir}: destroying by tag only")
+            left = down(vast, Snapshot.ephemeral(run_id), Policy(), abandon_unseen=False)
+            if damaged is not None:
+                log(f"::error::{damaged}; the ids it held could not be checked")
+                left += 1
     if left:
         log(f"::error::{left} thing(s) unresolved; see above, then run `gpubox down` again")
     return EXIT_INFRA if left else 0
 
 
 def cmd_reap(args) -> int:
-    legacy = compile_legacy(args.legacy_pattern)  # before anything is touched
+    if args.exclusive == (args.namespace is not None):
+        raise ConfigError("reap needs exactly one of --namespace NS and --exclusive")
+    if args.namespace is not None and not NAMESPACE.fullmatch(args.namespace):
+        raise ConfigError(f"not a namespace: {args.namespace!r}")
+    expected = pinned_account(args)
+    if args.exclusive and expected is None:
+        raise ConfigError("reap --exclusive needs --account-id (or GPUBOX_ACCOUNT_ID)")
+    if args.exclusive and args.max_age_min is None:
+        raise ConfigError("reap --exclusive needs --max-age-min")
+    vast = v.Vast(api_key(args))
+    check_account(vast, expected)  # R1
     failed = reap(
-        v.Vast(api_key(args)),
-        args.namespace,
-        args.max_age_min,
+        vast,
         Policy(),
-        destroy=args.destroy and not args.dry_run,
-        legacy=legacy,
+        namespace=args.namespace,
+        max_age_min=args.max_age_min,
+        destroy=args.destroy,
     )
     return EXIT_INFRA if failed else 0
 
@@ -355,12 +363,7 @@ def cmd_reap(args) -> int:
 def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
-    remote = []
-    try:
-        remote = open_shared(args).remote_rows()
-    except Exception as exc:
-        log(f"WARNING: reputation store not used: {type(exc).__name__}")
-    blocked = pol.blocklist([*obs.rows, *remote], time.time())
+    blocked = pol.blocklist(obs.rows, time.time())
     offers = pol.select_offers(v.Vast(api_key(args)).offers(v.offer_query(spec)), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
@@ -399,6 +402,12 @@ def main(argv=None) -> int:
     p.add_argument("--keys-file", default=LOCAL_KEYS_FILE, help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def account_arg(s):
+        s.add_argument(
+            "--account-id",
+            help="the provider account this must act on; refuse a key of another one",
+        )
+
     def state_args(s):
         s.add_argument("--state-dir", default=".gpubox")
         s.add_argument("--observations", help="JSONL of machine observations (read and appended)")
@@ -421,6 +430,7 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("up")
     spec_args(s)
+    account_arg(s)
     s.add_argument("--image", required=True)
     s.add_argument("--namespace", required=True, help="who owns the box, e.g. quack-ci")
     s.add_argument("--name", required=True, help="this run, e.g. the CI run id")
@@ -446,31 +456,31 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("down")
     state_args(s)
+    account_arg(s)
     s.add_argument(
         "--run-id",
-        help="the run to tear down (printed by `up`); without it, the directory's current run",
+        help="the run to tear down (printed by `up`); without it, the directory's current run. "
+        "For a run this directory has no snapshot of, its boxes are destroyed by tag alone",
     )
     s.add_argument(
         "--abandon-unseen",
         action="store_true",
-        help="declare that attempts with no visible box rented nothing (after checking the provider)",
+        help="a create that got no answer, and whose box is still not visible 60 s later, "
+        "is left to the box's timer and the reaper instead of failing the teardown",
     )
     s.set_defaults(fn=cmd_down)
 
     s = sub.add_parser("reap")
-    s.add_argument("--namespace", required=True)
-    s.add_argument("--max-age-min", type=number(float, 0), required=True)
+    account_arg(s)
+    s.add_argument("--namespace", help="only boxes tagged for this namespace, once expired")
     s.add_argument(
-        "--destroy",
+        "--exclusive",
         action="store_true",
-        help="destroy stale boxes; asserts every box in this namespace is disposable",
+        help="every instance of the account: asserts that all of them are disposable. "
+        "Needs --account-id and --max-age-min",
     )
-    s.add_argument("--dry-run", action="store_true", help="report only, even with --destroy")
-    s.add_argument(
-        "--legacy-pattern",
-        metavar="REGEX",
-        help="also match labels of an older scheme (full match; never a current-scheme label)",
-    )
+    s.add_argument("--max-age-min", type=number(float, 0, exclusive=True))
+    s.add_argument("--destroy", action="store_true", help="destroy; without it, only report")
     s.set_defaults(fn=cmd_reap)
 
     s = sub.add_parser("search")
@@ -496,7 +506,7 @@ def main(argv=None) -> int:
         log(f"::error::state directory: {exc}")
         return EXIT_INFRA
     except KeyboardInterrupt:
-        # `up` has rolled back by now; anything a killed `down` left is in the journal.
+        # `up` has tried to roll back by now; what is left is in the snapshot, for `down`.
         log("::error::interrupted")
         return EXIT_INTERRUPTED
 

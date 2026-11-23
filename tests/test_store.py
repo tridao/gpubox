@@ -734,6 +734,12 @@ UP = [
 ]  # fmt: skip
 
 
+# The store is parked (DESIGN.md, decision 3): `store.py` is kept and tested on its
+# own above, but no command talks to it. The tests below drove it through `up`
+# and `search`; they come back when it is wired in again.
+parked = pytest.mark.skip(reason="the reputation store is parked: no command uses it")
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch, remote):
     vast = FakeVast({1: "ok", 2: "ok"})
@@ -764,6 +770,7 @@ def world(tmp_path, monkeypatch, remote):
     return vast, lambda argv: cli.main([*argv, "--state-dir", str(tmp_path)])
 
 
+@parked
 def test_up_skips_a_machine_someone_else_reported_and_reports_its_own(world, remote, tmp_path):
     vast, run = world
     remote.add(failed(1))
@@ -775,6 +782,7 @@ def test_up_skips_a_machine_someone_else_reported_and_reports_its_own(world, rem
     assert run(["down"]) == 0
 
 
+@parked
 def test_a_setup_failure_of_the_http_stack_is_a_warning(world, monkeypatch, capsys):
     vast, run = world
 
@@ -786,6 +794,7 @@ def test_a_setup_failure_of_the_http_stack_is_a_warning(world, monkeypatch, caps
     assert run(["down"]) == 0
 
 
+@parked
 @pytest.mark.parametrize("mode", ["error", "garbage", "slow", "trickle"])
 def test_a_broken_store_costs_a_launch_a_few_seconds_and_nothing_else(
     world, remote, tmp_path, monkeypatch, capsys, mode
@@ -809,6 +818,7 @@ def test_a_broken_copy_on_disk_does_not_fail_a_launch(world, remote, tmp_path):
     assert run(["down"]) == 0
 
 
+@parked
 def test_the_real_setting_refuses_cleartext_and_says_so_without_the_url(world, monkeypatch, capsys):
     vast, run = world
     monkeypatch.undo()  # back to the real from_env ...

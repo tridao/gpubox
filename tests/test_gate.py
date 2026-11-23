@@ -4,6 +4,8 @@ import json
 import re
 import shlex
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -23,14 +25,23 @@ def prober(tmp_path):
 
 
 def verdict(tmp_path, monkeypatch, rc, stdout, spec=SPEC):
-    calls = []
+    """What the gate's verdict is when its process ends this way."""
+    return gate.read_gate(gate.Done(rc, stdout, "")), None
 
-    def fake(argv, **kw):
-        calls.append((argv, kw))
-        return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(gate.subprocess, "run", fake)
-    return prober(tmp_path).gate(("10.0.0.1", 22), spec), calls
+def finish(check, within=10):
+    """Poll a check until it is done, as the launch loop does."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        result = check.poll()
+        if result is not None:
+            return result
+        time.sleep(0.01)
+    raise AssertionError("the child process did not finish")
+
+
+def python(code, **kw):
+    return gate.Child([sys.executable, "-c", code], **{"timeout": 10, **kw})
 
 
 @pytest.mark.parametrize(
@@ -77,12 +88,10 @@ def test_the_report_handed_on_always_has_the_same_shape(tmp_path, monkeypatch, s
     assert report["cpus"] is None and report["driver"] is None and report["torch"] is None
 
 
-def test_a_hung_gate_is_a_soft_failure(tmp_path, monkeypatch):
-    def hang(*a, **k):
-        raise subprocess.TimeoutExpired(a[0], 240)
-
-    monkeypatch.setattr(gate.subprocess, "run", hang)
-    assert prober(tmp_path).gate(("10.0.0.1", 22), SPEC)[:2] == (False, "unreachable")
+def test_a_hung_gate_is_a_soft_failure():
+    killed_at_its_deadline = gate.Done(None, "", "")
+    assert gate.read_gate(killed_at_its_deadline)[:2] == (False, "unreachable")
+    assert gate.read_ready(killed_at_its_deadline) == (False, "ssh timed out")
 
 
 def test_the_gate_is_asked_exactly_what_the_reference_launcher_asked(tmp_path, monkeypatch):
@@ -90,14 +99,21 @@ def test_the_gate_is_asked_exactly_what_the_reference_launcher_asked(tmp_path, m
         image="img", gpu="RTX 5090", num_gpus=2, max_dph_per_gpu=1.25, capability=(12, 0),
         min_vram_mib=30000, must_reach=("https://github.com/", "https://pypi.org/simple/pip/"),
     )  # fmt: skip
-    _, calls = verdict(tmp_path, monkeypatch, 0, '{"ok": true}', spec)
+    calls = []
+
+    class Recorded:
+        def __init__(self, argv, **kw):
+            calls.append((argv, kw))
+
+    monkeypatch.setattr(gate, "Child", Recorded)
+    prober(tmp_path).start_gate(("10.0.0.1", 22), spec)
     argv, kw = calls[0]
     prefix = REFERENCE["gate"]["remote_prefix"]
     assert argv[-1].startswith(prefix)
     (quoted,) = shlex.split(argv[-1][len(prefix) :])  # what the remote shell will pass on
     sent = json.loads(quoted)
     assert sent == REFERENCE["gate"]["want"]
-    assert kw["input"] == gate.GATE_SCRIPT
+    assert kw == {"stdin": gate.GATE_SCRIPT, "timeout": gate.GATE_TIMEOUT}
 
 
 def test_gate_script_is_valid_python_and_names_only_known_reasons():
@@ -147,24 +163,80 @@ def test_each_key_directory_gets_its_own_key(tmp_path):
 
 
 def test_whatever_bytes_the_box_prints_are_read_without_raising(tmp_path, monkeypatch):
-    _, calls = verdict(tmp_path, monkeypatch, 0, '{"ok": true}')
-    kw = calls[0][1]
-    assert kw.get("errors") == "replace" and kw.get("encoding") == "utf-8" and "text" not in kw
-    # And for real: a process that emits bytes that are not UTF-8.
-    monkeypatch.undo()
+    # For real: a process that emits bytes that are not UTF-8.
     p = prober(tmp_path)
     monkeypatch.setattr(
         p,
         "ssh",
         lambda ep, remote, **k: [
-            "python3",
+            sys.executable,
             "-c",
             "import sys; sys.stdout.buffer.write(b'\\xff\\xfe junk'); sys.stderr.buffer.write(b'\\xff')",
         ],
     )
-    ok, reason, detail, report = p.gate(("10.0.0.1", 22), SPEC)
+    ok, reason, detail, report = finish(p.start_gate(("10.0.0.1", 22), SPEC))
     assert (ok, reason) == (False, None) and set(report) == {"gpus", "cpus", "driver", "torch"}
-    assert p.ready(("10.0.0.1", 22)) == (True, "\ufffd")
+    assert finish(p.start_ready(("10.0.0.1", 22))) == (True, "\ufffd")
+
+
+# --------------------------------------------------------- child processes
+
+
+def test_a_child_is_polled_and_gets_its_input_from_a_file():
+    child = python("import sys; print(sys.stdin.read().upper()); sys.exit(3)", stdin="hello")
+    done = finish(child)
+    assert (done.rc, done.stdout.strip(), done.timed_out) == (3, "HELLO", False)
+    assert child.poll() is done  # asking again changes nothing
+
+
+def test_a_child_that_prints_a_lot_never_blocks_on_a_pipe():
+    # Far more than a pipe holds. With pipes that nobody drains, this would hang.
+    done = finish(
+        python("import sys; sys.stdout.write('x' * 5_000_000); sys.stderr.write('e' * 5_000_000)")
+    )
+    assert done.rc == 0 and len(done.stdout) == 1 << 20  # and what we keep of it is bounded
+
+
+def test_a_child_is_killed_at_its_deadline_and_that_is_its_result():
+    child = python("import time; print('started', flush=True); time.sleep(60)", timeout=0.3)
+    t0 = time.monotonic()
+    done = finish(child)
+    assert done.timed_out and done.rc is None and time.monotonic() - t0 < 5
+    assert child.proc.poll() is not None  # collected, not left as a zombie
+
+
+def test_killing_a_child_stops_what_it_started_and_is_safe_to_repeat(tmp_path):
+    started, finished = tmp_path / "grandchild-started", tmp_path / "grandchild-finished"
+    grandchild = tmp_path / "grandchild.py"
+    grandchild.write_text(
+        f"import time\nopen({str(started)!r}, 'w').close()\ntime.sleep(1)\n"
+        f"open({str(finished)!r}, 'w').close()\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(grandchild)!r}])\ntime.sleep(60)\n"
+    )
+    child = gate.Child([sys.executable, str(parent)], timeout=10)
+    deadline = time.monotonic() + 10
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()  # there is something to stop
+    child.kill()
+    child.kill()
+    assert child.poll().timed_out and child.proc.poll() is not None
+    time.sleep(1.3)
+    assert not finished.exists()  # its whole session went with it
+    ended = python("pass")
+    finish(ended)
+    ended.kill()
+    assert ended.poll().rc == 0  # killing something that already ended does not rewrite its result
+
+
+def test_a_check_reads_the_result_of_its_child():
+    check = gate.Check(python('print(\'{"ok": true, "cpus": 4}\')'), gate.read_gate)
+    ok, reason, _, report = finish(check)
+    assert (ok, reason, report["cpus"]) == (True, None, 4)
 
 
 @pytest.mark.parametrize(

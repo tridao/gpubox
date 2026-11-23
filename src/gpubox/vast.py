@@ -54,8 +54,13 @@ class Vast:
     def __init__(self, key: str, base: str = API_BASE, timeout: float = 20):
         self.key, self.base, self.timeout = key, base, timeout
 
-    def _call(self, method, path, *, body=None, query=None, retries=2):
-        """The parsed JSON answer, of whatever shape. Callers validate it."""
+    def _call(self, method, path, *, body=None, query=None, retries=2, timeout=None):
+        """The parsed JSON answer, of whatever shape. Callers validate it.
+
+        `timeout` is for one request. A caller with a deadline passes what it
+        has left and `retries=0`, and does its own retrying.
+        """
+        timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
         url = self.base + path
         if query:
             url += "?" + urllib.parse.urlencode(
@@ -73,7 +78,7 @@ class Vast:
         for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read() or b"{}")
             except urllib.error.HTTPError as exc:
                 # The status is the answer; the body is only a description and
@@ -133,7 +138,14 @@ class Vast:
                 return contract
         raise CreateUnknown(200, f"create on offer {offer_id}: unusable answer {str(data)[:300]}")
 
-    def instance(self, instance_id: int) -> dict | None:
+    def account(self) -> str:
+        """The id of the account this key belongs to."""
+        data = self._call("GET", "/v0/users/current/", query={"owner": "me"})
+        if isinstance(data, dict) and type(data.get("id")) is int and data["id"] > 0:
+            return str(data["id"])
+        raise VastError(200, f"unexpected answer to the account lookup: {str(data)[:200]}")
+
+    def instance(self, instance_id: int, **call) -> dict | None:
         """The instance, or None only when the provider says it does not exist.
 
         Absence is a 404 or an explicit `"instances": null`. Any other answer
@@ -141,7 +153,7 @@ class Vast:
         callers use None to confirm a delete and free a slot.
         """
         try:
-            data = self._call("GET", f"/v0/instances/{instance_id}/", query={"owner": "me"})
+            data = self._call("GET", f"/v0/instances/{instance_id}/", query={"owner": "me"}, **call)
         except VastError as exc:
             if exc.status == 404:
                 return None
@@ -156,17 +168,20 @@ class Vast:
                 return row
         raise VastError(200, f"unexpected answer for instance {instance_id}: {str(data)[:200]}")
 
-    def instances(self) -> list[dict]:
+    def instances(self, **call) -> list[dict]:
         """Every instance of the account, or an error: never a partial list.
 
-        Callers conclude "no box carries this label" from this, so a page or a
-        row that cannot be read fails the whole listing.
+        Callers conclude "no box carries this tag" from this, so a page or a
+        row that cannot be read fails the whole listing. So does a row
+        without a `label` field (null or empty means untagged; absent means
+        we were not told), an id that appears twice, and a row count that
+        differs from the `total_instances` the last page states.
         """
         rows, query = [], {"select_filters": {}, "order_by": [{"col": "id", "dir": "asc"}]}
         query["limit"] = 25
-        seen_tokens = set()
+        seen_tokens, seen_ids = set(), set()
         for _ in range(MAX_PAGES):
-            data = self._call("GET", "/v1/instances/", query=query)
+            data = self._call("GET", "/v1/instances/", query=query, **call)
             page = data.get("instances") if isinstance(data, dict) else None
             if not isinstance(page, list) or data.get("success", True) is not True:
                 raise VastError(
@@ -177,6 +192,12 @@ class Vast:
                     raise VastError(
                         200, f"unreadable row in the instance listing: {str(row)[:200]}"
                     )
+                label = row.get("label", ...)
+                if label is ... or not (label is None or isinstance(label, str)):
+                    raise VastError(200, f"instance {row['id']} is listed without a usable label")
+                if row["id"] in seen_ids:
+                    raise VastError(200, f"instance {row['id']} is listed twice")
+                seen_ids.add(row["id"])
             rows.extend(page)
             if "next_token" not in data:
                 # The last page says `"next_token": null`. A page without the
@@ -184,6 +205,11 @@ class Vast:
                 raise VastError(200, "instance listing page has no next_token")
             token = data["next_token"]
             if token is None:
+                total = data.get("total_instances")
+                if total is not None and (type(total) is not int or total != len(rows)):
+                    raise VastError(
+                        200, f"instance listing has {len(rows)} rows but states {total!r}"
+                    )
                 return rows
             if not isinstance(token, str) or not token or token in seen_tokens:
                 raise VastError(200, f"instance listing does not advance (token {token!r})")
@@ -191,10 +217,10 @@ class Vast:
             query["after_token"] = token
         raise VastError(200, f"instance listing has more than {MAX_PAGES} pages")
 
-    def destroy(self, instance_id: int) -> None:
+    def destroy(self, instance_id: int, **call) -> None:
         """Ask for destruction. An instance that is already gone is not an error."""
         try:
-            data = self._call("DELETE", f"/v0/instances/{instance_id}/", body={})
+            data = self._call("DELETE", f"/v0/instances/{instance_id}/", body={}, **call)
         except VastError as exc:
             if exc.status != 404:
                 raise
@@ -237,7 +263,7 @@ SELF_DESTROY = (
 )
 
 
-def bootstrap_command(pubkey: str, ttl_min: int) -> str:
+def bootstrap_command(pubkey: str, expiry: int) -> str:
     """Container command: a self-destruct timer, then sshd for our key.
 
     The timer is a dead-man switch that needs neither the launcher nor our API
@@ -245,30 +271,42 @@ def bootstrap_command(pubkey: str, ttl_min: int) -> str:
     billing, because Vast restarts a container whose main process ends. It is
     part of the create request, so even a box whose create response we never
     saw carries it. One line, because Vast passes this as `docker run` arguments.
+
+    It is started first, so a box stuck installing sshd is covered. It waits
+    for an absolute time (the expiry in the box's tag), so a container that
+    restarts does not start counting again. Once that time has passed it
+    sends the delete every 30 s for as long as it runs, whatever the answers
+    say: if the delete works, the loop ends with the box.
     """
+    if type(expiry) is not int or not 0 < expiry < 10**10:
+        raise ValueError(f"bad expiry {expiry!r}")
     watchdog = (
-        f"(sleep {ttl_min}m; until python3 -c {shlex.quote(SELF_DESTROY)}; do sleep 60; done)"
-        " >/dev/null 2>&1 &"
+        f'(while :; do if [ "$(date +%s)" -ge {expiry} ]; then'
+        f" python3 -c {shlex.quote(SELF_DESTROY)}; fi; sleep 30; done) >/dev/null 2>&1 &"
     )
-    script = "; ".join(
-        [
-            "set -eu",
-            "if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq"
-            " && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
-            " --no-install-recommends openssh-server; fi",
-            "mkdir -p /run/sshd /root/.ssh",
-            "chmod 700 /root/.ssh",
-            f"printf '%s\\n' {shlex.quote(pubkey)} > /root/.ssh/authorized_keys",
-            "chmod 600 /root/.ssh/authorized_keys",
-            "ssh-keygen -A >/dev/null",
-            f"{watchdog} exec /usr/sbin/sshd -D -e"
-            " -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no",
-        ]
+    script = (
+        watchdog
+        + " "
+        + "; ".join(
+            [
+                "set -eu",
+                "if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq"
+                " && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
+                " --no-install-recommends openssh-server; fi",
+                "mkdir -p /run/sshd /root/.ssh",
+                "chmod 700 /root/.ssh",
+                f"printf '%s\\n' {shlex.quote(pubkey)} > /root/.ssh/authorized_keys",
+                "chmod 600 /root/.ssh/authorized_keys",
+                "ssh-keygen -A >/dev/null",
+                "exec /usr/sbin/sshd -D -e"
+                " -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no",
+            ]
+        )
     )
     return "bash -c " + shlex.quote(script)
 
 
-def create_payload(spec, label: str, pubkey: str) -> dict:
+def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
     return {
         "image": spec.image,
         "disk": spec.disk_gb,
@@ -276,7 +314,7 @@ def create_payload(spec, label: str, pubkey: str) -> dict:
         "target_state": "running",
         "runtype": "args",
         "env": {"-p 22:22": "1"},
-        "args_str": bootstrap_command(pubkey, spec.ttl_min),
+        "args_str": bootstrap_command(pubkey, expiry),
     }
 
 

@@ -94,8 +94,8 @@ def test_an_explicit_refusal_in_a_200_is_refused(wire):
 
 
 def test_reads_are_retried_and_listing_follows_pages(wire):
-    last = {"instances": [{"id": 2}], "next_token": None}
-    w = wire(503, {"instances": [{"id": 1}], "next_token": "t"}, last)
+    last = {"instances": [{"id": 2, "label": None}], "next_token": None}
+    w = wire(503, {"instances": [{"id": 1, "label": None}], "next_token": "t"}, last)
     assert [i["id"] for i in v.Vast("k").instances()] == [1, 2]
     assert "after_token" in w.requests[2][1] and "/v1/instances/" in w.requests[2][1]
 
@@ -131,17 +131,51 @@ def test_status_messages_are_attributed(msg, kind):
 
 
 def test_bootstrap_command_is_one_valid_shell_line():
-    cmd = v.bootstrap_command("ssh-ed25519 AAAA'tricky gpubox", ttl_min=90)
+    cmd = v.bootstrap_command("ssh-ed25519 AAAA'tricky gpubox", 1795400000)
     assert "\n" not in cmd
     bash, flag, script = shlex.split(cmd)
     assert (bash, flag) == ("bash", "-c")
     assert subprocess.run(["bash", "-n", "-c", script]).returncode == 0
-    # The self-destruct timer starts before sshd replaces the shell, so it runs
-    # even if nobody ever connects.
-    timer, sshd = script.rsplit(" & ", 1)
-    assert "sleep 90m; until python3 -c" in timer and "CONTAINER_API_KEY" in timer
-    assert sshd.startswith("exec /usr/sbin/sshd -D")
+    # The self-destruct timer is the first thing started: before a missing
+    # sshd is installed, and before sshd replaces the shell.
+    timer, rest = script.split(" & ", 1)
+    assert timer.startswith("(while :; do") and "CONTAINER_API_KEY" in timer
+    assert '"$(date +%s)" -ge 1795400000' in timer  # an absolute time, not a duration
+    assert rest.startswith("set -eu; ") and "apt-get" in rest
+    assert rest.endswith("-o PasswordAuthentication=no") and "exec /usr/sbin/sshd -D" in rest
     compile(v.SELF_DESTROY, "self_destroy", "exec")
+
+
+def test_the_timer_waits_for_its_time_and_then_keeps_trying(tmp_path):
+    """Run the timer's loop for real, with a stand-in for the delete and a short sleep."""
+
+    def loop(expiry, tries):
+        _, _, script = shlex.split(v.bootstrap_command("KEY", expiry))
+        timer = script.split(" >/dev/null 2>&1 & ", 1)[0]
+        assert timer.count("sleep 30") == 1 and timer.count("python3 -c") == 1
+        quoted = shlex.quote(v.SELF_DESTROY)
+        assert quoted in timer
+        # The delete is replaced by a command that records the try and fails,
+        # as a delete the provider ignores would.
+        timer = timer.replace(f"python3 -c {quoted}", f"{{ echo try >> {tries}; false; }}")
+        return subprocess.Popen(["bash", "-c", timer.replace("sleep 30", "sleep 0.05")])
+
+    import time as real_time
+
+    early = loop(int(real_time.time()) + 3600, tmp_path / "early")
+    late = loop(int(real_time.time()) - 1, tmp_path / "late")
+    real_time.sleep(0.6)
+    assert early.poll() is None and late.poll() is None  # neither loop ever ends by itself
+    early.kill(), late.kill(), early.wait(), late.wait()
+    # Before its time, nothing was sent; after it, the delete was tried again and again.
+    assert not (tmp_path / "early").exists()
+    assert len((tmp_path / "late").read_text().split()) >= 3
+
+
+@pytest.mark.parametrize("expiry", [0, -5, 10**10, "1795400000", 1795400000.5, None])
+def test_a_timer_is_not_built_from_a_bad_expiry(expiry):
+    with pytest.raises(ValueError):
+        v.bootstrap_command("KEY", expiry)
 
 
 def test_the_pinned_recording_still_matches_the_reference_launcher_if_present():
@@ -158,6 +192,68 @@ def test_the_pinned_recording_still_matches_the_reference_launcher_if_present():
 
 
 # ----------------------------------------------------- answers we cannot trust
+
+
+def test_a_listing_row_without_a_label_field_fails_the_listing(wire):
+    # Null or empty means untagged. Absent means we were not told, and the
+    # reaper must not read that as "untagged".
+    wire({"instances": [{"id": 1, "label": None}, {"id": 2, "label": ""}], "next_token": None})
+    assert [r["id"] for r in v.Vast("k").instances()] == [1, 2]
+    for row in ({"id": 3}, {"id": 3, "label": 7}, {"id": 3, "label": ["x"]}):
+        wire({"instances": [{"id": 1, "label": "a"}, row], "next_token": None})
+        with pytest.raises(v.VastError, match="label"):
+            v.Vast("k").instances()
+
+
+def test_an_id_listed_twice_fails_the_listing(wire):
+    page = {"instances": [{"id": 1, "label": None}], "next_token": "t"}
+    wire(page, {"instances": [{"id": 1, "label": None}], "next_token": None})
+    with pytest.raises(v.VastError, match="twice"):
+        v.Vast("k").instances()
+
+
+def test_a_listing_must_have_as_many_rows_as_it_says(wire):
+    rows = [{"id": 1, "label": None}, {"id": 2, "label": None}]
+    wire({"instances": rows, "next_token": None, "total_instances": 2})
+    assert len(v.Vast("k").instances()) == 2
+    for total in (3, 1, "2", 2.0):
+        wire({"instances": rows, "next_token": None, "total_instances": total})
+        with pytest.raises(v.VastError, match="states"):
+            v.Vast("k").instances()
+
+
+def test_the_account_is_the_id_the_provider_states(wire):
+    w = wire({"id": 4711, "username": "ci"})
+    assert v.Vast("k").account() == "4711"
+    assert "/v0/users/current/" in w.requests[0][1]
+    for answer in ({}, {"id": "4711"}, {"id": 0}, {"id": True}, [], {"user": {"id": 1}}):
+        wire(answer)
+        with pytest.raises(v.VastError):
+            v.Vast("k").account()
+
+
+def test_a_caller_with_a_deadline_sets_the_timeout_and_does_its_own_retrying(monkeypatch):
+    seen = []
+
+    def urlopen(req, timeout=None):
+        seen.append(timeout)
+        raise urllib.error.HTTPError(req.full_url, 503, "err", {}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(v.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(v.time, "sleep", lambda s: None)
+    vast = v.Vast("k", timeout=20)
+    for call in (
+        lambda: vast.instance(5, timeout=3, retries=0),
+        lambda: vast.destroy(5, timeout=0.01, retries=0),
+        lambda: vast.instances(timeout=99, retries=0),
+    ):
+        with pytest.raises(v.VastError):
+            call()
+    assert seen == [3, 0.5, 20]  # one request each; never below a floor, never above the client's
+    seen.clear()
+    with pytest.raises(v.VastError):
+        vast.instance(5)
+    assert seen == [20, 20, 20]  # without a deadline: the client's timeout, and its retries
 
 
 @pytest.mark.parametrize(
@@ -199,7 +295,7 @@ def test_instance_returns_the_row_when_it_is_the_one_asked_for(wire):
 
 @pytest.mark.parametrize("second_page", [{}, {"instances": None}, {"success": False}, []])
 def test_a_listing_with_an_unreadable_page_is_an_error_not_a_short_list(wire, second_page):
-    wire({"instances": [{"id": 1}], "next_token": "t"}, second_page)
+    wire({"instances": [{"id": 1, "label": None}], "next_token": "t"}, second_page)
     with pytest.raises(v.VastError):
         v.Vast("k").instances()
 
@@ -218,12 +314,29 @@ def test_the_wire_requests_equal_the_reference_launchers(wire):
     w = wire({"offers": []}, {"success": True, "new_contract": 9})
     vast = v.Vast("k")
     vast.offers(v.offer_query(SPEC))
-    vast.create(123, v.create_payload(SPEC, "LABEL", "KEY"))
+    vast.create(123, v.create_payload(SPEC, "LABEL", "KEY", 1795400000))
     (m1, u1, b1), (m2, u2, b2) = w.requests
     assert (m1, u1) == ("POST", v.API_BASE + ref["search"]["path"])
     assert json.loads(b1) == ref["search"]["body"]
     assert (m2, u2) == ("PUT", v.API_BASE + ref["create"]["path"].format(offer_id=123))
-    assert json.loads(b2) == ref["create"]["body"]
+    assert same_but_for_the_timer(json.loads(b2), ref["create"]["body"])
+
+
+def same_but_for_the_timer(payload, reference):
+    """The create payload equals the reference launcher's in everything but the timer.
+
+    The reference starts its timer last (`(sleep 60m; until ...) &` just before
+    sshd) and counts a duration; ours starts first and waits for an absolute
+    time. Everything else in the bootstrap, and every other field, is equal.
+    """
+    ours, theirs = dict(payload), dict(reference)
+    _, _, script = shlex.split(ours.pop("args_str"))
+    _, _, old = shlex.split(theirs.pop("args_str"))
+    timer, rest = script.split(" >/dev/null 2>&1 & ", 1)
+    old_rest, old_tail = old.split("(sleep 60m; ", 1)
+    old_timer, old_sshd = old_tail.split(" >/dev/null 2>&1 & ", 1)
+    assert shlex.quote(v.SELF_DESTROY) in timer and shlex.quote(v.SELF_DESTROY) in old_timer
+    return ours == theirs and rest == old_rest + old_sshd
 
 
 def test_offer_query_scales_with_gpu_count():
@@ -263,7 +376,7 @@ def test_an_unreadable_error_body_does_not_change_what_the_status_means(monkeypa
         {"instances": [{"id": "7"}], "next_token": None},
         {"instances": [{"id": True}], "next_token": None},
         {"instances": [{"id": 0}], "next_token": None},
-        {"instances": [{"id": 1}, "text"], "next_token": None},
+        {"instances": [{"id": 1, "label": None}, "text"], "next_token": None},
     ],
 )
 def test_a_listing_with_an_unreadable_row_is_an_error_not_a_shorter_list(wire, page):
@@ -273,7 +386,7 @@ def test_a_listing_with_an_unreadable_row_is_an_error_not_a_shorter_list(wire, p
 
 
 def test_a_listing_that_does_not_advance_is_an_error_not_a_loop(wire):
-    wire(*[{"instances": [{"id": 1}], "next_token": "same"}] * 3)
+    wire(*[{"instances": [{"id": n, "label": None}], "next_token": "same"} for n in (1, 2, 3)])
     with pytest.raises(v.VastError, match="does not advance"):
         v.Vast("k").instances()
 
@@ -312,7 +425,7 @@ def test_the_two_real_shapes_of_absence_are_accepted(wire):
 @pytest.mark.parametrize("token", [[], 0, False, "", {}, 7])
 def test_only_null_ends_a_listing(wire, token):
     # Anything else in the cursor's place is not "the last page".
-    wire({"success": True, "instances": [{"id": 1}], "next_token": token})
+    wire({"success": True, "instances": [{"id": 1, "label": None}], "next_token": token})
     with pytest.raises(v.VastError):
         v.Vast("k").instances()
 
@@ -322,7 +435,9 @@ def test_a_listing_page_that_says_it_failed_is_an_error(wire):
         wire({"success": success, "instances": [], "next_token": None})
         with pytest.raises(v.VastError):
             v.Vast("k").instances()
-    wire({"instances": [{"id": 3}], "next_token": None})  # no discriminator at all is fine
+    wire(
+        {"instances": [{"id": 3, "label": None}], "next_token": None}
+    )  # no discriminator at all is fine
     assert [r["id"] for r in v.Vast("k").instances()] == [3]
 
 
@@ -345,6 +460,6 @@ def test_a_page_that_does_not_say_whether_more_follow_is_not_the_last_page(wire)
     # The provider ends a listing with `"next_token": null`. Without the field
     # we do not know that we have seen everything, and "nothing else carries
     # this label" is exactly what callers conclude from a listing.
-    wire({"success": True, "instances": [{"id": 1}]})
+    wire({"success": True, "instances": [{"id": 1, "label": None}]})
     with pytest.raises(v.VastError, match="next_token"):
         v.Vast("k").instances()

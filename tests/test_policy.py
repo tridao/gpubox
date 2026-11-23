@@ -46,16 +46,12 @@ def test_every_reason_code_has_a_policy():
     }  # fmt: skip
 
 
-def test_repeats_within_the_window_double_up_to_the_cap():
+def test_a_repeat_blocks_for_the_same_time_again_not_for_longer():
     rows = [failed(5, 0, "busy_gpu"), failed(5, 3 * H, "busy_gpu")]
-    assert pol.blocklist(rows, 3 * H + 1)[5]["until"] == 3 * H + 4 * H
+    assert pol.blocklist(rows, 3 * H + 1)[5]["until"] == 3 * H + 2 * H
     rows = [failed(5, i * H, "busy_gpu") for i in range(12)]
-    assert pol.blocklist(rows, 11 * H + 1)[5]["until"] == 11 * H + 2 * D  # capped
-
-
-def test_an_old_offence_does_not_count_as_a_repeat():
-    rows = [failed(5, 0, "unreachable"), failed(5, pol.STRIKE_WINDOW + 1, "unreachable")]
-    assert pol.blocklist(rows, pol.STRIKE_WINDOW + 2)[5]["until"] == pol.STRIKE_WINDOW + 1 + D
+    assert pol.blocklist(rows, 11 * H + 1)[5]["until"] == 11 * H + 2 * H
+    assert pol.blocklist(rows, 13 * H + 1) == {}
 
 
 def test_healthy_clears_a_soft_block_but_not_a_hard_one():
@@ -64,9 +60,9 @@ def test_healthy_clears_a_soft_block_but_not_a_hard_one():
     assert pol.blocklist(rows, 120)[6]["class"] == "hard"
 
 
-def test_healthy_does_not_erase_the_strike_history():
+def test_a_failure_after_a_healthy_row_blocks_again():
     rows = [failed(5, 0, "busy_gpu"), obs("healthy", 5, 60), failed(5, 120, "busy_gpu")]
-    assert pol.blocklist(rows, 121)[5]["until"] == 120 + 4 * H
+    assert pol.blocklist(rows, 121)[5]["until"] == 120 + 2 * H
 
 
 def test_hard_block_wins_over_a_concurrent_soft_one():
@@ -151,16 +147,16 @@ def test_everything_hard_blocked_leaves_nothing():
     assert pol.select_offers([offer(1), offer(2)], {1: hard, 2: hard}, want=2) == []
 
 
-def test_a_row_seen_twice_counts_once():
+def test_a_row_seen_twice_changes_nothing():
     row = failed(5, 0, "busy_gpu")
-    assert pol.blocklist([row, dict(row)], 1)[5]["until"] == 2 * H
+    assert pol.blocklist([row, dict(row)], 1) == pol.blocklist([row], 1)
 
 
-def test_strikes_are_counted_per_class_not_per_reason():
-    rows = [failed(5, 0, "busy_gpu"), failed(5, D, "unreachable")]
-    assert pol.blocklist(rows, D + 1)[5]["until"] == D + 2 * D  # second soft strike
-    rows = [failed(6, 0, "busy_gpu"), failed(6, D, "cuda_init")]
-    assert pol.blocklist(rows, D + 1)[6]["until"] == D + 14 * D  # first hard strike
+def test_the_longest_running_block_of_a_class_is_the_one_reported():
+    rows = [failed(5, 0, "unreachable"), failed(5, H, "busy_gpu")]
+    assert pol.blocklist(rows, H + 1)[5] == {"until": D, "class": "soft", "reason": "unreachable"}
+    rows = [failed(6, 0, "busy_gpu"), failed(6, H, "cuda_init")]
+    assert pol.blocklist(rows, H + 1)[6]["until"] == H + 14 * D
 
 
 @pytest.mark.parametrize(
