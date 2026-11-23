@@ -6,6 +6,7 @@ These run a real second process against a provider whose state is a file, so
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,10 @@ from test_cli import UP
 
 from gpubox import cli
 from gpubox import launch as L
-from gpubox.state import Snapshot
+from gpubox.state import State
 
 CHILD = str(Path(__file__).with_name("crash_child.py"))
-CUES = ["after:open", "after:create", "after:bind", "after:winner"]
+CUES = ["after:create", "after:id", "after:winner"]
 
 
 def crash(tmp_path, cue):
@@ -25,44 +26,33 @@ def crash(tmp_path, cue):
         [sys.executable, CHILD, str(tmp_path), cue], capture_output=True, text=True, timeout=60
     )
     assert r.returncode == 9, (r.returncode, r.stdout, r.stderr)
-    return FileVast(tmp_path / "provider.json", {1: "ok"}), Snapshot.load(tmp_path)
-
-
-def test_killed_after_the_attempt_is_on_disk_but_before_the_request(tmp_path):
-    vast, snap = crash(tmp_path, "after:open")
-    assert vast.on_disk() == [] and snap.ids() == {} and list(snap.open_attempts()) == [1]
-    # Nothing was rented, but nothing proves it: the attempt stays open.
-    assert L.down(vast, snap, FAST) == 1 and not Snapshot.load(tmp_path).closed
-    assert L.down(vast, Snapshot.load(tmp_path), FAST, abandon_unseen=True) == 0
-    assert Snapshot.load(tmp_path).closed
+    return FileVast(tmp_path / "provider.json", {1: "ok"}), State.load(tmp_path)
 
 
 def test_killed_after_the_provider_rented_but_before_we_knew_the_id(tmp_path):
-    vast, snap = crash(tmp_path, "after:create")
-    (iid,) = vast.on_disk()
-    assert snap.ids() == {} and list(snap.open_attempts()) == [1]
-    assert L.down(vast, snap, FAST) == 0  # found by its tag, which names the open attempt
-    disk = Snapshot.load(tmp_path)
-    assert vast.on_disk() == [] and disk.ids() == {iid: "gone"} and disk.closed
+    vast, state = crash(tmp_path, "after:create")
+    assert len(vast.on_disk()) == 1 and state.ids == []
+    assert L.down(vast, state, FAST) == []  # found by its tag
+    assert vast.on_disk() == [] and State.load(tmp_path).closed
 
 
 def test_killed_after_the_id_was_on_disk(tmp_path):
-    vast, snap = crash(tmp_path, "after:bind")
+    vast, state = crash(tmp_path, "after:id")
     (iid,) = vast.on_disk()
-    assert snap.live_ids() == [iid]
-    vast._with_file(lambda: vast.live[iid].update(label="renamed-by-the-box"))
-    assert L.down(vast, snap, FAST) == 0  # by id, whatever it is called now
-    assert vast.on_disk() == [] and Snapshot.load(tmp_path).closed
+    assert state.ids == [iid]
+    vast._with_file(lambda: vast.live[iid].update(label="renamed"))
+    assert L.down(vast, state, FAST) == []  # by id, whatever it is called now
+    assert vast.on_disk() == [] and State.load(tmp_path).closed
 
 
 def test_killed_right_after_the_hand_off(tmp_path):
-    vast, snap = crash(tmp_path, "after:winner")
+    vast, state = crash(tmp_path, "after:winner")
     (iid,) = vast.on_disk()
-    assert snap.winner["id"] == iid
-    assert L.down(vast, snap, FAST) == 0 and vast.on_disk() == []
+    assert state.winner["id"] == iid
+    assert L.down(vast, state, FAST) == [] and vast.on_disk() == []
 
 
-@pytest.mark.parametrize("cue", ["after:create", "after:bind", "after:winner"])
+@pytest.mark.parametrize("cue", CUES)
 def test_a_runner_whose_disk_is_gone_is_torn_down_with_the_run_id_alone(tmp_path, monkeypatch, cue):
     # The CI case: the job's teardown step runs somewhere that has nothing but
     # the run id. The tag is enough.
@@ -77,17 +67,16 @@ def test_a_runner_whose_disk_is_gone_is_torn_down_with_the_run_id_alone(tmp_path
     assert vast.on_disk() == []
 
 
-def test_a_box_that_changed_its_label_on_a_lost_runner_is_left_to_the_reaper(tmp_path):
-    # What neither the tag nor a lost snapshot can reach, stated as a test:
-    # only a reaper that owns the whole account destroys this box.
-    vast, _ = crash(tmp_path, "after:winner")
-    (iid,) = vast.on_disk()
-    vast._with_file(lambda: vast.live[iid].update(label="renamed-by-the-box"))
-    assert L.down(vast, Snapshot.ephemeral(RUN_ID), FAST) == 0  # sees nothing with the tag
-    assert vast.on_disk() == [iid]
-    vast._with_file(lambda: [vast.live.pop(i) for i in list(vast.live) if i >= 9000])
-    assert L.reap(vast, FAST, max_age_min=90, destroy=True) == 0
-    assert vast.on_disk() == []
+@pytest.mark.parametrize("cue", CUES)
+def test_a_box_nobody_tears_down_is_reaped_once_its_lease_has_ended(tmp_path, cue):
+    # No `down` at all: the runner died and nothing else ran. The lease is
+    # what bounds it.
+    vast, state = crash(tmp_path, cue)
+    assert len(vast.on_disk()) == 1
+    assert L.reap(vast, FAST, "quack-ci", destroy=True) == 0 and len(vast.on_disk()) == 1
+    after = state.expiry + FAST.expiry_margin + 1
+    assert L.reap(vast, FAST, "quack-ci", destroy=True, now=after) == 0
+    assert vast.on_disk() == [] and time.time() < state.expiry
 
 
 def test_a_command_is_refused_while_another_process_holds_the_directory(tmp_path, monkeypatch):

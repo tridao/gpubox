@@ -2,10 +2,9 @@
 
     python crash_child.py STATE_DIR CUE
 
-CUE is `after:open` (the attempt is on disk; the create request is not sent),
-`after:create` (the provider rented the box; die before the answer is used),
-`after:bind` (the id is on disk), `after:winner` (the hand-off is on disk),
-or `hold-lock` (take the state lock and wait).
+CUE is `after:create` (the provider rented the box; die before the answer is
+used), `after:id` (the id is in the state file), `after:winner` (the hand-off
+is on disk), or `hold-lock` (take the state lock and wait).
 """
 
 import os
@@ -19,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from fakes import EXPIRY, FAST, RUN_ID, SPEC, FakeProber, FileVast  # noqa: E402
 
 from gpubox.launch import Launch, Policy  # noqa: E402
-from gpubox.state import Snapshot, state_lock  # noqa: E402
+from gpubox.state import State, state_lock  # noqa: E402
 
 state_dir, cue = Path(sys.argv[1]), sys.argv[2]
 vast = FileVast(state_dir / "provider.json", {1: "ok"})
@@ -29,7 +28,7 @@ with state_lock(state_dir):
         print("locked", flush=True)
         time.sleep(60)
     meta = {"image": SPEC.image, "gpu": SPEC.gpu, "num_gpus": SPEC.num_gpus}
-    snap = Snapshot.begin(state_dir, RUN_ID, EXPIRY, None, meta)
+    state = State.begin(state_dir, RUN_ID, EXPIRY, None, meta)
 
     def dying(name, method):
         def wrapped(*a, **kw):
@@ -39,11 +38,10 @@ with state_lock(state_dir):
 
         return wrapped
 
-    snap.open_attempt = dying("open", snap.open_attempt)
-    snap.bind = dying("bind", snap.bind)
-    snap.publish = dying("winner", snap.publish)
+    state.add_id = dying("id", state.add_id)
+    state.publish = dying("winner", state.publish)
     if cue == "after:create":
         vast.hooks["created"] = lambda iid: (vast._save(), os._exit(9))
     policy = Policy(**{**FAST.__dict__, "spare": 0})
-    result = Launch(vast, SPEC, policy, snap, FakeProber(vast)).run({})
+    result = Launch(vast, SPEC, policy, state, FakeProber(vast)).run({})
     print("winner", result.winner.instance_id, flush=True)

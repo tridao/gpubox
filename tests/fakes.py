@@ -11,7 +11,7 @@ import time
 
 from gpubox import vast as v
 from gpubox.launch import Launch, Policy, Spec
-from gpubox.state import Snapshot, make_tag
+from gpubox.state import State, make_tag
 
 RUN_ID = "quack-ci.test.0123456789ab"
 OTHER_RUN = "quack-ci.other.89abcdef0123"  # same namespace, another run
@@ -27,15 +27,13 @@ FAST = Policy(
     startup_timeout=0.3,
     overall_timeout=5,
     cleanup_reserve=0,
-    image_grace=0.5,
-    blind_timeout=0.3,
     settle=0.15,
     min_lease=1,
     rollback=0.3,
-    confirm_timeout=0.15,
+    confirm_timeout=0.3,
     confirm_poll=0.01,
+    recheck=0.01,
     call_timeout=1,
-    reap_recheck=0,
 )
 SPEC = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25)
 REPORT = {"gpus": ["RTX 5090"], "cpus": 32, "driver": "1", "torch": "2"}
@@ -191,6 +189,12 @@ class FakeVast:
             rows.append({**row, "machine_id": box["machine"], "actual_status": "running"})
         return rows
 
+    def relabel(self, iid, label):
+        self._enter("relabel", iid)
+        if iid not in self.live:
+            raise v.VastError(404, "no such instance")
+        self.live[iid]["label"] = label
+
     def destroy(self, iid, **kw):
         self._enter("destroy", iid, kw)
         box = self.live.get(iid)
@@ -271,6 +275,11 @@ class FakeProber:
         self.vast = vast
         self.wants = []  # the spec each gate was asked to check
         self.checks = []  # every child process started
+        self.ran, self.run_rc = [], 0  # commands run on a box, and what they return
+
+    def run(self, ep, remote, timeout=60):
+        self.ran.append((ep, remote))
+        return self.run_rc
 
     def kill_all(self):
         self.vast._enter("kill_all")
@@ -290,6 +299,7 @@ class FakeProber:
         started = time.monotonic()
 
         def result():
+            vast._enter("gate_poll", machine)  # a hook point while boxes sit in their gates
             if kind == "late" or (kind == "hold" and not vast.release):
                 return None
             if kind == "slow" and time.monotonic() - started < vast.slow_secs:
@@ -308,19 +318,14 @@ class FakeProber:
 
 
 def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, expiry=EXPIRY, **policy_kw):
-    """A Launch ready to run, plus its fake provider and snapshot."""
+    """A Launch ready to run, plus its fake provider and state."""
     if policy_kw:
         policy = Policy(**{**policy.__dict__, **policy_kw})
     vast = vast or FakeVast(behaviour)
     meta = {"image": spec.image, "gpu": spec.gpu, "num_gpus": spec.num_gpus}
-    snap = Snapshot.begin(tmp_path, RUN_ID, expiry, None, meta)
-    return Launch(vast, spec, policy, snap, FakeProber(vast)), vast, snap
+    state = State.begin(tmp_path, RUN_ID, expiry, None, meta)
+    return Launch(vast, spec, policy, state, FakeProber(vast)), vast, state
 
 
 def foreign_untouched(vast):
     return all(9000 + i in vast.live for i in range(len(FOREIGN)))
-
-
-def states(snap):
-    """attempt number -> its state in the snapshot as it is on disk."""
-    return {n: a["state"] for n, a in Snapshot.load(snap.path.parent).attempts().items()}

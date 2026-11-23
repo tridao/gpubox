@@ -3,9 +3,12 @@
 import http.client
 import io
 import json
+import os
 import shlex
+import signal
 import subprocess
 import sys
+import time
 import urllib.error
 from pathlib import Path
 
@@ -139,37 +142,94 @@ def test_bootstrap_command_is_one_valid_shell_line():
     # The self-destruct timer is the first thing started: before a missing
     # sshd is installed, and before sshd replaces the shell.
     timer, rest = script.split(" & ", 1)
-    assert timer.startswith("(while :; do") and "CONTAINER_API_KEY" in timer
-    assert '"$(date +%s)" -ge 1795400000' in timer  # an absolute time, not a duration
+    assert timer.startswith("[ -f /etc/gpubox-expiry ] || echo 1795400000 > /etc/gpubox-expiry; (")
+    assert "CONTAINER_API_KEY" in timer
     assert rest.startswith("set -eu; ") and "apt-get" in rest
     assert rest.endswith("-o PasswordAuthentication=no") and "exec /usr/sbin/sshd -D" in rest
     compile(v.SELF_DESTROY, "self_destroy", "exec")
 
 
-def test_the_timer_waits_for_its_time_and_then_keeps_trying(tmp_path):
-    """Run the timer's loop for real, with a stand-in for the delete and a short sleep."""
+class Timer:
+    """The bootstrap's timer, for real, with a stand-in for the delete and a short sleep.
 
-    def loop(expiry, tries):
-        _, _, script = shlex.split(v.bootstrap_command("KEY", expiry))
+    `in_file` is what the expiry file holds when the timer starts (None: no file yet).
+    """
+
+    def __init__(self, tmp_path, name, baked, in_file):
+        _, _, script = shlex.split(v.bootstrap_command("KEY", baked))
         timer = script.split(" >/dev/null 2>&1 & ", 1)[0]
         assert timer.count("sleep 30") == 1 and timer.count("python3 -c") == 1
         quoted = shlex.quote(v.SELF_DESTROY)
         assert quoted in timer
+        self.tries, self.file = tmp_path / f"{name}.tries", tmp_path / f"{name}.expiry"
+        if in_file is not None:
+            self.file.write_text(in_file)
         # The delete is replaced by a command that records the try and fails,
         # as a delete the provider ignores would.
-        timer = timer.replace(f"python3 -c {quoted}", f"{{ echo try >> {tries}; false; }}")
-        return subprocess.Popen(["bash", "-c", timer.replace("sleep 30", "sleep 0.05")])
+        timer = timer.replace(f"python3 -c {quoted}", f"{{ echo try >> {self.tries}; false; }}")
+        timer = timer.replace(v.EXPIRY_FILE, str(self.file)).replace("sleep 30", "sleep 0.05")
+        self.proc = subprocess.Popen(["bash", "-c", timer], start_new_session=True)
 
-    import time as real_time
+    def fired(self) -> int:
+        return len(self.tries.read_text().split()) if self.tries.exists() else 0
 
-    early = loop(int(real_time.time()) + 3600, tmp_path / "early")
-    late = loop(int(real_time.time()) - 1, tmp_path / "late")
-    real_time.sleep(0.6)
-    assert early.poll() is None and late.poll() is None  # neither loop ever ends by itself
-    early.kill(), late.kill(), early.wait(), late.wait()
-    # Before its time, nothing was sent; after it, the delete was tried again and again.
-    assert not (tmp_path / "early").exists()
-    assert len((tmp_path / "late").read_text().split()) >= 3
+    def stop(self) -> bool:
+        """Kill it and everything it started. True if it was still running."""
+        running = self.proc.poll() is None
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.proc.wait()
+        return running
+
+
+def test_the_timer_waits_for_its_time_and_then_keeps_trying(tmp_path):
+    now = int(time.time())
+    cases = {
+        "early": (now + 3600, None, False),  # before its time: nothing is sent
+        "late": (now - 1, None, True),  # after it: the delete, again and again
+        "renewed": (now - 1, f"{now + 3600}\n", False),  # the file says later: it waits
+        "restarted": (now + 3600, f"{now - 1}\n", True),  # a file already there is kept
+        "garbage": (now - 1, "soon\n", True),  # not a number: the first expiry applies
+        "empty": (now - 1, "", True),
+    }
+    timers = {k: Timer(tmp_path, k, baked, held) for k, (baked, held, _) in cases.items()}
+    try:
+        time.sleep(0.8)
+        fired = {k: t.fired() for k, t in timers.items()}
+    finally:
+        running = {k: t.stop() for k, t in timers.items()}
+    assert all(running.values()), running  # the loop never ends by itself
+    for name, (_, _, should_fire) in cases.items():
+        assert (fired[name] >= 3) if should_fire else (fired[name] == 0), (name, fired)
+    assert timers["early"].file.read_text().strip() == str(now + 3600)  # made with the first expiry
+
+
+def test_renewing_while_the_timer_runs_moves_its_time(tmp_path):
+    now = int(time.time())
+    timer = Timer(tmp_path, "live", now + 3600, None)
+    try:
+        time.sleep(0.3)
+        assert timer.fired() == 0
+        cmd = v.set_expiry_command(now - 1).replace(v.EXPIRY_FILE, str(timer.file))
+        assert subprocess.run(["bash", "-c", cmd]).returncode == 0
+        time.sleep(0.5)
+        assert timer.fired() >= 1  # the lease was moved into the past: it fires
+    finally:
+        timer.stop()
+
+
+def test_relabel_sends_the_label_and_needs_an_explicit_yes(wire):
+    w = wire({"success": True})
+    v.Vast("k").relabel(5, "new-label")
+    method, url, body = w.requests[0]
+    assert (method, url) == ("PUT", "https://console.vast.ai/api/v0/instances/5/")
+    assert json.loads(body) == {"label": "new-label"}
+    for answer in ({}, {"success": False}, [], {"success": "true"}):
+        wire(answer)
+        with pytest.raises(v.VastError):
+            v.Vast("k").relabel(5, "x")
 
 
 @pytest.mark.parametrize("expiry", [0, -5, 10**10, "1795400000", 1795400000.5, None])

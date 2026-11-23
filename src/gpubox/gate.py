@@ -181,6 +181,16 @@ class Prober:
             argv += ["-o", f"{k}={v}"]
         return [*argv, f"root@{ep[0]}", remote]
 
+    def run(self, ep: tuple[str, int], remote: str, timeout: float = 60) -> int:
+        """Run a short command on the box and wait for it. Returns ssh's exit code, 255 if
+        it could not connect or did not finish in time."""
+        try:
+            return subprocess.run(
+                self.ssh(ep, remote), stdin=subprocess.DEVNULL, timeout=timeout
+            ).returncode
+        except subprocess.TimeoutExpired:
+            return 255
+
     def _start(self, argv: list[str], read, **kw) -> Check:
         """Start a child and remember it, as one step that a signal cannot split: a child
         that is running but that nobody knows about could not be stopped."""

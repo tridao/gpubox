@@ -231,6 +231,12 @@ class Vast:
             query["after_token"] = token
         raise VastError(200, f"instance listing has more than {MAX_PAGES} pages")
 
+    def relabel(self, instance_id: int, label: str) -> None:
+        """Set an instance's label. Raises unless the provider says it did."""
+        data = self._call("PUT", f"/v0/instances/{instance_id}/", body={"label": label})
+        if not isinstance(data, dict) or data.get("success") is not True:
+            raise VastError(200, f"relabel of instance {instance_id} refused: {str(data)[:200]}")
+
     def destroy(self, instance_id: int, **call) -> None:
         """Ask for destruction. An instance that is already gone is not an error."""
         try:
@@ -277,6 +283,20 @@ SELF_DESTROY = (
 )
 
 
+EXPIRY_FILE = "/etc/gpubox-expiry"
+
+
+def check_expiry(expiry) -> None:
+    if type(expiry) is not int or not 0 < expiry < 10**10:
+        raise ValueError(f"bad expiry {expiry!r}")
+
+
+def set_expiry_command(expiry: int) -> str:
+    """Shell for the box: move the time at which its timer destroys it (see `renew`)."""
+    check_expiry(expiry)
+    return f"echo {expiry} > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE}"
+
+
 def bootstrap_command(pubkey: str, expiry: int) -> str:
     """Container command: a self-destruct timer, then sshd for our key.
 
@@ -287,15 +307,20 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
     saw carries it. One line, because Vast passes this as `docker run` arguments.
 
     It is started first, so a box stuck installing sshd is covered. It waits
-    for an absolute time (the expiry in the box's tag), so a container that
-    restarts does not start counting again. Once that time has passed it
-    sends the delete every 30 s for as long as it runs, whatever the answers
-    say: if the delete works, the loop ends with the box.
+    for an absolute time, so a container that restarts does not start counting
+    again. That time is read from a file on the box, which `renew` rewrites;
+    the file is created with the expiry of the create request unless it is
+    already there (a restart must not undo a renewal), and anything in it
+    that is not a number falls back to that first expiry. Once the time has
+    passed, the delete is sent every 30 s for as long as the timer runs,
+    whatever the answers say: if it works, the loop ends with the box.
     """
-    if type(expiry) is not int or not 0 < expiry < 10**10:
-        raise ValueError(f"bad expiry {expiry!r}")
+    check_expiry(expiry)
     watchdog = (
-        f'(while :; do if [ "$(date +%s)" -ge {expiry} ]; then'
+        f"[ -f {EXPIRY_FILE} ] || echo {expiry} > {EXPIRY_FILE}; "
+        f"(while :; do e=$(cat {EXPIRY_FILE} 2>/dev/null); "
+        f'case "$e" in ""|*[!0-9]*) e={expiry};; esac; '
+        f'if [ "$(date +%s)" -ge "$e" ]; then'
         f" python3 -c {shlex.quote(SELF_DESTROY)}; fi; sleep 30; done) >/dev/null 2>&1 &"
     )
     script = (

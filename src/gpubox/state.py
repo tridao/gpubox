@@ -1,20 +1,18 @@
-"""What a run asked for and which boxes it knows: the tag, a snapshot, a lock.
+"""What a run is called and what it left on disk: the tag, a small state file, a lock.
 
-The tag on a box says whose it is (DESIGN.md, section 4). It is set by the
-create request, so a box found by its tag can be destroyed by a process that
-knows nothing else.
+The tag on a box says whose it is and when its lease ends (DESIGN.md). It is
+set by the create request, so any process that knows the run id can find the
+run's boxes in the provider's listing and destroy them.
 
-The snapshot (`run.json`) is one JSON document, replaced whole at each change.
-It is not a log and is never replayed: it is read whole or not at all. It holds
-the run's attempts (so that a create with no answer is not forgotten) and every
-instance id the run knows (so that a box that changed its label is still
-destroyed by id). Rules S1 to S4 of the design are about this file.
+The state file (`run.json`) is a convenience for this directory: the run id,
+the instance ids that creates returned, and where the winner is. Losing it
+loses the use of the box (its address and key), never the ability to destroy
+it: `down --run-id` works from the tag alone.
 """
 
 from __future__ import annotations
 
 import copy
-import errno
 import fcntl
 import json
 import os
@@ -29,16 +27,15 @@ NAMESPACE = re.compile(r"[a-z0-9][a-z0-9-]*")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]*\.[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{12}")
 _TAG = re.compile(
-    r"(?P<run>(?P<ns>[a-z0-9][a-z0-9-]*)\.[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{12})"
+    r"(?P<run>(?P<ns>[a-z0-9][a-z0-9-]*)\.(?P<name>[A-Za-z0-9][A-Za-z0-9_-]*)\.[0-9a-f]{12})"
     r"\.a(?P<n>[1-9][0-9]{0,5})\.(?P<expiry>[0-9]{10})"
 )
 
-SNAPSHOT = "run.json"
-ATTEMPT_STATES = ("open", "refused", "bound", "unseen")
+STATE = "run.json"
 
 
 class StateError(RuntimeError):
-    """The state directory cannot be used as asked (locked, live run, no run, damaged)."""
+    """The state directory cannot be used as asked (locked, live run, no run, unreadable)."""
 
 
 def positive_int(value) -> bool:
@@ -51,6 +48,11 @@ def new_run_id(namespace: str, name: str) -> str:
     if not NAME.fullmatch(name):
         raise StateError(f"name must match {NAME.pattern}: {name!r}")
     return f"{namespace}.{name}.{secrets.token_hex(6)}"
+
+
+def name_of(run_id: str) -> str:
+    """The caller's name inside a run id."""
+    return run_id.split(".")[1]
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,7 @@ def parse_tag(label) -> Tag | None:
 
 @contextmanager
 def state_lock(state_dir: Path):
-    """One `up` or `down` per state directory. Released by the kernel if we die."""
+    """One `up`, `down` or `renew` per state directory. Released by the kernel if we die."""
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(state_dir / "lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -97,288 +99,125 @@ def state_lock(state_dir: Path):
         os.close(fd)
 
 
-def _check(data) -> None:
-    """Raise ValueError unless `data` is a snapshot we wrote."""
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("not a version 1 snapshot")
-    if not isinstance(data.get("run"), str) or not RUN_ID.fullmatch(data["run"]):
-        raise ValueError("bad run id")
-    if type(data.get("expiry")) is not int or not 0 < data["expiry"] < 10**10:
-        raise ValueError("bad expiry")
-    if "account" not in data or not (data["account"] is None or isinstance(data["account"], str)):
-        raise ValueError("bad account")
-    if not isinstance(data.get("meta"), dict):
-        raise ValueError("bad meta")
-    for flag in ("closing", "closed"):
-        if type(data.get(flag)) is not bool:
-            raise ValueError(f"bad {flag}")
-    ids = data.get("ids")
-    if not isinstance(ids, dict):
-        raise ValueError("bad ids")
-    for key, status in ids.items():
-        if not key.isascii() or not key.isdigit() or int(key) <= 0 or str(int(key)) != key:
-            raise ValueError(f"bad instance id {key!r}")
-        if status not in ("live", "gone"):
-            raise ValueError(f"bad status for instance {key}")
-    attempts = data.get("attempts")
-    if not isinstance(attempts, dict):
-        raise ValueError("bad attempts")
-    for key, a in attempts.items():
-        if not key.isascii() or not key.isdigit() or int(key) <= 0 or str(int(key)) != key:
-            raise ValueError(f"bad attempt number {key!r}")
-        if not isinstance(a, dict) or a.get("state") not in ATTEMPT_STATES:
-            raise ValueError(f"bad attempt {key}")
-        if type(a.get("sent")) not in (int, float):
-            raise ValueError(f"attempt {key} has no time")
-        if a["state"] == "bound":
-            if not positive_int(a.get("id")) or str(a["id"]) not in ids:
-                raise ValueError(f"attempt {key} is bound to an id the snapshot does not know")
-    w = data.get("winner")
-    if w is not None:
-        ok = (
-            isinstance(w, dict)
-            and positive_int(w.get("id"))
-            and str(w["id"]) in ids
-            and positive_int(w.get("attempt"))
-            and isinstance(w.get("host"), str)
-            and positive_int(w.get("port"))
+def _usable(data) -> bool:
+    """Enough of a state file to act on. Not a consistency check: just the shapes we index."""
+    w = data.get("winner") if isinstance(data, dict) else None
+    return (
+        isinstance(data, dict)
+        and data.get("version") == 2
+        and isinstance(data.get("run"), str)
+        and RUN_ID.fullmatch(data["run"]) is not None
+        and type(data.get("expiry")) is int
+        and isinstance(data.get("ids"), list)
+        and all(positive_int(i) for i in data["ids"])
+        and isinstance(data.get("meta"), dict)
+        and (data.get("account") is None or isinstance(data["account"], str))
+        and (
+            w is None
+            or (
+                isinstance(w, dict)
+                and positive_int(w.get("id"))
+                and positive_int(w.get("attempt"))
+                and isinstance(w.get("host"), str)
+                and positive_int(w.get("port"))
+            )
         )
-        if not ok:
-            raise ValueError("bad winner")
-        a = attempts.get(str(w["attempt"]))
-        if a is None or a["state"] != "bound" or a.get("id") != w["id"]:
-            raise ValueError("the winner is not the box of its attempt")
-    if data["closed"] and (not data["closing"] or _may_have_a_box(data)):
-        raise ValueError("closed, but a box may exist")
-
-
-def _may_have_a_box(data: dict) -> bool:
-    return any(s == "live" for s in data["ids"].values()) or any(
-        a["state"] == "open" for a in data["attempts"].values()
     )
 
 
-class Snapshot:
-    """The run's snapshot. Every change is on disk before the method returns, or it raises
-    OSError and nothing has changed, in memory or on disk."""
+class State:
+    """The run's state file. Each change is written (temp file, fsync, rename) before the
+    method returns; if the write raises OSError, memory is unchanged too."""
 
     def __init__(self, path: Path | None, data: dict):
         self.path, self.data = path, data
 
-    # ------------------------------------------------------------ reading
-
     @classmethod
-    def load(cls, state_dir) -> Snapshot | None:
-        """The directory's snapshot, None if there is none, StateError if it cannot be used."""
-        path = Path(state_dir) / SNAPSHOT
+    def load(cls, state_dir) -> State | None:
+        """The directory's state, None if there is none, StateError if it cannot be used."""
+        path = Path(state_dir) / STATE
         try:
-            text = path.read_text()
+            data = json.loads(path.read_text())
         except FileNotFoundError:
             return None
-        except (OSError, UnicodeDecodeError) as exc:
-            raise StateError(f"{path} cannot be read: {exc}") from None
-        try:
-            data = json.loads(text)
-            _check(data)
-        except (ValueError, TypeError, AttributeError, RecursionError) as exc:
-            raise StateError(f"{path} is damaged ({exc})") from None
+        except (OSError, ValueError) as exc:
+            raise StateError(f"{path} cannot be read ({exc})") from None
+        if not _usable(data):
+            raise StateError(f"{path} is not a gpubox state file of this version")
         return cls(path, data)
 
     @classmethod
     def begin(cls, state_dir, run_id: str, expiry: int, account: str | None, meta: dict):
-        data = {
-            "version": 1,
-            "account": account,
-            "run": run_id,
-            "expiry": int(expiry),
-            "meta": dict(meta),
-            "attempts": {},
-            "ids": {},
-            "winner": None,
-            "closing": False,
-            "closed": False,
-        }
-        _check(data)
-        snap = cls(Path(state_dir) / SNAPSHOT, {})
-        snap._write(data)
-        snap.data = data
-        snap._sync_dir()
-        return snap
+        state = cls(Path(state_dir) / STATE, {})
+        state._replace({
+            "version": 2, "run": run_id, "expiry": int(expiry), "account": account,
+            "meta": dict(meta), "ids": [], "winner": None, "ssh_alias": None,
+            "closing": False, "closed": False,
+        })  # fmt: skip
+        return state
 
     @classmethod
     def ephemeral(cls, run_id: str):
-        """A snapshot that is never written: for tearing down a run by its tag alone."""
+        """A state that is never written: for tearing down a run by its tag alone."""
         if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
             raise StateError(f"not a run id: {run_id!r}")
         return cls(None, {
-            "version": 1, "account": None, "run": run_id, "expiry": 1, "meta": {},
-            "attempts": {}, "ids": {}, "winner": None, "closing": True, "closed": False,
+            "version": 2, "run": run_id, "expiry": 0, "account": None, "meta": {}, "ids": [],
+            "winner": None, "ssh_alias": None, "closing": True, "closed": False,
         })  # fmt: skip
 
     run = property(lambda self: self.data["run"])
     expiry = property(lambda self: self.data["expiry"])
-    account = property(lambda self: self.data["account"])
+    account = property(lambda self: self.data.get("account"))
     meta = property(lambda self: self.data["meta"])
-    closing = property(lambda self: self.data["closing"])
-    closed = property(lambda self: self.data["closed"])
+    ids = property(lambda self: list(self.data["ids"]))
+    ssh_alias = property(lambda self: self.data.get("ssh_alias"))
+    closing = property(lambda self: bool(self.data.get("closing")))
+    closed = property(lambda self: bool(self.data.get("closed")))
 
     @property
     def winner(self) -> dict | None:
         return copy.deepcopy(self.data["winner"])
 
-    def attempts(self) -> dict[int, dict]:
-        return {int(n): dict(a) for n, a in self.data["attempts"].items()}
-
-    def open_attempts(self) -> dict[int, dict]:
-        return {n: a for n, a in self.attempts().items() if a["state"] == "open"}
-
-    def status(self, instance_id: int) -> str | None:
-        return self.data["ids"].get(str(instance_id))
-
-    def ids(self) -> dict[int, str]:
-        return {int(i): status for i, status in self.data["ids"].items()}
-
-    def live_ids(self) -> list[int]:
-        return sorted(i for i, status in self.ids().items() if status == "live")
-
-    def attempt_of(self, instance_id: int) -> tuple[int, dict] | None:
-        for n, a in self.attempts().items():
-            if a.get("id") == instance_id:
-                return n, a
-        return None
-
-    def slots(self) -> int:
-        """Attempts that hold a slot: a box may exist for them (rule L2)."""
-        ids = self.data["ids"]
-        return sum(
-            a["state"] == "open" or (a["state"] == "bound" and ids.get(str(a["id"])) != "gone")
-            for a in self.data["attempts"].values()
-        )
-
-    def is_live(self) -> bool:
-        return _may_have_a_box(self.data)
-
-    # ------------------------------------------------------------ changing
-
-    def _write(self, data: dict) -> None:
-        if self.path is None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=SNAPSHOT + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(json.dumps(data, sort_keys=True, indent=1) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
+    def _replace(self, data: dict) -> None:
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=STATE + ".", suffix=".tmp")
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
-    def _sync_dir(self) -> None:
-        """Make the rename itself durable. A filesystem that cannot sync a directory is
-        tolerated; a real I/O error is not."""
-        if self.path is None:
-            return
-        try:
-            dfd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError as exc:
-            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                with os.fdopen(fd, "w") as f:
+                    f.write(json.dumps(data, sort_keys=True, indent=1) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
                 raise
+        self.data = data
 
-    def _change(self, fn) -> None:
-        """Apply a change. If the file could not be replaced, raises OSError with nothing
-        changed, in memory or on disk. Once it is replaced, memory follows the file; an
-        error after that (the directory could not be synced) is still raised, and means
-        the change is in the file but may not survive a power cut."""
-        new = copy.deepcopy(self.data)
-        fn(new)
-        # A run that may have a box is not closed, whatever it was before.
-        new["closed"] = new["closed"] and not _may_have_a_box(new)
-        _check(new)
-        self._write(new)
-        self.data = new
-        self._sync_dir()
+    def _set(self, **fields) -> None:
+        self._replace({**copy.deepcopy(self.data), **fields})
 
-    def open_attempt(self, n: int, *, sent: float, **fields) -> None:
-        """Rule S1: called, and on disk, before the create request is sent."""
+    def add_id(self, instance_id: int) -> None:
+        """An id a create returned, kept so that `down` destroys it without needing its tag."""
+        if instance_id not in self.data["ids"]:
+            self._set(ids=[*self.data["ids"], instance_id])
 
-        def fn(d):
-            if str(n) in d["attempts"]:
-                raise StateError(f"attempt {n} already exists")
-            d["attempts"][str(n)] = {**fields, "sent": sent, "state": "open", "id": None}
+    def publish(self, winner: dict) -> None:
+        """The hand-off: once this is on disk the winner is kept."""
+        self._set(winner=dict(winner))
 
-        self._change(fn)
+    def set_expiry(self, expiry: int) -> None:
+        self._set(expiry=int(expiry))
 
-    def refuse(self, n: int) -> None:
-        self._set_attempt(n, "refused")
-
-    def unseen(self, n: int) -> None:
-        """An open attempt whose box nobody saw: left to the timer and the reaper."""
-        self._set_attempt(n, "unseen")
-
-    def _set_attempt(self, n: int, state: str) -> None:
-        def fn(d):
-            a = d["attempts"][str(n)]
-            if a["state"] != "open":
-                raise StateError(f"attempt {n} is {a['state']}, not open")
-            a["state"] = state
-
-        self._change(fn)
-
-    def bind(self, n: int, instance_id: int) -> None:
-        """Rule S2: the id is on disk before the box is used."""
-
-        def fn(d):
-            a = d["attempts"][str(n)]
-            if a["state"] != "open":
-                raise StateError(f"attempt {n} is {a['state']}, not open")
-            a["state"], a["id"] = "bound", instance_id
-            d["ids"].setdefault(str(instance_id), "live")
-
-        self._change(fn)
-
-    def know(self, instance_id: int) -> None:
-        """Rule S2: an id is recorded before any delete is sent for it."""
-        if self.status(instance_id) is None:
-            self._change(lambda d: d["ids"].setdefault(str(instance_id), "live"))
-
-    def gone(self, instance_id: int) -> None:
-        """Rule S3: only ever called after a lookup of this id said it does not exist."""
-        if self.status(instance_id) != "gone":
-            self._change(lambda d: d["ids"].__setitem__(str(instance_id), "gone"))
-
-    def revive(self, instance_id: int) -> None:
-        """A lookup found an instance we had recorded as gone: the earlier answer was wrong,
-        and the box is ours to destroy again."""
-        if self.status(instance_id) != "live":
-            self._change(lambda d: d["ids"].__setitem__(str(instance_id), "live"))
-
-    def publish(self, instance_id: int, attempt: int, host: str, port: int) -> None:
-        """The hand-off (rule L4): once this is on disk the winner is kept."""
-
-        def fn(d):
-            d["winner"] = {"id": instance_id, "attempt": attempt, "host": host, "port": port}
-
-        self._change(fn)
+    def set_ssh_alias(self, alias: str | None) -> None:
+        self._set(ssh_alias=alias)
 
     def set_closing(self) -> None:
         if not self.closing:
-            self._change(lambda d: d.__setitem__("closing", True))
+            self._set(closing=True)
 
     def close(self) -> None:
-        """Only for a run of which nothing can exist any more (rule T1)."""
-        if _may_have_a_box(self.data):
-            raise StateError(f"run {self.run} cannot be closed: a box may exist")
-
-        def fn(d):
-            d["closing"] = d["closed"] = True
-
-        self._change(fn)
+        self._set(closing=True, closed=True)

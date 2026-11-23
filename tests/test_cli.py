@@ -6,12 +6,12 @@ import time
 from pathlib import Path
 
 import pytest
-from fakes import EXPIRY, FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
+from fakes import FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
 
 from gpubox import cli
 from gpubox import policy as pol
 from gpubox import vast as v
-from gpubox.state import Snapshot, make_tag, parse_tag, state_lock
+from gpubox.state import State, make_tag, parse_tag, state_lock
 
 REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
 UP = [
@@ -103,7 +103,7 @@ def test_up_run_down(world, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
     assert run(UP) == 0
     assert len(vast.ours()) == 1 and "READY" in capsys.readouterr().out
-    run_id = Snapshot.load(tmp_path).run
+    run_id = State.load(tmp_path).run
     assert f"run_id={run_id}" in out.read_text()
     assert "observations_changed=true" in out.read_text()
     assert "| healthy |" in (tmp_path / "summary.md").read_text()
@@ -144,7 +144,7 @@ def test_the_quack_ci_flags_send_what_the_reference_launcher_sent(world):
     for payload in vast.payloads:
         tag = parse_tag(payload["label"])
         assert 59 * 60 < tag.expiry - time.time() <= 60 * 60  # --ttl-min 60
-        assert f"-ge {tag.expiry} ]" in payload["args_str"]  # the timer waits for the tag's expiry
+        assert f"echo {tag.expiry} > /etc/gpubox-expiry" in payload["args_str"]  # the timer's time
         assert same_but_for_the_timer({**payload, "label": "LABEL"}, REFERENCE["create"]["body"])
     want = REFERENCE["gate"]["want"]
     for spec in vast.probers[0].wants:
@@ -181,11 +181,11 @@ def test_up_refuses_a_state_directory_whose_run_still_has_boxes(world, capsys):
     assert len(set(vast.key_dirs)) == 2  # and the next run has a key of its own
 
 
-def test_up_refuses_a_damaged_snapshot(world, tmp_path, capsys):
+def test_up_refuses_a_unreadable_state(world, tmp_path, capsys):
     vast, run = world
     (tmp_path / "run.json").write_text('{"version": 1, "run": "a.b.0123456789ab", "closed": tr')
     assert run(UP) == cli.EXIT_CONFIG
-    assert "damaged" in capsys.readouterr().out
+    assert "cannot be read" in capsys.readouterr().out
     assert vast.creates == 0
 
 
@@ -241,7 +241,7 @@ def test_up_rents_nothing_with_a_key_of_another_account(world, monkeypatch, caps
     assert run(UP) == cli.EXIT_CONFIG and vast.creates == 0
     monkeypatch.setenv("GPUBOX_ACCOUNT_ID", "111")
     assert run(UP) == 0
-    assert Snapshot.load(run.state_dir).account == "111"
+    assert State.load(run.state_dir).account == "111"
 
 
 def test_down_with_a_key_of_another_account_is_an_error_not_a_clean_result(world, capsys):
@@ -253,33 +253,9 @@ def test_down_with_a_key_of_another_account_is_an_error_not_a_clean_result(world
     assert run(["down"]) == cli.EXIT_CONFIG
     assert "another account" in capsys.readouterr().out
     assert len(vast.ours()) == 1 and len(vast.names("destroy")) == deletes
-    assert not Snapshot.load(run.state_dir).closed
+    assert not State.load(run.state_dir).closed
     vast.account_id = "111"
     assert run(["down"]) == 0 and vast.ours() == []
-
-
-def test_a_run_remembers_its_account_even_when_none_was_pinned(world, capsys):
-    # Otherwise a `down` with another account's key would find nothing there
-    # and call the run clean.
-    vast, run = world
-    assert run(UP) == 0
-    assert Snapshot.load(run.state_dir).account == "111"
-    vast.account_id = "222"
-    deletes = len(vast.names("destroy"))
-    assert run(["down"]) == cli.EXIT_CONFIG and "another account" in capsys.readouterr().out
-    assert len(vast.ours()) == 1 and len(vast.names("destroy")) == deletes
-    vast.account_id = "111"
-    assert run(["down"]) == 0
-
-
-def test_the_reaper_does_nothing_on_another_account(world, capsys):
-    vast, run = world
-    vast.live[50] = {"id": 50, "label": None, "machine": 1, "start_date": time.time() - 9e4}
-    reap = ["reap", "--exclusive", "--max-age-min", "90", "--destroy"]
-    assert run([*reap, "--account-id", "999"]) == cli.EXIT_CONFIG  # R1
-    assert vast.names("instances", "destroy") == [] and 50 in vast.live
-    assert run(reap) == cli.EXIT_CONFIG  # an exclusive reap without a pinned account
-    assert "--account-id" in capsys.readouterr().out and 50 in vast.live
 
 
 def test_bad_image_is_a_configuration_error(world):
@@ -351,24 +327,13 @@ def test_down_reports_an_unconfirmed_teardown_as_infrastructure(world):
     assert run(["down"]) == 0 and vast.ours() == []
 
 
-def test_an_unseen_create_keeps_down_failing_until_it_is_abandoned(world, tmp_path):
-    vast, run = world
-    vast.behaviour.update({1: "ghost", 2: "ok"})
-    assert run(UP) == 0  # a healthy winner; the ghost is a warning
-    key = tmp_path / "keys" / Snapshot.load(tmp_path).run
-    assert run(["down"]) == cli.EXIT_INFRA and vast.ours() == []
-    assert (key / "id_ed25519").exists()  # the run is not over: its key stays
-    assert run(["down", "--abandon-unseen"]) == 0
-    assert Snapshot.load(tmp_path).closed and not key.exists()
-
-
 def test_a_late_teardown_of_an_earlier_run_does_not_touch_the_next_one(world, tmp_path):
     vast, run = world
     assert run(UP) == 0
-    first = Snapshot.load(tmp_path).run
+    first = State.load(tmp_path).run
     assert run(["down", "--run-id", first]) == 0
     assert run(UP) == 0
-    second_box, second = vast.ours(), Snapshot.load(tmp_path).run
+    second_box, second = vast.ours(), State.load(tmp_path).run
     before = (tmp_path / "run.json").read_text()
     assert run(["down", "--run-id", first]) == 0  # the retried teardown of the first run
     assert vast.ours() == second_box
@@ -394,23 +359,8 @@ def test_down_by_run_id_without_a_state_directory_works_by_tag(world, tmp_path, 
     vast, run = world
     assert 9003 in vast.live  # tagged for OTHER_RUN, whose state is nowhere
     assert run(["down", "--run-id", OTHER_RUN]) == 0
-    assert 9003 not in vast.live and "by tag only" in capsys.readouterr().out
+    assert 9003 not in vast.live and "carries its tag" in capsys.readouterr().out
     assert not (tmp_path / "run.json").exists()
-
-
-def test_a_damaged_snapshot_is_never_a_clean_teardown(world, tmp_path, capsys):
-    vast, run = world
-    assert run(UP) == 0
-    run_id, iid = Snapshot.load(tmp_path).run, vast.ours()[0]
-    damaged = (tmp_path / "run.json").read_text()[:40]
-    (tmp_path / "run.json").write_text(damaged)
-    assert run(["down"]) == cli.EXIT_CONFIG  # T3: we cannot even tell which run this is
-    assert vast.ours() == [iid]
-    # With the run id its tagged boxes are destroyed, but the ids the snapshot
-    # held could not be checked: never exit 0, never remove the key.
-    assert run(["down", "--run-id", run_id]) == cli.EXIT_INFRA
-    assert vast.ours() == [] and (tmp_path / "keys" / run_id).exists()
-    assert (tmp_path / "run.json").read_text() == damaged
 
 
 def test_a_machine_that_failed_is_skipped_by_the_next_up(world, tmp_path):
@@ -423,6 +373,156 @@ def test_a_machine_that_failed_is_skipped_by_the_next_up(world, tmp_path):
     assert run([*UP, "--spare", "0"]) == 0
     # Machine 1 is blocked now, so the second launch goes straight to machine 2.
     assert vast.creates == first + 1
+
+
+def test_a_create_that_got_no_answer_does_not_fail_the_teardown(world, tmp_path, capsys):
+    vast, run = world
+    vast.behaviour.update({1: "ghost", 2: "ok"})
+    assert run(UP) == 0  # a healthy winner; the ghost is a warning
+    assert "got no answer to its create" in capsys.readouterr().out
+    assert run(["down"]) == 0 and vast.ours() == []
+    assert State.load(tmp_path).closed
+
+
+def test_down_that_cannot_finish_says_what_to_do_and_keeps_the_key(
+    world, tmp_path, capsys, monkeypatch
+):
+    vast, run = world
+    assert run(UP) == 0
+    run_id, iid = State.load(tmp_path).run, vast.ours()[0]
+    vast.sticky.add(vast.live[iid]["machine"])
+    capsys.readouterr()
+    assert run(["down"]) == cli.EXIT_INFRA
+    out = capsys.readouterr().out
+    assert str(iid) in out and f"gpubox down --run-id {run_id}" in out and "lease ends" in out
+    assert (tmp_path / "keys" / run_id).exists() and not State.load(tmp_path).closed
+    vast.sticky.clear()
+    assert run(["down", "--run-id", run_id]) == 0 and vast.ours() == []
+    assert not (tmp_path / "keys" / run_id).exists()
+
+
+def test_run_is_refused_once_the_teardown_has_begun(world, tmp_path, monkeypatch):
+    vast, run = world
+    assert run(UP) == 0
+    vast.sticky.add(vast.live[vast.ours()[0]]["machine"])
+    assert run(["down"]) == cli.EXIT_INFRA  # not finished, so the key is still there
+    calls = fake_ssh(monkeypatch)
+    assert run(script(tmp_path)) == cli.EXIT_CONFIG and not calls
+
+
+def test_with_an_unreadable_state_file_the_run_id_still_tears_down_by_tag(world, tmp_path):
+    vast, run = world
+    assert run(UP) == 0
+    run_id = State.load(tmp_path).run
+    (tmp_path / "run.json").write_text("{ not json")
+    assert run(["down"]) == cli.EXIT_CONFIG  # we cannot even tell which run this is
+    assert len(vast.ours()) == 1
+    assert run(["down", "--run-id", run_id]) == 0 and vast.ours() == []
+    assert (tmp_path / "run.json").read_text() == "{ not json"  # and the file is left as found
+
+
+# ---------------------------------------------------------------- ssh config
+
+
+@pytest.fixture
+def ssh_dir(tmp_path, monkeypatch):
+    d = tmp_path / "home ssh"  # a space, as in "My Drive"
+    monkeypatch.setenv("GPUBOX_SSH_DIR", str(d))
+    return d
+
+
+def test_ssh_config_adds_an_entry_for_the_box_and_down_removes_it(world, tmp_path, ssh_dir):
+    vast, run = world
+    ssh_dir.mkdir()
+    (ssh_dir / "config").write_text("Host mine\n    HostName example.org\n")
+    assert run([*UP, "--ssh-config"]) == 0
+    run_id = State.load(tmp_path).run
+    mine = (ssh_dir / "config").read_text()
+    assert mine == "Include gpubox_config\n\nHost mine\n    HostName example.org\n"
+    entry = (ssh_dir / "gpubox_config").read_text()
+    keys = (tmp_path / "keys" / run_id).resolve()
+    assert f"# gpubox run {run_id}\nHost 77-1\n" in entry
+    assert "    HostName 10.0.0." in entry and "    Port 2222\n" in entry
+    assert f'    IdentityFile "{keys}/id_ed25519"\n' in entry
+    assert f'    UserKnownHostsFile "{keys}/known_hosts"\n' in entry
+    assert State.load(tmp_path).ssh_alias == "77-1"
+    assert run(["down"]) == 0
+    assert (ssh_dir / "gpubox_config").read_text() == ""
+    assert (ssh_dir / "config").read_text() == mine  # the user's file is not touched again
+
+
+def test_what_ssh_reads_from_the_entry_is_the_box(world, tmp_path, ssh_dir):
+    # Ask ssh itself what it would do: the real parser, no connection. (Our file is read
+    # directly: a relative Include resolves against ~/.ssh, which a test must not touch.)
+    vast, run = world
+    tmp_path = tmp_path / "my state"  # a space in the key's path, as under "My Drive"
+    assert cli.main([*UP, "--ssh-config", "--state-dir", str(tmp_path)]) == 0
+    r = subprocess.run(
+        ["ssh", "-F", str(ssh_dir / "gpubox_config"), "-G", "77-1"], capture_output=True, text=True
+    )
+    assert r.returncode == 0, r.stderr
+    got = dict(line.split(" ", 1) for line in r.stdout.splitlines() if " " in line)
+    run_id = State.load(tmp_path).run
+    assert got["hostname"].startswith("10.0.0.") and got["port"] == "2222" and got["user"] == "root"
+    assert got["identityfile"] == str((tmp_path / "keys" / run_id / "id_ed25519").resolve())
+    assert got["identitiesonly"] == "yes"
+
+
+def test_without_the_flag_nothing_is_written_to_the_ssh_directory(world, ssh_dir):
+    vast, run = world
+    assert run(UP) == 0 and run(["down"]) == 0
+    assert not ssh_dir.exists()
+
+
+def test_a_second_box_of_the_same_name_replaces_the_first_entry(world, tmp_path, ssh_dir):
+    vast, run = world
+    assert run([*UP, "--ssh-config"]) == 0
+    first = State.load(tmp_path).run
+    other = tmp_path / "other"
+    assert cli.main([*UP, "--ssh-config", "--state-dir", str(other)]) == 0
+    entry = (ssh_dir / "gpubox_config").read_text()
+    assert entry.count("Host 77-1\n") == 1 and first not in entry
+    assert (ssh_dir / "config").read_text().count("Include gpubox_config") == 1
+    assert cli.main(["down", "--state-dir", str(other)]) == 0 and run(["down"]) == 0
+
+
+def test_a_failure_to_write_the_ssh_entry_does_not_cost_the_box(world, tmp_path, ssh_dir):
+    vast, run = world
+    ssh_dir.write_text("a file where the directory should be")
+    assert run([*UP, "--ssh-config"]) == 0 and len(vast.ours()) == 1
+    assert run(["down"]) == 0
+
+
+# --------------------------------------------------------------------- renew
+
+
+def test_renew_moves_the_lease(world, tmp_path, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    iid = vast.ours()[0]
+    before = parse_tag(vast.live[iid]["label"]).expiry
+    assert run(["renew", "--ttl-min", "600"]) == 0
+    after = parse_tag(vast.live[iid]["label"]).expiry
+    assert 598 * 60 < after - time.time() <= 600 * 60 and after > before
+    assert State.load(tmp_path).expiry == after
+    assert vast.probers[-1].ran[-1][1] == v.set_expiry_command(after)
+    assert "lease now ends" in capsys.readouterr().out
+    assert run(["down"]) == 0 and vast.ours() == []
+
+
+def test_renew_needs_a_live_box(world, tmp_path):
+    vast, run = world
+    assert run(["renew", "--ttl-min", "60"]) == cli.EXIT_CONFIG
+    assert run(UP) == 0 and run(["down"]) == 0
+    assert run(["renew", "--ttl-min", "60"]) == cli.EXIT_CONFIG
+    assert vast.names("relabel") == []
+
+
+def test_a_renewal_that_fails_is_an_infrastructure_error(world):
+    vast, run = world
+    assert run(UP) == 0
+    vast.hooks["relabel"] = lambda iid: (_ for _ in ()).throw(v.VastError(500, "boom"))
+    assert run(["renew", "--ttl-min", "600"]) == cli.EXIT_INFRA
 
 
 # ----------------------------------------------------------------------- run
@@ -439,20 +539,7 @@ def test_run_after_down_has_no_box_and_no_key(world, tmp_path):
     assert run(script(tmp_path)) == cli.EXIT_CONFIG
 
 
-def test_run_is_refused_once_the_box_is_destroyed_but_the_run_is_not_over(
-    world, tmp_path, monkeypatch
-):
-    # `down` destroyed the winner but could not finish (an unseen create is
-    # unresolved), so the run's key is still there. The box is not.
-    vast, run = world
-    vast.behaviour.update({1: "ghost", 2: "ok"})
-    assert run(UP) == 0 and run(["down"]) == cli.EXIT_INFRA
-    assert (tmp_path / "keys").exists()
-    calls = fake_ssh(monkeypatch)
-    assert run(script(tmp_path)) == cli.EXIT_CONFIG and not calls
-
-
-def test_run_refuses_a_damaged_snapshot(world, tmp_path, monkeypatch):
+def test_run_refuses_a_unreadable_state(world, tmp_path, monkeypatch):
     _, run = world
     assert run(UP) == 0
     (tmp_path / "run.json").write_text((tmp_path / "run.json").read_text()[:-20])
@@ -546,7 +633,7 @@ def test_our_own_down_during_run_blames_nobody(world, tmp_path, monkeypatch):
     iid = vast.ours()[0]
 
     def torn_down_meanwhile():
-        Snapshot.load(tmp_path).set_closing()  # what `down` writes first
+        State.load(tmp_path).set_closing()  # what `down` writes first
         vast.live[iid]["status"] = "exited"
 
     fake_ssh(monkeypatch, rc=255, before=torn_down_meanwhile)
@@ -565,7 +652,7 @@ def test_down_that_starts_after_the_connection_dropped_is_still_not_blamed(
     fake_ssh(monkeypatch, rc=255)
 
     def over_because_of_us(instance_id, **kw):
-        Snapshot.load(tmp_path).set_closing()
+        State.load(tmp_path).set_closing()
         return {"id": iid, "actual_status": "exited"}
 
     monkeypatch.setattr(vast, "instance", over_because_of_us)
@@ -608,39 +695,21 @@ def test_reap_reports_an_unreadable_listing_as_infrastructure(world):
     assert 50 in vast.live
 
 
-def test_an_exclusive_reap_destroys_what_carries_no_tag(world):
-    vast, run = world
-    for iid in [i for i in vast.live if i >= 9000]:
-        vast.live.pop(iid)
-    old_box(vast, label="renamed-by-the-box")
-    vast.live[51] = {
-        **vast.live[50],
-        "id": 51,
-        "label": make_tag(OTHER_RUN, 1, EXPIRY),
-        "machine": 2,
-    }
-    vast.live[51]["start_date"] = time.time() - 60
-    reap = ["reap", "--exclusive", "--max-age-min", "90", "--account-id", "111"]
-    assert run(reap) == 0 and vast.names("destroy") == []
-    assert run([*reap, "--destroy"]) == 0
-    assert vast.ours() == [51]  # in its lease, and young
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["reap"],
-        ["reap", "--namespace", "quack-ci", "--exclusive", "--account-id", "111"],
-        ["reap", "--exclusive", "--account-id", "111"],  # no maximum age
-        ["reap", "--namespace", "Not A Namespace"],
-        ["reap", "--namespace", "quack-ci", "--max-age-min", "90"],  # revision 3's invocation
-    ],
-)
-def test_a_reap_that_does_not_say_what_it_is_for_is_refused(world, argv):
+def test_reap_checks_the_account_when_one_is_pinned(world):
     vast, run = world
     old_box(vast)
-    assert run(argv) == cli.EXIT_CONFIG
-    assert vast.names("instances", "destroy") == []
+    reap = ["reap", "--namespace", "quack-ci", "--destroy"]
+    assert run([*reap, "--account-id", "999"]) == cli.EXIT_CONFIG and 50 in vast.live
+    assert vast.names("instances") == []
+    assert run([*reap, "--account-id", "111"]) == 0 and 50 not in vast.live
+
+
+def test_reap_needs_a_namespace(world):
+    vast, run = world
+    with pytest.raises(SystemExit):
+        run(["reap", "--destroy"])
+    assert run(["reap", "--namespace", "Not A Namespace"]) == cli.EXIT_CONFIG
+    assert vast.names("instances") == []
 
 
 # ----------------------------------------------------------------- arguments
@@ -664,9 +733,3 @@ def test_nonsense_arguments_are_rejected_before_anything_is_rented(world, bad):
 def test_bad_capability_is_a_configuration_error(world):
     vast, run = world
     assert run([*UP, "--capability", "twelve"]) == cli.EXIT_CONFIG and vast.creates == 0
-
-
-def test_reap_rejects_a_negative_age(world):
-    _, run = world
-    with pytest.raises(SystemExit):
-        run(["reap", "--exclusive", "--account-id", "111", "--max-age-min", "-1", "--destroy"])
