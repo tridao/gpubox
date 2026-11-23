@@ -487,6 +487,46 @@ MUTATIONS = [
      '                            self.rent_until = time.monotonic()\n',
      '',
      'queued_worker_does_not_rent'),
+    ('everything about a row is sent to the store', 'store.py',
+     '            batch = [{k: r.get(k) for k in SENT_FIELDS} for r in rows[i : i + BATCH]]',
+     '            batch = rows[i : i + BATCH]',
+     'only_the_agreed_fields'),
+    ('a listing that never ends is used as far as it got', 'store.py',
+     '                raise StoreError("the listing does not end")',
+     '                return rows',
+     'leaves_the_last_complete_snapshot'),
+    ('the outbox is emptied before the rows are accepted', 'store.py',
+     '            sent = self.store.push(waiting, deadline)\n            _write(self.outbox, waiting[sent:])',
+     '            _write(self.outbox, [])\n            sent = self.store.push(waiting, deadline)',
+     'keeps_what_was_not_sent'),
+    ('the store may take as long as it likes', 'store.py',
+     '        left = deadline - time.monotonic()\n',
+     '        left = 30\n',
+     'no_more_than_the_budget'),
+    ('remote rows with unknown reasons reach the policy', 'store.py',
+     '    return row["kind"] == "healthy" or row.get("reason_code") in REASONS',
+     '    return True',
+     'trusted_no_further'),
+    ('a plain-http store is accepted', 'store.py',
+     '        if not url.startswith("https://") and not url.startswith("http://127.0.0.1"):',
+     '        if False:',
+     'must_be_https'),
+    ('the outbox grows without bound', 'store.py',
+     '[-OUTBOX_LIMIT:]',
+     '',
+     'outbox_is_bounded'),
+    ('a store failure fails the command', 'cli.py',
+     '        except Exception as exc:\n            log(f"WARNING: reputation store ({what}): {exc}")',
+     '        except ZeroDivisionError as exc:\n            log(f"WARNING: reputation store ({what}): {exc}")',
+     'broken_store_never_fails'),
+    ('what others saw is not used', 'cli.py',
+     '        known = [*obs.rows, *shared.remote_rows()]',
+     '        known = obs.rows',
+     'someone_else_reported'),
+    ('our own observations are not shared', 'cli.py',
+     '        advisory("queueing observations", shared.queue, obs.rows[-obs.added :])\n',
+     '',
+     'reports_its_own'),
 ]
 # fmt: on
 
@@ -499,7 +539,11 @@ def main(only) -> int:
             work = pathlib.Path(tmp) / "w"
             shutil.rmtree(work, ignore_errors=True)
             shutil.copytree(
-                ROOT, work, ignore=shutil.ignore_patterns(".git", "__pycache__", ".gpubox")
+                ROOT,
+                work,
+                ignore=shutil.ignore_patterns(
+                    ".git", "__pycache__", ".gpubox", "node_modules", ".cloudflare"
+                ),
             )
             path = work / "src/gpubox" / fname
             text = path.read_text()

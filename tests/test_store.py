@@ -342,10 +342,12 @@ def test_the_client_and_the_real_worker_agree(tmp_path):
             s.sync(budget=20) == "sent 3, read 2"
         )  # the second failure for machine 11 is spaced out
         got = s.remote_rows()
-        assert [(r["machine_id"], r["kind"], r["source"]) for r in got] == [
+        # Rows of one request share a timestamp and come back ordered by id.
+        assert sorted((r["machine_id"], r["kind"], r["source"]) for r in got) == [
             (11, "failed_admission", "laptop"),
             (12, "healthy", "laptop"),
         ]
+        assert [r["reason_code"] for r in got if r["machine_id"] == 11] == ["busy_gpu"]
         assert abs(got[0]["ts"] - time.time()) < 60  # the Worker's clock, in seconds
         assert set(pol.blocklist(got, time.time())) == {11}
         s.queue(rows)

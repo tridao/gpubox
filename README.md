@@ -16,8 +16,8 @@ gpubox reap --namespace quack-ci --max-age-min 90 --destroy  # only if every box
 ```
 
 State lives in `--state-dir` (default `.gpubox`): the journal of what was
-rented, a throwaway SSH key, and `observations.jsonl` (which machines worked;
-cache this file between CI runs, and nothing else).
+rented, a throwaway SSH key per run, and `observations.jsonl` (which machines
+worked).
 
 ## What it guarantees, and what it does not
 
@@ -51,6 +51,22 @@ cache this file between CI runs, and nothing else).
   relabelled it and killed its timer when the launcher's state is also lost.
   `reap` works by label and cannot find such a box either; only a provider
   account used for nothing else, swept as a whole, closes that.
+
+## Sharing what machines did
+
+Set `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` and gpubox shares its
+observations of machines (which worked, which failed and with what reason
+code; never logs or run names) through the Worker in `store/`:
+
+- before a launch it sends what it has not sent yet and reads everyone's
+  observations of the last 30 days; machines that failed for others are
+  skipped like machines that failed here;
+- after a launch, and when a box dies mid-run, it sends what it learned.
+
+Both steps together may take at most 5 seconds and never fail a command. If
+the store cannot be reached, the last complete copy is used and unsent rows
+wait in `outbox.jsonl`. Without the two variables nothing is contacted, and
+`observations.jsonl` alone is used (cache it between CI runs in that case).
 
 ## QuACK CI mapping
 
