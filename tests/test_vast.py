@@ -19,7 +19,7 @@ from gpubox.launch import Spec
 REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
 SPEC = Spec(
     image="tridao/quack-kernels:cu13.2-26.11.22",
-    gpu="RTX 5090",
+    gpus=("RTX 5090",),
     num_gpus=2,
     max_dph_per_gpu=1.25,
     min_cuda=13.2,
@@ -468,7 +468,7 @@ def test_offers_in_an_excluded_country_are_dropped_and_unknown_locations_kept():
 
 
 def test_offer_query_scales_with_gpu_count():
-    q = v.offer_query(Spec(image="i", gpu="RTX 5090", num_gpus=4, max_dph_per_gpu=1.25))
+    q = v.offer_query(Spec(image="i", gpus=("RTX 5090",), num_gpus=4, max_dph_per_gpu=1.25))
     assert q["num_gpus"] == {"eq": 4} and q["dph_total"] == {"lte": 5.0}
     assert q["cpu_cores_effective"] == {"gte": 32} and q["cpu_ram"] == {"gte": 4 * 32 * 1024}
 
@@ -591,3 +591,13 @@ def test_a_page_that_does_not_say_whether_more_follow_is_not_the_last_page(wire)
     wire({"success": True, "instances": [{"id": 1, "label": None}]})
     with pytest.raises(v.VastError, match="next_token"):
         v.Vast("k").instances()
+
+
+def test_cpus_and_ram_asked_for_the_whole_box_replace_the_per_gpu_defaults():
+    q = v.offer_query(Spec(image="i", gpus=("RTX 5090",), num_gpus=2, max_dph_per_gpu=1))
+    assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 16}, {"gte": 64 * 1024})
+    q = v.offer_query(
+        Spec(image="i", gpus=("RTX 5090",), num_gpus=2, max_dph_per_gpu=1, min_cpus=12,
+             min_ram_gb=200)
+    )  # fmt: skip
+    assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 12}, {"gte": 200 * 1024})

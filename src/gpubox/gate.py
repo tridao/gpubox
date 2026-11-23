@@ -56,8 +56,8 @@ out["disk_free_gb"] = shutil.disk_usage("/").free >> 30
 if len(rows) != want["num_gpus"]:
     done("wrong_hardware", "expected %d GPUs, nvidia-smi lists %d" % (want["num_gpus"], len(rows)))
 for r in rows:
-    if want["gpu"] not in r[1]:
-        done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], want["gpu"]))
+    if not any(model in r[1] for model in want["gpus"]):
+        done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], " or ".join(want["gpus"])))
     if int(r[2]) < want["min_vram_mib"]:
         done("wrong_hardware", "GPU %s has %s MiB, need %d" % (r[0], r[2], want["min_vram_mib"]))
 if out["disk_free_gb"] < 10:
@@ -238,7 +238,7 @@ class Prober:
         """Start the health gate. Its result is (ok, reason_code, detail, report)."""
         want = {
             "num_gpus": spec.num_gpus,
-            "gpu": spec.gpu,
+            "gpus": list(spec.gpus),
             "min_vram_mib": spec.min_vram_mib,
             "capability": list(spec.capability) if spec.capability else None,
             "must_reach": list(spec.must_reach),

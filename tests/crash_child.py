@@ -27,7 +27,7 @@ with state_lock(state_dir):
     if cue == "hold-lock":
         print("locked", flush=True)
         time.sleep(60)
-    meta = {"image": SPEC.image, "gpu": SPEC.gpu, "num_gpus": SPEC.num_gpus}
+    meta = {"image": SPEC.image, "gpus": list(SPEC.gpus), "num_gpus": SPEC.num_gpus}
     state = State.begin(state_dir, RUN_ID, EXPIRY, None, meta)
 
     def dying(name, method):

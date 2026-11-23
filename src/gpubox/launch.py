@@ -33,6 +33,7 @@ answers are well formed, or that one host is right about the image.
 from __future__ import annotations
 
 import collections
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -57,7 +58,7 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Spec:
     image: str
-    gpu: str
+    gpus: tuple[str, ...]  # any of these models (Vast's names), cheapest offer first
     max_dph_per_gpu: float
     num_gpus: int = 1
     capability: tuple[int, int] | None = None  # None: do not check
@@ -65,8 +66,8 @@ class Spec:
     min_cuda: float = 12.0
     disk_gb: int = 40
     min_reliability: float = 0.98
-    min_cpus_per_gpu: int = 8
-    min_ram_gb_per_gpu: int = 32
+    min_cpus: int | None = None  # for the whole box; None: max(16, 8 per GPU)
+    min_ram_gb: int | None = None  # for the whole box; None: 32 per GPU
     min_inet_down_mbps: int = 200
     must_reach: tuple[str, ...] = ()
     # The caller's own checks, run on the box after the built-in gate passes (gate.read_hook).
@@ -76,6 +77,17 @@ class Spec:
     # Hosts in mainland China took a median of 250 s to load the CI image against 65 s
     # elsewhere, and 2 of 6 never did (DESIGN.md, section 10).
     exclude_countries: tuple[str, ...] = ("CN",)
+
+    def __post_init__(self):
+        gpus = (self.gpus,) if isinstance(self.gpus, str) else tuple(self.gpus)
+        if not gpus or not all(isinstance(g, str) and g.strip() for g in gpus):
+            raise ValueError(f"gpus must name at least one GPU model: {self.gpus!r}")
+        object.__setattr__(self, "gpus", gpus)
+
+    @property
+    def gpu_text(self) -> str:
+        """What was asked for, for people: "2x RTX 5090 or RTX 4090"."""
+        return f"{self.num_gpus}x {' or '.join(self.gpus)}"
 
 
 @dataclass(frozen=True)
@@ -117,6 +129,7 @@ class Attempt:
     offer_id: int
     dph: float
     geo: str = ""
+    gpu: str | None = None  # the model the offer said it has
     # unanswered: the create got no usable answer, so a box may exist that we have no id for
     state: str = "unanswered"  # unanswered | refused | rented
     instance_id: int | None = None
@@ -260,6 +273,7 @@ class Launch:
                     "id": winner.instance_id, "attempt": winner.seq,
                     "host": winner.endpoint[0], "port": winner.endpoint[1],
                     "machine": winner.machine_id, "host_id": winner.host_id,
+                    "gpu": winner.gpu,
                 })  # fmt: skip
         except BaseException:
             deadline = time.monotonic() + self.policy.rollback  # one budget for all of it
@@ -340,7 +354,7 @@ class Launch:
         allowed = v.in_allowed_country(found, spec.exclude_countries)
         offers = collections.deque(pol.select_offers(allowed, blocked, policy.max_live))
         log(
-            f"{len(offers)} candidate host(s) for {spec.num_gpus}x {spec.gpu} "
+            f"{len(offers)} candidate host(s) for {spec.gpu_text} "
             f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
             f"excluded countries); racing {policy.max_live}, "
             f"up to {policy.max_attempts} attempts"
@@ -565,6 +579,7 @@ class Launch:
                 offer_id=o["id"],
                 dph=float(o["dph_total"]),
                 geo=str(o.get("geolocation") or ""),
+                gpu=o.get("gpu_name") if isinstance(o.get("gpu_name"), str) else None,
             )
             payload = v.create_payload(spec, a.tag, self.prober.pubkey, state.expiry)
             self.attempts[seq] = a  # as unanswered: if the request is interrupted, it stays so
@@ -616,6 +631,16 @@ class Launch:
         )
 
 
+_GPU_MODEL = re.compile(r"[\w .+-]{1,64}")  # what the store accepts
+
+
+def gpu_model(rented: str | None, asked) -> str | None:
+    """The model to record for a box: the one its offer named, else the only one asked for."""
+    asked = list(asked or ())
+    model = rented or (asked[0] if len(asked) == 1 else None)
+    return model if model and _GPU_MODEL.fullmatch(model) else None
+
+
 def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> None:
     """Record what this launch taught us about machines.
 
@@ -626,8 +651,9 @@ def observe(result: Result, spec: Spec, run_id: str, obs: pol.Observations) -> N
     """
     if not result.winner:
         return
-    common = {"gpu": spec.gpu, "num_gpus": spec.num_gpus, "gate_version": GATE_VERSION}
     for a in result.attempts:
+        common = {"gpu": gpu_model(a.gpu, spec.gpus), "num_gpus": spec.num_gpus,
+                  "gate_version": GATE_VERSION}  # fmt: skip
         if a is result.winner:
             secs = a.timings.get("healthy")
             obs.add(

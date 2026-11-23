@@ -22,7 +22,7 @@
     12,
     0
    ],
-   "gpu": "RTX 5090",
+   "gpus": ["RTX 5090"],
    "min_vram_mib": 30000,
    "must_reach": [
     "https://github.com/",

@@ -14,7 +14,7 @@ from gpubox import gate, policy
 from gpubox.gate import Prober
 from gpubox.launch import Spec
 
-SPEC = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25)
+SPEC = Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25)
 REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
 
 
@@ -96,7 +96,7 @@ def test_a_hung_gate_is_a_soft_failure():
 
 def test_the_gate_is_asked_exactly_what_the_reference_launcher_asked(tmp_path, monkeypatch):
     spec = Spec(
-        image="img", gpu="RTX 5090", num_gpus=2, max_dph_per_gpu=1.25, capability=(12, 0),
+        image="img", gpus=("RTX 5090",), num_gpus=2, max_dph_per_gpu=1.25, capability=(12, 0),
         min_vram_mib=30000, must_reach=("https://github.com/", "https://pypi.org/simple/pip/"),
     )  # fmt: skip
     calls = []
@@ -296,7 +296,13 @@ def test_loading_a_key_never_creates_one(tmp_path):
 SMI = """#!/bin/sh
 echo "0, NVIDIA GeForce RTX 5090, 32607, 1, 0, 20.5, 570.86"
 """
-WANT = {"num_gpus": 1, "gpu": "RTX 5090", "min_vram_mib": 0, "capability": None, "must_reach": []}
+WANT = {
+    "num_gpus": 1,
+    "gpus": ["RTX 5090"],
+    "min_vram_mib": 0,
+    "capability": None,
+    "must_reach": [],
+}
 
 
 def real_gate(tmp_path, torch_source=None, want=WANT):
@@ -361,7 +367,7 @@ def test_a_pytorch_that_is_missing_a_part_is_not_taken_for_no_pytorch(tmp_path):
 
 
 def test_the_nvidia_smi_checks_run_whatever_pytorch_there_is(tmp_path):
-    ok, reason, detail, _ = real_gate(tmp_path, want={**WANT, "gpu": "H100"})
+    ok, reason, detail, _ = real_gate(tmp_path, want={**WANT, "gpus": ["H100", "A100"]})
     assert (ok, reason) == (False, "wrong_hardware")
 
 
@@ -401,7 +407,7 @@ def test_the_gate_script_is_sent_on_stdin_with_its_own_timeout(tmp_path, monkeyp
             calls.append((argv, kw))
 
     monkeypatch.setattr(gate, "Child", Recorded)
-    spec = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1, gate_script="echo hi\n",
+    spec = Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1, gate_script="echo hi\n",
                 gate_timeout=42)  # fmt: skip
     prober(tmp_path).start_hook(("10.0.0.1", 22), spec)
     argv, kw = calls[0]

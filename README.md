@@ -34,6 +34,10 @@ gpubox down
 `--ssh-config` adds a `Host mybox` entry to `~/.ssh/gpubox_config` and one
 `Include` line at the top of `~/.ssh/config`. `down` removes the entry.
 
+`--gpu` can be repeated to accept any of several models (the cheapest offer
+goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
+default it gets max(16, 8 per GPU) CPUs and 32 GB of RAM per GPU.
+
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 

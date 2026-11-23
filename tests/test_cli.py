@@ -150,13 +150,13 @@ def test_the_quack_ci_flags_send_what_the_reference_launcher_sent(world):
     for spec in vast.probers[0].wants:
         asked = (
             spec.num_gpus,
-            spec.gpu,
+            list(spec.gpus),
             spec.min_vram_mib,
             list(spec.capability),
             list(spec.must_reach),
         )
         assert asked == tuple(
-            want[k] for k in ("num_gpus", "gpu", "min_vram_mib", "capability", "must_reach")
+            want[k] for k in ("num_gpus", "gpus", "min_vram_mib", "capability", "must_reach")
         )
     assert vast.probers[0].wants and run(["down"]) == 0
 
@@ -809,3 +809,14 @@ def test_an_unreadable_gate_script_rents_nothing(world, tmp_path):
     vast, run = world
     assert run([*UP, "--gate-script", str(tmp_path / "missing.sh")]) == cli.EXIT_CONFIG
     assert vast.creates == 0
+
+
+def test_several_models_cpus_and_ram_reach_the_search(world):
+    vast, run = world
+    argv = [*UP, "--gpu", "RTX 4090", "--min-cpus", "12", "--min-ram-gb", "64"]
+    assert run(argv) == 0
+    q = vast.queries[0]
+    assert q["gpu_name"] == {"in": ["RTX 5090", "RTX 4090"]}
+    assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 12}, {"gte": 64 * 1024})
+    assert vast.probers[0].wants[0].gpus == ("RTX 5090", "RTX 4090")
+    assert run(["down"]) == 0

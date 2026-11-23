@@ -252,7 +252,7 @@ class Vast:
 def offer_query(spec) -> dict:
     n = spec.num_gpus
     return {
-        "gpu_name": {"in": [spec.gpu]},
+        "gpu_name": {"in": list(spec.gpus)},
         "num_gpus": {"eq": n},
         "cuda_max_good": {"gte": spec.min_cuda},
         "reliability": {"gte": spec.min_reliability},
@@ -260,9 +260,9 @@ def offer_query(spec) -> dict:
         "rentable": {"eq": True},
         "direct_port_count": {"gte": 1},
         "inet_down": {"gte": spec.min_inet_down_mbps},
-        # Cores for a compile pool on top of one worker per GPU.
-        "cpu_cores_effective": {"gte": max(16, spec.min_cpus_per_gpu * n)},
-        "cpu_ram": {"gte": spec.min_ram_gb_per_gpu * n * 1024},
+        # By default, cores for a compile pool on top of one worker per GPU.
+        "cpu_cores_effective": {"gte": max(16, 8 * n) if spec.min_cpus is None else spec.min_cpus},
+        "cpu_ram": {"gte": (32 * n if spec.min_ram_gb is None else spec.min_ram_gb) * 1024},
         "dph_total": {"lte": spec.max_dph_per_gpu * n},
         "disk_space": {"gte": spec.disk_gb},
         # Price the offer with the disk we will actually allocate.

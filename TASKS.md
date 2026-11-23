@@ -55,9 +55,9 @@ Partly done: the lease timer destroys a box when its lease ends, and writing a p
 
 ## 6. GPU models, CPUs, RAM
 
-- [ ] `--gpu` repeatable: any of the models, cheapest first; the gate accepts any of them.
+- [x] `--gpu` repeatable: any of the models, cheapest first; the gate accepts any of them.
   Observations record the model actually rented.
-- [ ] `--min-cpus N`, `--min-ram-gb N` for the whole box (defaults as now: max(16, 8 per GPU)
+- [x] `--min-cpus N`, `--min-ram-gb N` for the whole box (defaults as now: max(16, 8 per GPU)
   CPUs, 32 GB per GPU).
 
 ## 7. Python API [R]

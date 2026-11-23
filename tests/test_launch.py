@@ -383,7 +383,7 @@ def test_the_winner_is_recorded_with_what_run_and_renew_need(tmp_path):
     w = on_disk(state).winner
     assert w == {
         "id": result.winner.instance_id, "attempt": 1, "host": "10.0.0.1", "port": 2222,
-        "machine": 1, "host_id": 1,
+        "machine": 1, "host_id": 1, "gpu": "RTX 5090",
     }  # fmt: skip
     assert parse_tag(vast.live[w["id"]]["label"]).expiry == EXPIRY
 
@@ -862,7 +862,7 @@ def test_a_run_without_a_box_cannot_be_renewed(tmp_path):
 
 # ---------------------------------------------------------- the gate script
 
-HOOKED = L.Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25, gate_script="exit 0\n")
+HOOKED = L.Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25, gate_script="exit 0\n")
 
 
 def test_a_gate_script_runs_after_the_gate_and_admits_the_box(tmp_path):
@@ -902,3 +902,33 @@ def test_a_box_in_its_gate_script_is_waited_for_and_stopped_when_it_loses(tmp_pa
     assert result.winner.machine_id == 2 and 1 in launch.prober.hooked
     assert reasons(result)[1] is None
     only_winner_left(result, vast, state)
+
+
+# ------------------------------------------------------------ several models
+
+TWO_MODELS = L.Spec(image="img", gpus=("RTX 4090", "RTX 5090"), max_dph_per_gpu=1.25)
+
+
+def test_any_of_several_models_is_rented_and_recorded_as_what_it_is(tmp_path):
+    offers = [offer(1, dph=0.5, gpu="RTX 4090"), offer(2, dph=0.9, gpu="RTX 5090")]
+    vast = FakeVast({1: "bad_gpu", 2: "ok"}, offers=offers)
+    result, vast, state = run(tmp_path, {}, vast=vast, spec=TWO_MODELS, spare=0)
+    assert vast.queries[0]["gpu_name"] == {"in": ["RTX 4090", "RTX 5090"]}
+    assert result.winner.machine_id == 2 and on_disk(state).winner["gpu"] == "RTX 5090"
+    obs = pol.Observations(None)
+    L.observe(result, TWO_MODELS, "r", obs)
+    assert {(o["machine_id"], o["gpu"]) for o in obs.rows} == {(1, "RTX 4090"), (2, "RTX 5090")}
+
+
+def test_a_model_name_the_store_would_refuse_is_not_recorded():
+    assert L.gpu_model("RTX 5090", ["RTX 5090"]) == "RTX 5090"
+    assert L.gpu_model(None, ["RTX 5090"]) == "RTX 5090"  # the only one asked for
+    assert L.gpu_model(None, ["RTX 4090", "RTX 5090"]) is None  # cannot tell which
+    assert L.gpu_model("RTX\n5090;", ["RTX 5090"]) is None
+
+
+def test_a_spec_needs_a_model_and_takes_a_single_name():
+    assert L.Spec(image="i", gpus="H100", max_dph_per_gpu=1).gpus == ("H100",)
+    for bad in ((), ("",), [None]):
+        with pytest.raises(ValueError):
+            L.Spec(image="i", gpus=bad, max_dph_per_gpu=1)

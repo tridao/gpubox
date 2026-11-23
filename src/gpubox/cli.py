@@ -47,6 +47,7 @@ from .launch import (
     Spec,
     down,
     explain_leftovers,
+    gpu_model,
     log,
     observe,
     reap,
@@ -91,7 +92,7 @@ def write_summary(spec: Spec, result: Result) -> None:
         else f"no healthy box after {result.seconds:.0f}s"
     )
     lines = [
-        f"### Vast launch: {spec.num_gpus}x {spec.gpu}",
+        f"### Vast launch: {spec.gpu_text}",
         "",
         head,
         "",
@@ -117,7 +118,9 @@ def spec_from(args, image: str = "") -> Spec:
         cap = tuple(int(x) for x in args.capability.split("."))
     return Spec(
         image=image,
-        gpu=args.gpu,
+        gpus=tuple(args.gpu),
+        min_cpus=args.min_cpus,
+        min_ram_gb=args.min_ram_gb,
         num_gpus=args.num_gpus,
         capability=cap,
         min_vram_mib=args.min_vram_mib,
@@ -277,7 +280,7 @@ def cmd_up(args) -> int:
                 f"cannot write the run id to GITHUB_OUTPUT ({exc}); nothing was rented"
             ) from None
         expiry = int(time.time()) + spec.ttl_min * 60
-        meta = {"image": spec.image, "gpu": spec.gpu, "num_gpus": spec.num_gpus}
+        meta = {"image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus}
         state = State.begin(state_dir, run_id, expiry, account, meta)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
@@ -318,7 +321,7 @@ def report_result(spec: Spec, result: Result, state: State) -> None:
         )
     w = result.winner
     if not w:
-        log(f"::error::no healthy {spec.num_gpus}x {spec.gpu} box")
+        log(f"::error::no healthy {spec.gpu_text} box")
         return
     r = w.report
     until = time.strftime("%H:%M UTC", time.gmtime(state.expiry))
@@ -394,7 +397,9 @@ def cmd_run(args) -> int:
     # its own timer, the reaper), which says nothing about the machine. A
     # missing or transitional status, or an API error, is not evidence either.
     if status in DEAD_STATUSES and _still_ours(state_dir, run_id):
-        extra = {k: state.meta[k] for k in ("gpu", "num_gpus") if k in state.meta}
+        meta = state.meta
+        asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
+        extra = {"gpu": gpu_model(w.get("gpu"), asked), "num_gpus": meta.get("num_gpus")}
 
         def record():
             row = pol.observation(
@@ -539,7 +544,12 @@ def main(argv=None) -> int:
         s.add_argument("--observations", help="JSONL of machine observations (read and appended)")
 
     def spec_args(s):
-        s.add_argument("--gpu", required=True, help='Vast GPU name, e.g. "RTX 5090"')
+        s.add_argument(
+            "--gpu",
+            action="append",
+            required=True,
+            help='Vast GPU name, e.g. "RTX 5090"; repeat to accept any of several models',
+        )
         s.add_argument("--num-gpus", type=number(int, 1), default=1)
         s.add_argument(
             "--max-dph-per-gpu",
@@ -551,6 +561,12 @@ def main(argv=None) -> int:
         s.add_argument("--min-vram-mib", type=number(int, 0), default=0)
         s.add_argument("--min-cuda", type=number(float, 0), default=12.0)
         s.add_argument("--disk-gb", type=number(int, 1), default=40)
+        s.add_argument(
+            "--min-cpus", type=number(int, 1), help="CPUs for the box (default: max(16, 8 per GPU))"
+        )
+        s.add_argument(
+            "--min-ram-gb", type=number(int, 1), help="GB of RAM for the box (default: 32 per GPU)"
+        )
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
         s.add_argument(
             "--exclude-country",

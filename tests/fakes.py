@@ -36,16 +36,17 @@ FAST = Policy(
     recheck=0.01,
     call_timeout=1,
 )
-SPEC = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25)
+SPEC = Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25)
 REPORT = {"gpus": ["RTX 5090"], "cpus": 32, "driver": "1", "torch": "2"}
 
 
-def offer(machine, host=None, dph=1.0):
+def offer(machine, host=None, dph=1.0, gpu="RTX 5090"):
     return {
         "id": 1000 + machine,
         "machine_id": machine,
         "host_id": host or machine,
         "dph_total": dph,
+        "gpu_name": gpu,
     }
 
 
@@ -359,7 +360,7 @@ def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, expiry=EXPI
     if policy_kw:
         policy = Policy(**{**policy.__dict__, **policy_kw})
     vast = vast or FakeVast(behaviour)
-    meta = {"image": spec.image, "gpu": spec.gpu, "num_gpus": spec.num_gpus}
+    meta = {"image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus}
     state = State.begin(tmp_path, RUN_ID, expiry, None, meta)
     return Launch(vast, spec, policy, state, FakeProber(vast)), vast, state
 
