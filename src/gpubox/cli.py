@@ -168,6 +168,7 @@ def cmd_up(args) -> int:
         spare=args.spare,
         max_attempts=args.max_attempts,
         startup_timeout=args.startup_timeout,
+        stall_timeout=args.stall_timeout,
         overall_timeout=args.overall_timeout,
     )
     if spec.ttl_min * 60 < policy.overall_timeout + policy.min_lease:
@@ -468,6 +469,12 @@ def main(argv=None) -> int:
     s.add_argument("--max-attempts", type=number(int, 1), default=DEFAULTS.max_attempts)
     s.add_argument(
         "--startup-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.startup_timeout
+    )
+    s.add_argument(
+        "--stall-timeout",
+        type=number(float, 0, exclusive=True),
+        default=DEFAULTS.stall_timeout,
+        help="give up on a box that is still loading and has reported nothing new for this long",
     )
     s.add_argument(
         "--overall-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.overall_timeout

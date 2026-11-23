@@ -140,6 +140,30 @@ def test_startup_failures_carry_a_reason_code(tmp_path, kind, reason):
     only_winner_left(result, vast, snap)
 
 
+def test_a_box_whose_loading_status_stops_changing_is_replaced_before_the_startup_timeout(
+    tmp_path,
+):
+    t0 = time.monotonic()
+    result, vast, snap = run(
+        tmp_path, {1: "stuck", 2: "ok"}, spare=0, startup_timeout=30, stall_timeout=0.2
+    )
+    assert result.winner.machine_id == 2 and time.monotonic() - t0 < 5
+    assert reasons(result)[1] == "unreachable"
+    assert "stalled" in next(a.detail for a in result.attempts if a.machine_id == 1)
+    only_winner_left(result, vast, snap)
+
+
+def test_a_box_that_keeps_reporting_progress_is_not_taken_for_stalled(tmp_path):
+    # Slow is not stuck: it gets the whole startup timeout.
+    result, vast, snap = run(
+        tmp_path, {1: "pulling", 2: "ok"}, spare=0, startup_timeout=0.6, stall_timeout=0.2
+    )
+    assert result.winner.machine_id == 2
+    slow = next(a for a in result.attempts if a.machine_id == 1)
+    assert "not reachable after 0.6s" in slow.detail and "stalled" not in slow.detail
+    only_winner_left(result, vast, snap)
+
+
 def test_stale_offer_is_skipped_without_blame(tmp_path):
     result, vast, snap = run(tmp_path, {1: "stale", 2: "ok"}, spare=0)
     assert result.winner.machine_id == 2

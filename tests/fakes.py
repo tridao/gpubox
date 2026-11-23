@@ -56,7 +56,8 @@ class FakeVast:
     ok        comes up and passes the gate
     bad_gpu   comes up, gate reports cuda_init
     busy      comes up, gate reports busy_gpu
-    stuck     never leaves "loading"
+    stuck     never leaves "loading", and its status message never changes
+    pulling   never leaves "loading", but its status message changes at every look
     cdi       status message blames the machine's container runtime
     image     status message says the image cannot be pulled
     exited    container exits during bootstrap
@@ -158,6 +159,8 @@ class FakeVast:
             row["status_msg"] = "Error response from daemon: manifest unknown"
         elif kind == "exited":
             row["actual_status"] = "exited"
+        elif kind == "pulling":
+            row["status_msg"] = f"layer: Downloading {len(self.calls)} MB"
         elif kind != "stuck":
             row.update(
                 actual_status=box.get("status", "running"),

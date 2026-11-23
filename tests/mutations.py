@@ -801,6 +801,16 @@ MUTATIONS = [
      '        allowed = v.in_allowed_country(found, spec.exclude_countries)',
      '        allowed = found',
      'hosts_in_china_are_skipped'),
+    ('a stalled pull is waited for until the startup timeout',
+     'launch.py',
+     '            if quiet > policy.stall_timeout:',
+     '            if False:',
+     'stops_changing_is_replaced'),
+    ('progress does not reset the stall clock',
+     'launch.py',
+     '        if not a.answered or (status, msg) != (a.status, a.msg):\n            a.changed_at = time.monotonic()',
+     '        if not a.answered:\n            a.changed_at = time.monotonic()',
+     'keeps_reporting_progress'),
 ]
 # fmt: on
 

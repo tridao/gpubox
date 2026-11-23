@@ -66,6 +66,10 @@ class Policy:
     spare: int = 1  # candidates raced beyond the one we keep
     max_attempts: int = 6
     startup_timeout: float = 300
+    # A box that is not running yet and whose status has not changed for this long is
+    # given up on. Pulls that finished went silent for at most 166 s; the ones that never
+    # finished, for 600 s and more (experiments/pull_time_dev, 2026-11-23).
+    stall_timeout: float = 300
     overall_timeout: float = 900
     cleanup_reserve: float = (
         60  # the race ends, and renting stops, this long before overall_timeout
@@ -108,6 +112,7 @@ class Attempt:
     failed_at: float = 0.0  # monotonic; when it failed
     check: object = None  # the child process it is waiting for, if any
     answered: bool = False  # did the provider ever tell us anything about this box?
+    changed_at: float = 0.0  # monotonic; when its status or status message last changed
     status: str = ""
     msg: str = ""
     ssh_err: str = ""
@@ -500,9 +505,11 @@ class Launch:
                 self._note_gone(a.instance_id)
                 self._fail(a, None, "the instance no longer exists")
             return None
-        a.answered = True
-        a.status = str(inst.get("actual_status") or "none")
-        a.msg = str(inst.get("status_msg") or "")
+        status = str(inst.get("actual_status") or "none")
+        msg = str(inst.get("status_msg") or "")
+        if not a.answered or (status, msg) != (a.status, a.msg):
+            a.changed_at = time.monotonic()
+        a.answered, a.status, a.msg = True, status, msg
         kind = v.classify_status(a.msg)
         if kind == "image":
             self._fail(a, None, f"image cannot be pulled: {a.msg[:200]}")
@@ -515,7 +522,18 @@ class Launch:
             self._fail(a, "unreachable", f"container exited during bootstrap ({a.msg[:120]})")
             return None
         ep = v.endpoint_of(inst)
-        if a.status != "running" or ep is None:
+        if a.status != "running":
+            quiet = time.monotonic() - a.changed_at
+            if quiet > policy.stall_timeout:
+                # Still loading, and the provider has reported nothing new for a
+                # long while: a pull that is stuck, or too slow to wait for.
+                self._fail(
+                    a,
+                    "unreachable",
+                    f"stalled: status {a.status} unchanged for {quiet:.0f}s ({a.msg[:120]})",
+                )
+            return None
+        if ep is None:
             return None
         a.timings.setdefault("running", self._elapsed(a))
         a.endpoint = ep

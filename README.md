@@ -102,6 +102,11 @@ Hosts in mainland China are skipped by default (`--exclude-country`, default
 `CN`; `none` to skip none): in `experiments/pull_time` they took a median of
 250 s to load the CI image against 65 s elsewhere, and 2 of 6 never did.
 
+A box that is still loading and whose status has not changed for
+`--stall-timeout` (300 s) is replaced. That only matters when
+`--startup-timeout` is longer, as a large image needs: the 4 GB dev image
+took up to 350 s on hosts that finished, and 2 of 6 hosts stalled for good.
+
 ## QuACK CI mapping
 
 The flags that reproduce `tools/ci/vast/vast_ci.py` (checked against a pinned

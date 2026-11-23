@@ -224,7 +224,10 @@ decides.
 processes with a start, a poll, a deadline and a kill; their output goes to
 files, so nothing blocks on a pipe. The gate's script and the reading of its
 verdict are revision 3's. The rules for reading a box's status are revision
-3's: an image error, a machine error, `exited`, the start-up timeout.
+3's: an image error, a machine error, `exited`, the start-up timeout. One is
+new: a box that is not running yet and whose status and status message have
+not changed for `--stall-timeout` (300 s) has failed, as `unreachable`. A box
+that keeps reporting progress gets the whole start-up timeout.
 
 **Create.** Sent once, never retried. An id comes only from an explicit yes;
 `refused` only from an explicit no (the offer is dropped, nobody is blamed).
