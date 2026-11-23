@@ -20,7 +20,8 @@ history is in git and in QuACK's `AI/gpubox_design.md` (revision 3).
    take the cheapest, one machine per host.
 2. Rent up to `1 + --spare` boxes at once (2 by default) and wait for each to
    boot, answer SSH and pass the health gate. A box that fails is destroyed
-   and replaced, up to `--max-attempts` creates (6).
+   and replaced, up to `--max-attempts` rentals (6; an offer that was already
+   gone does not count).
 3. The first box through the gate is the winner; the others are destroyed.
 4. `gpubox run` runs a script on it; `gpubox down` destroys it.
 

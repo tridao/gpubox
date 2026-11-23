@@ -51,7 +51,8 @@ and `observations.jsonl` (which machines worked).
 
 - `up` races `1 + --spare` hosts (2 by default), cheapest first, one machine
   per host. The first to boot, answer SSH and pass the health gate wins; the
-  others are destroyed. A box that fails is replaced, up to `--max-attempts`.
+  others are destroyed. A box that fails is replaced, up to `--max-attempts` rentals (an offer that
+  was already gone does not count).
 - Every box carries a tag as its label,
   `<namespace>.<name>.<random>.a<attempt>.<expiry>`. Anything that knows the
   run id can find the run's boxes and destroy them. `down --run-id` needs

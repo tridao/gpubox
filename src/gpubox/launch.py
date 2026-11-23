@@ -511,7 +511,7 @@ class Launch:
         spec, state = self.spec, self.state
         while (
             sum(a.holds_slot for a in self.attempts.values()) < self.policy.max_live
-            and len(self.attempts) < self.policy.max_attempts
+            and self._sent() < self.policy.max_attempts
             and offers
             and time.monotonic() < deadline
         ):
@@ -547,6 +547,12 @@ class Launch:
             state.add_id(iid)  # if this raises, the rollback destroys what `held` names
             log(f"  {a.tag_name} rented instance {iid}: ${a.dph:.2f}/hr, host {a.host_id}, {a.geo}")
 
+    def _sent(self) -> int:
+        """Creates that count against `max_attempts`: those that may have rented a box. An
+        offer that was already gone ("refused") cost nothing, and a burst of them must not
+        end the launch; the list of offers is what bounds those."""
+        return sum(a.state != "refused" for a in self.attempts.values())
+
     def _worth_waiting(self, offers: collections.deque, deadline: float) -> bool:
         """Is anything still going on that could end in a healthy box?
 
@@ -565,7 +571,7 @@ class Launch:
         return bool(
             offers
             and sum(a.holds_slot for a in self.attempts.values()) < policy.max_live
-            and len(self.attempts) < policy.max_attempts
+            and self._sent() < policy.max_attempts
             and now < deadline
         )
 
@@ -625,7 +631,7 @@ def down(vast, state: State, policy: Policy) -> list[int] | None:
         if pending:
             left = set(destroy_confirmed(vast, pending, policy.round, policy))
             for iid in sorted(pending - left):
-                log(f"destroyed instance {iid}")
+                log(f"instance {iid}: gone")
             pending = left
         found = tagged(vast, state.run, policy)
         new = (found or set()) - pending  # these have not been sent a delete yet

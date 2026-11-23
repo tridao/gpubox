@@ -170,6 +170,16 @@ def test_stale_offer_is_skipped_without_blame(tmp_path):
     only_winner_left(result, vast, state)
 
 
+def test_offers_that_were_already_gone_do_not_use_up_the_attempts(tmp_path):
+    # Seen live: two stale offers in a row. They rented nothing, so they do
+    # not count against --max-attempts; boxes that were rented do.
+    behaviour = {1: "stale", 2: "stale", 3: "stale", 4: "bad_gpu", 5: "bad_gpu", 6: "ok", 7: "ok"}
+    result, vast, state = run(tmp_path, behaviour, spare=0, max_attempts=3)
+    assert result.winner.machine_id == 6 and vast.creates == 3
+    assert [a.state for a in result.attempts][:3] == ["refused"] * 3
+    only_winner_left(result, vast, state)
+
+
 def test_a_silent_provider_api_is_not_held_against_the_machine(tmp_path):
     result, vast, state = run(tmp_path, {1: "api_down", 2: "ok"}, spare=0)
     assert result.winner.machine_id == 2

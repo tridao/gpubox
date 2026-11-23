@@ -846,6 +846,11 @@ MUTATIONS = [
      '            _write(config, f"{INCLUDE}\\n\\n{text}" if text else f"{INCLUDE}\\n")',
      '            _write(config, f"{text}\\n{INCLUDE}\\n")',
      'adds_an_entry_for_the_box'),
+    ('refused creates use up the attempts',
+     'launch.py',
+     '        return sum(a.state != "refused" for a in self.attempts.values())',
+     '        return len(self.attempts)',
+     'already_gone_do_not_use_up_the_attempts'),
 ]
 # fmt: on
 
