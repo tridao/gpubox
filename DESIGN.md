@@ -180,17 +180,27 @@ connection drops without that line, it asks the provider whether the box is
 still there and starts again from its offset. So every byte arrives once,
 however often the connection drops.
 
-A job is `lost` when its wrapper is gone and it has no exit code: the
-container restarted, or someone killed it. The wrapper is recognised by its
-pid and its start time, so a process that got its pid after a restart is not
-taken for it. The timeout is kept by the wrapper, on the box, so that it holds
-with nobody connected; it kills the job's process group (TERM, then KILL
-after 10 s) and the exit code is 124.
+The wrapper owns the job's end. At the timeout, kept on the box so that it
+holds with nobody connected, and on `gpubox kill`, which signals the wrapper
+rather than a remembered process group, it sends TERM to its child's process
+group, then KILL to whatever is left after 10 s, and only then writes the exit
+code (124 at the timeout). A job is `lost` when its wrapper is gone and it has
+no exit code: the container restarted, or someone killed the wrapper. A
+wrapper counts as alive by its pid, its start time (so a process that got its
+pid after a restart is not taken for it) and not being a zombie.
 
 The caller's variables go over SSH stdin into a 0600 file in the job's
-directory, which the wrapper reads and deletes before the script starts. They
-are on no command line, here or on the box, and not in the provider's
-instance settings.
+directory. Only the wrapper's child, which then execs the script, reads them,
+and deletes the file; nothing the caller passes can change what the wrapper
+does. They are on no command line, here or on the box, and not in the
+provider's instance settings. The start reports success only once the wrapper
+has started the script; otherwise it deletes the file and fails.
+
+The follower's status line counts only when it is whole and the follower
+exited cleanly: `exit 1` cut short may have been `exit 124`. A connection that
+brought output, or held for 30 s, ends an outage; `--reconnect-min` counts
+from there. Job ids are the start time to the millisecond, so the newest job
+is the last name.
 
 **The container's start.** gpubox sets the container's entrypoint to bash
 (Vast's `onstart` in the args launch mode, which is what its own CLI sends for
@@ -318,6 +328,15 @@ and a full test suite on 2x RTX 5090.
 
 Not yet seen on a real box: a create that got no answer, a delete that did
 not take, and a provider subaccount.
+
+Also on real boxes (RTX 3060s, November 2026): an image whose ENTRYPOINT is
+`ffmpeg` started our sshd, so `onstart` does replace the entrypoint; a
+python:3.12-slim image passed the gate with its CUDA checks skipped; two boxes
+handed over together with the spare destroyed; the image's environment in SSH
+sessions; a job on each box with its index; a job followed across killed
+connections with every byte once and its exit code kept; Ctrl-C leaving the
+job running; the box ending a job at its timeout with nothing left of it; and
+`--destroy-after` (the instance gone 26 s after the job ended).
 
 ## 11. Considered, and decided against
 

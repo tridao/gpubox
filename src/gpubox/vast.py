@@ -306,10 +306,14 @@ def set_expiry_command(expiry: int) -> str:
 # over SSH, which does not inherit it: login shells load it, and so does every
 # command gpubox runs on the box (job.LOAD_ENV). POSIX syntax, so sh can read it.
 ENV_FILE = "/etc/gpubox/env.sh"
+# Written afresh and renamed into place, so it is 0600 whatever the image had there.
 SAVE_ENV = (
     "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; set -o posix; "
-    f"umask 077; export -p > {ENV_FILE})"
+    f"umask 077; rm -f {ENV_FILE}.tmp; export -p > {ENV_FILE}.tmp && mv {ENV_FILE}.tmp {ENV_FILE})"
 )
+# Loads it into a shell on the box. POSIX sh: root's login shell, which runs what ssh
+# is asked to run, need not be bash.
+LOAD_ENV = f"[ -r {ENV_FILE} ] && . {ENV_FILE}; "
 # A job ends its own box with this: the lease timer, which reads the expiry file
 # every 30 s, then destroys it. One way to destroy a box from inside, not two.
 DESTROY_SELF = "/usr/local/bin/gpubox-destroy-self"

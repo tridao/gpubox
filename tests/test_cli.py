@@ -1088,7 +1088,7 @@ def test_wait_without_any_job_says_so(world, tmp_path, local_box):
     vast, run = world
     assert run(UP) == 0
     assert run(["wait"]) == cli.EXIT_CONFIG
-    assert run(["logs", "20260101-000000-abcd"]) == cli.EXIT_CONFIG
+    assert run(["logs", "20260101-000000-000-abcd"]) == cli.EXIT_CONFIG
     assert run(["logs", "../../etc"]) == cli.EXIT_CONFIG
 
 
@@ -1098,3 +1098,69 @@ def test_ssh_runs_a_command_on_the_box(world, tmp_path, local_box):
     argv = ["ssh", "--state-dir", str(tmp_path), "--", "sh", "-c", "exit 5"]
     assert cli.main(argv) == 5
     assert local_box.commands[-1].startswith(job.LOAD_ENV)
+
+
+def test_at_its_timeout_the_whole_job_is_ended_before_its_exit_code_is_written(
+    world, tmp_path, local_box
+):
+    vast, run = world
+    assert run(UP) == 0
+    pids = tmp_path / "descendant.pid"
+    # The script ends on SIGTERM; a child of it ignores SIGTERM and would run on.
+    script = f"sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' & echo $! > {pids}; wait\n"
+    assert run([*job_script(tmp_path, script), "--timeout-min", "0.02"]) == 124
+    descendant = int(pids.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant, 0)
+
+
+def test_the_jobs_variables_cannot_change_what_the_wrapper_does(world, tmp_path, local_box, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    argv = [
+        *job_script(tmp_path, 'echo "[$d] [$limit] [$destroy]"; sleep 3\n'),
+        "--env", "destroy=1", "--env", "limit=0", "--env", f"d={tmp_path}",
+        "--timeout-min", "0.02",
+    ]  # fmt: skip
+    capsys.readouterr()
+    assert run(argv) == 124  # its timeout held
+    assert f"[{tmp_path}] [0] [1]" in capsys.readouterr().out  # the job saw its own values
+    assert not (the_job(tmp_path) / "env").exists()
+
+
+def test_kill_asks_the_wrapper_and_leaves_an_ended_job_alone(world, tmp_path, local_box, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    assert run(job_script(tmp_path, "exit 0\n")) == 0
+    capsys.readouterr()
+    assert run(["kill"]) == 0 and "already ended" in capsys.readouterr().out
+    assert run([*job_script(tmp_path, "sleep 30\n", name="b.sh"), "--detach"]) == 0
+    time.sleep(0.5)
+    assert run(["kill"]) == 0 and "killed: exit 143" in capsys.readouterr().out
+    job_id = sorted(p.name for p in box_dir(tmp_path).iterdir())[-1]
+    assert (box_dir(tmp_path) / job_id / "cancelled").exists()
+
+
+def test_a_start_that_the_box_cannot_carry_out_leaves_no_secrets(
+    world, tmp_path, local_box, monkeypatch
+):
+    vast, run = world
+    assert run(UP) == 0
+    broken = tmp_path / "broken-bin"
+    broken.mkdir()
+    (broken / "setsid").write_text("#!/bin/sh\nexit 1\n")
+    (broken / "setsid").chmod(0o755)
+    local_box.path = f"{broken}:{local_box.path}"
+    monkeypatch.setattr(job, "START_WAIT", 1)
+    monkeypatch.setenv("TOKEN", "s3cr3t")
+    assert run([*job_script(tmp_path, "true\n"), "--env", "TOKEN"]) == cli.EXIT_INFRA
+    assert not (the_job(tmp_path) / "env").exists()
+
+
+def test_a_long_line_on_one_of_several_boxes_is_shown_in_pieces(capsys):
+    import threading
+
+    out = cli.Prefixed("b", threading.Lock())
+    out.write(b"x" * (3 * cli.Prefixed.LONGEST + 5))
+    assert len(out.partial) == 5
+    assert capsys.readouterr().out.count("[b] ") == 3

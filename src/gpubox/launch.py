@@ -409,7 +409,10 @@ class Launch:
             healthy = sum(a.phase == "healthy" for a in self.attempts.values())
             short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
             if not self._possible(offers):
-                why = f"{policy.count} healthy boxes are no longer possible{short}"
+                want = (
+                    f"{policy.count} healthy boxes are" if policy.count > 1 else "a healthy box is"
+                )
+                why = f"{want} no longer possible{short}"
                 return self._give_up(image_said, why)
             out_of_time = time.monotonic() >= deadline
             if not out_of_time:

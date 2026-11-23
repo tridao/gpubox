@@ -662,3 +662,12 @@ def test_the_destroy_self_helper_moves_the_lease_into_the_past(tmp_path):
     expiry.write_text("1795400000\n")
     assert subprocess.run([str(helper)], capture_output=True).returncode == 0
     assert expiry.read_text().strip() == "1"  # the timer acts on its next look
+
+
+def test_the_saved_environment_is_private_even_over_a_file_the_image_had(tmp_path):
+    out = tmp_path / "env.sh"
+    out.write_text("old\n")
+    out.chmod(0o644)
+    save = v.SAVE_ENV.replace(v.ENV_FILE, str(out))
+    assert subprocess.run(["bash", "-c", save], env={"A": "1"}).returncode == 0
+    assert oct(out.stat().st_mode & 0o777) == "0o600" and "export A=" in out.read_text()

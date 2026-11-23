@@ -22,7 +22,7 @@ close the gaps found when comparing the two. Work them in order; each is one or 
   command line). Sent as Vast's `image_login`; the registry is taken from the image name.
   Use a read-only pull token: Vast and the host's docker daemon see it.
 
-## 3. N boxes in one run [R]
+## 3. N boxes in one run [R] (reviewed; checked on real boxes)
 
 - [x] `up --count N`: one run id, one race with `N + --spare` slots, all-or-nothing (a launch
   that cannot get N healthy boxes rolls back like today's). `--max-attempts` defaults to
@@ -32,7 +32,7 @@ close the gaps found when comparing the two. Work them in order; each is one or 
   writes one `Host` entry each. `gpubox status` prints the boxes (alias, address, lease).
   `run` takes `--box I` (`ssh`, `logs` will too); `renew` and `down` act on all of them.
 
-## 4. Detached jobs; ssh in [R] (live check pending: entrypoint override, env, detach)
+## 4. Detached jobs; ssh in [R] (reviewed; checked on real boxes)
 
 - [x] The container's environment (Docker `ENV`, Vast's variables) is saved by the bootstrap
   and loaded by every gpubox command on the box and by login shells, so `ssh` sees the

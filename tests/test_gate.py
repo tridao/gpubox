@@ -108,7 +108,8 @@ def test_the_gate_is_asked_exactly_what_the_reference_launcher_asked(tmp_path, m
     monkeypatch.setattr(gate, "Child", Recorded)
     prober(tmp_path).start_gate(("10.0.0.1", 22), spec)
     argv, kw = calls[0]
-    prefix = REFERENCE["gate"]["remote_prefix"]
+    # The reference ran python3 directly; ours loads the image's environment first.
+    prefix = gate.LOAD_ENV + REFERENCE["gate"]["remote_prefix"]
     assert argv[-1].startswith(prefix)
     (quoted,) = shlex.split(argv[-1][len(prefix) :])  # what the remote shell will pass on
     sent = json.loads(quoted)

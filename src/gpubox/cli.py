@@ -543,8 +543,13 @@ class Prefixed:
     def __init__(self, name: str, lock):
         self.prefix, self.lock, self.partial = f"[{name}] ".encode(), lock, b""
 
+    LONGEST = 1 << 16  # a longer line is shown in pieces, not held back without end
+
     def write(self, data: bytes) -> None:
         *lines, self.partial = (self.partial + data).split(b"\n")
+        while len(self.partial) > self.LONGEST:
+            lines.append(self.partial[: self.LONGEST])
+            self.partial = self.partial[self.LONGEST :]
         if lines:
             with self.lock:
                 for line in lines:
@@ -566,20 +571,16 @@ def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wa
 
     lock = threading.Lock()
     results: dict[int, int] = {}
+    procs: list = []  # the ssh processes following, to stop if we are interrupted
 
     def one(box):
         i, name, w = box
         watch = BoxWatch(args, w)
-        if quiet:
-            out = open(os.devnull, "wb")
-        elif len(boxes) == 1:
-            out = sys.stdout.buffer
-        else:
-            out = Prefixed(name, lock)
+        out = sys.stdout.buffer if len(boxes) == 1 or quiet else Prefixed(name, lock)
         end, _ = job.follow(
-            box_ssh(state_dir, state, w), job_id, out, wait=wait,
-            offset=2**62 if quiet else offset, still_there=watch,
-            patience=args.reconnect_min * 60,
+            box_ssh(state_dir, state, w), job_id, out, wait=wait, quiet=quiet,
+            offset=offset, still_there=watch, patience=args.reconnect_min * 60,
+            started=procs.append,
         )  # fmt: skip
         if isinstance(out, Prefixed):
             out.close()
@@ -593,6 +594,11 @@ def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wa
             while t.is_alive():
                 t.join(0.5)
     except KeyboardInterrupt:
+        for proc in procs:  # our followers, not the job
+            try:
+                proc.kill()
+            except OSError:
+                pass
         where = "" if len(boxes) == 1 and len(state.winners) == 1 else f" --box {boxes[0][0]}"
         log(f"job {job_id} carries on: `gpubox logs -f{where} {job_id}`, "
             f"`gpubox kill{where} {job_id}` to stop it")  # fmt: skip
@@ -620,7 +626,7 @@ def cmd_run(args) -> int:
     started = [b for b in boxes if start_job(args, state_dir, state, b, job_id, script, env)]
     for i, name, _ in started:
         log(f"job {job_id} started on {name}")
-    github_output(job_id=job_id)
+    advisory("writing outputs", github_output, job_id=job_id)
     if len(started) < len(boxes):
         return EXIT_INFRA
     if args.detach:
@@ -641,6 +647,8 @@ def job_of(args, state_dir, state, box) -> str:
         raise InfraError(f"could not ask {box[1]} for its jobs (exit {rc}): {err.strip()[-200:]}")
     if not out.strip():
         raise ConfigError(f"no job on {box[1]}")
+    if not job.JOB_ID.fullmatch(out.strip().splitlines()[-1]):
+        raise InfraError(f"{box[1]} answered with no job id: {out.strip()[-200:]}")
     return out.strip().splitlines()[-1]
 
 
@@ -673,14 +681,14 @@ def cmd_kill(args) -> int:
     state_dir = Path(args.state_dir)
     state, boxes = chosen(state_dir, args)
     job_id = job_of(args, state_dir, state, boxes[0])
-    timeout = job.KILL_GRACE + 30
-    rc, _, err = job.run_remote(
+    timeout = job.KILL_GRACE + 45
+    rc, out, err = job.run_remote(
         box_ssh(state_dir, state, boxes[0][2]), job.kill_command(job_id), timeout=timeout
     )
     if rc != 0:
         log(f"::error::could not kill job {job_id} (exit {rc}): {err.strip()[-200:]}")
         return EXIT_INFRA
-    log(f"job {job_id} killed")
+    log(f"job {job_id}: {out.strip()}")
     return 0
 
 
