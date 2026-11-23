@@ -7,6 +7,9 @@ name = "gpubox"
 version = "0.1.0"
 description = "Rent a verified GPU box from a marketplace, and make sure it is destroyed afterwards"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Tri Dao" }]
 dependencies = []
 
 [project.scripts]
