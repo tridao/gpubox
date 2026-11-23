@@ -38,21 +38,24 @@ import time
 from dataclasses import dataclass, field
 
 from . import policy as pol
+from .errors import ConfigError
 from . import vast as v
 from .gate import GATE_VERSION
 from .state import State, make_tag, parse_tag
 
 
+_sink = None  # where log() sends what it says; None: stdout (api.set_log)
+
+
 def log(msg: str) -> None:
     """Say something. Never raises: a closed pipe must not stop a teardown."""
     try:
-        print(msg, flush=True)
+        if _sink is not None:
+            _sink(msg)
+        else:
+            print(msg, flush=True)
     except Exception:
         pass
-
-
-class ConfigError(RuntimeError):
-    """Our mistake (image, key, arguments): another host cannot help."""
 
 
 @dataclass(frozen=True)

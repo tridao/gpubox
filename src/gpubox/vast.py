@@ -16,6 +16,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .errors import InfraError
+
 API_BASE = "https://console.vast.ai/api"
 MAX_PAGES = 400  # 10,000 instances; a listing longer than this is a loop
 
@@ -36,7 +38,7 @@ MACHINE_ERRORS = (
 _CDI = re.compile(r"\bCDI\b")
 
 
-class VastError(RuntimeError):
+class VastError(InfraError):
     def __init__(self, status: int, msg: str):
         super().__init__(msg)
         self.status = status

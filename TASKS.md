@@ -62,7 +62,7 @@ Partly done: the lease timer destroys a box when its lease ends, and writing a p
 
 ## 7. Python API [R]
 
-- [ ] `gpubox.api`: `up(spec, ...) -> Run` (context manager: `down` on exit unless told to keep),
+- [x] `gpubox.api`: `up(spec, ...) -> Run` (context manager: `down` on exit unless told to keep),
   `Run.boxes -> [Box]`, `Box.ssh_argv(cmd)`, `Box.start(script, env) -> Job`, `Job.wait()`,
   `Job.logs()`, `Run.renew(ttl)`, `Run.down()`, `down(run_id)`, `reap(namespace)`.
   Exceptions instead of exit codes; the CLI is a thin layer over it.

@@ -23,6 +23,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import GpuboxError
+
 NAMESPACE = re.compile(r"[a-z0-9][a-z0-9-]*")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]*\.[A-Za-z0-9][A-Za-z0-9_-]*\.[0-9a-f]{12}")
@@ -34,7 +36,7 @@ _TAG = re.compile(
 STATE = "run.json"
 
 
-class StateError(RuntimeError):
+class StateError(GpuboxError):
     """The state directory cannot be used as asked (locked, live run, no run, unreadable)."""
 
 

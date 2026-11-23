@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fakes import FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
 
-from gpubox import cli, gate, job
+from gpubox import api, cli, gate, job
 from gpubox import policy as pol
 from gpubox import vast as v
 from gpubox.state import State, make_tag, parse_tag, state_lock
@@ -46,7 +46,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     monkeypatch.delenv("GPUBOX_ACCOUNT_ID", raising=False)
     monkeypatch.setattr(cli.v, "Vast", lambda key: vast)
-    monkeypatch.setattr(cli, "Prober", prober)
+    monkeypatch.setattr(api, "Prober", prober)
     monkeypatch.setattr(cli, "Policy", lambda **kw: type(FAST)(**{**FAST.__dict__, **kw}))
 
     def run(argv):
@@ -67,7 +67,7 @@ def fake_ssh(monkeypatch, rc=0, timeout=False, before=None):
                 raise FileNotFoundError(key_dir)
             self.key_dir = key_dir
 
-        def ssh(self, ep, remote):
+        def ssh(self, ep, remote, **kw):
             return ["ssh", str(self.key_dir), f"{ep[0]}:{ep[1]}", remote]
 
     def fake_run(argv, input=None, timeout=None, **kw):
@@ -79,7 +79,7 @@ def fake_ssh(monkeypatch, rc=0, timeout=False, before=None):
         return subprocess.CompletedProcess(argv, fake_run.rc, b"", b"")
 
     fake_run.rc, fake_run.timeout = rc, timeout
-    monkeypatch.setattr(cli, "Prober", FakeSsh)
+    monkeypatch.setattr(api, "Prober", FakeSsh)
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     return calls
 
@@ -118,9 +118,9 @@ def local_box(world, tmp_path, monkeypatch):
     LocalSsh.root, LocalSsh.fail, LocalSsh.commands = tmp_path / "boxes", [], []
     shim = [str(Path(__file__).parent / "bin")] if sh.which("setsid") is None else []
     LocalSsh.path = ":".join([*shim, os.environ["PATH"]])
-    launching = cli.Prober
+    launching = api.Prober
     monkeypatch.setattr(
-        cli,
+        api,
         "Prober",
         lambda key_dir, create=True: (launching(key_dir) if create else LocalSsh(key_dir, create)),
     )
@@ -164,7 +164,7 @@ def test_up_run_down(world, tmp_path, monkeypatch, capsys):
     assert vast.key_dirs == [tmp_path / "keys" / run_id]
 
     keys = []
-    monkeypatch.setattr(cli, "Prober", lambda key_dir, create=True: keys.append(key_dir) or
+    monkeypatch.setattr(api, "Prober", lambda key_dir, create=True: keys.append(key_dir) or
                         LocalSsh(key_dir, create))  # fmt: skip
     LocalSsh.root, LocalSsh.fail = tmp_path / "boxes", []
     LocalSsh.path = ":".join([str(Path(__file__).parent / "bin"), os.environ["PATH"]])
@@ -348,7 +348,7 @@ def test_nothing_after_the_decision_can_fail_the_launch(world, monkeypatch, tmp_
     def boom(*a, **k):
         raise TypeError("len() of NoneType")
 
-    monkeypatch.setattr(cli, "observe", boom)
+    monkeypatch.setattr(api.L, "observe", boom)
     monkeypatch.setattr(cli, "report_result", boom)
     assert run(UP) == 0 and len(vast.ours()) == 1
     assert "run_id=" in out.read_text() and "observations_changed" not in out.read_text()

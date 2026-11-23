@@ -128,6 +128,28 @@ gpubox reap --namespace my-ci --destroy
 to `down` lets the teardown work even from a runner that has lost the state
 directory. Always run `down` after `up`, whatever `up` returned.
 
+## From Python
+
+```python
+import gpubox
+
+spec = gpubox.Spec(image="ghcr.io/org/img:1", gpus=("RTX 5090", "RTX 4090"),
+                   max_dph_per_gpu=1.0, min_cpus=12, min_ram_gb=64, ttl_min=240)
+with gpubox.up(spec, namespace="eval", name="shard", count=4) as run:
+    jobs = run.start(open("shard.sh").read(), env={"TOKEN": token}, timeout_min=180)
+    codes = gpubox.wait_all(jobs)   # exit codes, or the error each ended with
+# the boxes are destroyed when the block ends, however it ends (run.keep() to keep them)
+```
+
+`gpubox.attach(state_dir)` picks up a run left in a state directory (also by
+the command line); `run.boxes[i]` has `ssh_argv`, `sh`, `start`, `job`,
+`jobs`; a `Job` has `wait`, `logs` and `kill`. `gpubox.down(run_id=...)` and
+`gpubox.reap(namespace)` are the teardowns. Failures are exceptions:
+`ConfigError` and `StateError` for our own mistakes, `InfraError` (`NoBoxes`,
+`TeardownIncomplete`, `BoxLost`, `JobLost`) for the provider's or a box's.
+`gpubox.set_log(fn)` sends what it says somewhere other than stdout. The
+command line is a thin layer over this (`gpubox/api.py`).
+
 ## Commands
 
 | | |
