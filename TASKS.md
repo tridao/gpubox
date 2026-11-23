@@ -32,24 +32,24 @@ close the gaps found when comparing the two. Work them in order; each is one or 
   writes one `Host` entry each. `gpubox status` prints the boxes (alias, address, lease).
   `run` takes `--box I` (`ssh`, `logs` will too); `renew` and `down` act on all of them.
 
-## 4. Detached jobs; ssh in [R]
+## 4. Detached jobs; ssh in [R] (live check pending: entrypoint override, env, detach)
 
-- [ ] The container's environment (Docker `ENV`, Vast's variables) is saved by the bootstrap
+- [x] The container's environment (Docker `ENV`, Vast's variables) is saved by the bootstrap
   and loaded by every gpubox command on the box and by login shells, so `ssh` sees the
   image's `PATH`.
-- [ ] `run` starts the script detached on the box (`setsid`, output to a log, exit code to a
+- [x] `run` starts the script detached on the box (`setsid`, output to a log, exit code to a
   file) and then waits by default, streaming the log. A dropped connection or a killed
   `gpubox run` does not stop the job: `run` reconnects and resumes the log from where it
   was; another process can `gpubox logs -f JOB` / `gpubox wait JOB`. `--detach` returns
   the job id at once. `--timeout-min` kills the job's process group on the box (exit 124).
-- [ ] `gpubox ssh [--box I] [-- CMD...]`: an interactive shell or a command, with the run's key,
+- [x] `gpubox ssh [--box I] [-- CMD...]`: an interactive shell or a command, with the run's key,
   no `~/.ssh/config` needed.
 
 ## 5. A job ends its own box
 
 Partly done: the lease timer destroys a box when its lease ends, and writing a past time to
 `/etc/gpubox-expiry` would make it do so within 30 s, but nothing documents or wraps that.
-- [ ] Bootstrap installs `gpubox-destroy-self` (writes 0 to the expiry file; the existing timer
+- [x] Bootstrap installs `gpubox-destroy-self` (writes 0 to the expiry file; the existing timer
   does the deletion, so there is one code path). `run --destroy-after` calls it when the
   script ends, whatever its exit code.
 
@@ -84,9 +84,9 @@ afford to have read: scoped, revocable, ideally short-lived.
 gpubox should not talk to any one manager. It should carry a secret from the controller's
 environment to the job without storing it anywhere else, so `op run -- gpubox run ...`,
 GitHub secrets, Doppler etc. all work the same way:
-- [ ] `--env NAME` (no `=`) takes the value from gpubox's own environment, so it is not on a
+- [x] `--env NAME` (no `=`) takes the value from gpubox's own environment, so it is not on a
   command line or in shell history. `--env-file FILE` reads `NAME=VALUE` lines.
-- [ ] Values travel over SSH stdin into a 0600 file in the job's directory, read by the job's
+- [x] Values travel over SSH stdin into a 0600 file in the job's directory, read by the job's
   shell and deleted as it starts; never into Vast's instance `env`, label or arguments.
 
 ## 10. Interruptible instances [R]

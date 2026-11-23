@@ -429,27 +429,22 @@ def test_the_wire_requests_equal_the_reference_launchers(wire):
 
 
 def same_but_for_the_timer(payload, reference):
-    """The create payload equals the reference launcher's in everything but the timer.
-
-    The reference starts its timer last (`(sleep 60m; until ...) &` just before
-    sshd) and counts a duration; ours starts first and waits for an absolute
-    time. Everything else in the bootstrap, and every other field, is equal.
-    """
+    """The create payload equals the reference launcher's in every field but how the
+    container starts. The reference passed its bootstrap as `args_str` to the image's
+    ENTRYPOINT; ours replaces the ENTRYPOINT with bash (`onstart`) and hands it the
+    bootstrap as arguments, which `test_bootstrap_command_is_one_valid_shell_line`
+    and the tests after it check."""
     ours, theirs = dict(payload), dict(reference)
-    _, _, script = shlex.split(ours.pop("args_str"))
-    _, _, old = shlex.split(theirs.pop("args_str"))
-    timer, rest = script.split(" >/dev/null 2>&1 & ", 1)
-    old_rest, old_tail = old.split("(sleep 60m; ", 1)
-    old_timer, old_sshd = old_tail.split(" >/dev/null 2>&1 & ", 1)
-    assert shlex.quote(v.SELF_DESTROY) in timer and shlex.quote(v.SELF_DESTROY) in old_timer
-    # ... and in where the key is put: a file of our own that sshd is pointed at,
-    # where the reference used root's authorized_keys.
-    expected = (old_rest + old_sshd).replace(
-        "mkdir -p /run/sshd /root/.ssh; chmod 700 /root/.ssh; ", "mkdir -p /run/sshd /etc/ssh; "
+    theirs.pop("args_str")
+    onstart, args = ours.pop("onstart"), ours.pop("args")
+    return (
+        ours == theirs
+        and onstart == "bash"
+        and args[0] == "-c"
+        and len(args) == 2
+        and subprocess.run(["bash", "-n", "-c", args[1]]).returncode == 0
+        and args[1].endswith(f" -o AuthorizedKeysFile={v.KEYS_FILE}")
     )
-    expected = expected.replace("/root/.ssh/authorized_keys", v.KEYS_FILE)
-    expected += f" -o AuthorizedKeysFile={v.KEYS_FILE}"
-    return ours == theirs and rest == expected
 
 
 def test_offers_in_an_excluded_country_are_dropped_and_unknown_locations_kept():
@@ -635,3 +630,35 @@ def test_a_registry_login_is_whole_and_one_word_each(user, token):
     with pytest.raises(ValueError):
         Spec(image="i", gpus=("H100",), max_dph_per_gpu=1, registry_user=user,
              registry_token=token)  # fmt: skip
+
+
+def test_the_container_command_replaces_the_images_entrypoint():
+    payload = v.create_payload(SPEC, "L", "KEY", 1795400000)
+    assert payload["onstart"] == "bash" and payload["args"][0] == "-c"
+    assert payload["args"][1] == v.bootstrap_script("KEY", 1795400000)
+    assert "args_str" not in payload
+
+
+def test_the_bootstrap_saves_the_containers_environment_for_ssh(tmp_path):
+    out = tmp_path / "env.sh"
+    save = v.SAVE_ENV.replace(v.ENV_FILE, str(out))
+    assert save in v.bootstrap_script("KEY", 1795400000).replace(v.ENV_FILE, str(out))
+    env = {"PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/root", "TRICKY": 'a\'b "c" $d\ne'}
+    assert subprocess.run(["bash", "-c", save], env=env).returncode == 0
+    assert oct(out.stat().st_mode & 0o777) == "0o600"
+    r = subprocess.run(["sh", "-c", f'. {out}; printf "%s|%s|%s" "$PATH" "$TRICKY" "${{HOME-x}}"'],
+                       capture_output=True, text=True, env={})  # fmt: skip
+    assert r.stdout == '/opt/venv/bin:/usr/bin:/bin|a\'b "c" $d\ne|x'  # HOME is ssh's to set
+
+
+def test_the_destroy_self_helper_moves_the_lease_into_the_past(tmp_path):
+    script = v.bootstrap_script("KEY", 1795400000)
+    expiry, helper = tmp_path / "expiry", tmp_path / "gpubox-destroy-self"
+    line = next(p for p in script.split("; ") if p.endswith(f"> {v.DESTROY_SELF}"))
+    line = line.replace(v.DESTROY_SELF, str(helper))
+    assert subprocess.run(["bash", "-c", line]).returncode == 0
+    helper.write_text(helper.read_text().replace(v.EXPIRY_FILE, str(expiry)))
+    helper.chmod(0o755)
+    expiry.write_text("1795400000\n")
+    assert subprocess.run([str(helper)], capture_output=True).returncode == 0
+    assert expiry.read_text().strip() == "1"  # the timer acts on its next look

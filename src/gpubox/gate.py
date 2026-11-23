@@ -206,7 +206,11 @@ class Prober:
             )
         self.pubkey = self.key.with_name(self.key.name + ".pub").read_text().strip()
 
-    def ssh(self, ep: tuple[str, int], remote: str, *, connect_timeout: int = 10) -> list[str]:
+    def ssh(
+        self, ep: tuple[str, int], remote: str | None, *, connect_timeout: int = 10, tty=None
+    ) -> list[str]:
+        """ssh's argv for `remote` on the box; None for a login shell. `tty`: True to ask
+        for a terminal, False to refuse one, None to let ssh decide."""
         opts = {
             "BatchMode": "yes",
             "IdentitiesOnly": "yes",
@@ -224,9 +228,11 @@ class Prober:
         # -F /dev/null: nothing from the user's or the system's ssh_config
         # (SendEnv, extra identities, proxies) applies to these connections.
         argv = ["ssh", "-F", "/dev/null", "-i", str(self.key), "-p", str(ep[1])]
+        if tty is not None:
+            argv.append("-t" if tty else "-T")
         for k, v in opts.items():
             argv += ["-o", f"{k}={v}"]
-        return [*argv, f"root@{ep[0]}", remote]
+        return [*argv, f"root@{ep[0]}", *([] if remote is None else [remote])]
 
     def run(self, ep: tuple[str, int], remote: str, timeout: float = 60) -> int:
         """Run a short command on the box and wait for it. Returns ssh's exit code, 255 if

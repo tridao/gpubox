@@ -27,6 +27,7 @@ In CI, pin a commit: the job that runs gpubox holds your Vast key.
 gpubox up --gpu "RTX 4090" --max-dph-per-gpu 0.60 --image my/image:tag \
     --namespace dev --name mybox --ttl-min 480 --ssh-config
 ssh mybox                      # also scp, rsync, editors
+gpubox ssh -- nvidia-smi       # the same with the run's key, no ~/.ssh/config needed
 gpubox renew --ttl-min 480     # the lease now ends 8 hours from now
 gpubox down
 ```
@@ -49,6 +50,45 @@ the host's docker daemon see the token, so make it a read-only pull token.
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 
+## Jobs
+
+```bash
+gpubox run --script train.sh --env WANDB_API_KEY --timeout-min 600
+```
+
+`run` starts the script on the box in a session of its own and streams its
+output. The job does not depend on the connection: a dropped connection is
+picked up where it was (for up to `--reconnect-min`, 10), and Ctrl-C stops
+the streaming, not the job. `--detach` prints the job id and returns at once.
+Then:
+
+```bash
+gpubox logs -f [JOB]           # its output, until it ends; its exit code
+gpubox wait [JOB]              # just the exit code
+gpubox jobs                    # every job on the box: exit code, running or lost
+gpubox kill [JOB]
+```
+
+(`JOB` defaults to the newest.) The box itself ends a job at `--timeout-min`
+(default 60; 0 for never), with exit 124. `--destroy-after` destroys the box
+when the script ends; a job can also run `gpubox-destroy-self` on the box
+whenever it is done.
+
+The job sees the image's environment (Docker `ENV`, saved when the box
+starts; so do `ssh` sessions), then `--env` variables, then `GPUBOX_RUN_ID`,
+`GPUBOX_JOB`, `GPUBOX_BOX_INDEX`, `GPUBOX_BOX_COUNT` and `GPUBOX_BOX_NAME`.
+gpubox replaces the image's `ENTRYPOINT` to start its own sshd and timer: a
+job that needs the entrypoint's setup runs it itself
+(`exec /entrypoint.sh python -m my.job`).
+
+**Secrets.** `--env NAME` (no `=`) takes the value from gpubox's own
+environment, so it is on no command line: `op run -- gpubox run ...`, a CI
+secret, Doppler and the like all work the same way. `--env-file FILE` reads
+`NAME=VALUE` lines. Values go over SSH into a file only root can read, which
+the job reads and deletes as it starts; they are never in Vast's instance
+settings. The host's operator has root on the machine, so send only
+credentials you can revoke: scoped, short-lived where possible.
+
 ## Several boxes
 
 ```bash
@@ -57,6 +97,7 @@ gpubox up --count 4 --gpu "RTX 5090" --max-dph-per-gpu 0.80 --image my/image:tag
 gpubox status                  # shard-0 ... shard-3: addresses, lease
 ssh shard-2
 gpubox run --box 2 --script job.sh
+gpubox run --all --script shard.sh   # on every box: $GPUBOX_BOX_INDEX says which
 gpubox down                    # all of them
 ```
 
@@ -93,7 +134,12 @@ directory. Always run `down` after `up`, whatever `up` returned.
 |---|---|
 | `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate |
 | `status` | show the run's boxes: names, addresses, lease |
-| `run` | run a local script on a box over SSH, streaming its output |
+| `run` | start a local script on a box, detached, and stream its output |
+| `logs` | a job's output (`-f`: until it ends) |
+| `wait` | wait for a job to end |
+| `jobs` | the jobs on a box |
+| `kill` | stop a job |
+| `ssh` | a shell on a box, or `-- CMD` run there |
 | `renew` | move the end of the boxes' lease |
 | `down` | destroy everything the run rented |
 | `reap` | destroy boxes of a namespace whose lease has ended (without `--destroy`: report) |
@@ -101,8 +147,9 @@ directory. Always run `down` after `up`, whatever `up` returned.
 
 Exit codes: 0 ok; 2 configuration (bad arguments, no API key, an image that
 cannot be pulled or does not start our sshd); 75 infrastructure (no healthy
-box, box lost mid-run, teardown not confirmed); 124 script timeout. `run`
-otherwise returns the script's own exit code.
+box, box lost mid-run, teardown not confirmed); 124 script timeout; 130
+interrupted. `run`, `wait` and `logs -f` otherwise return the job's own exit
+code.
 
 State lives in `--state-dir` (default `.gpubox`): `run.json`, an SSH key per
 run, and `observations.jsonl`.

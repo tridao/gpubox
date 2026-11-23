@@ -409,23 +409,26 @@ class Launch:
             healthy = sum(a.phase == "healthy" for a in self.attempts.values())
             short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
             if not self._possible(offers):
-                if image_said and self._only_image_evidence():
-                    raise ConfigError(image_said)
-                log(f"giving up: {policy.count} healthy boxes are no longer possible{short}")
-                return None
+                why = f"{policy.count} healthy boxes are no longer possible{short}"
+                return self._give_up(image_said, why)
             out_of_time = time.monotonic() >= deadline
             if not out_of_time:
                 self._rent(offers, deadline)
             if out_of_time or not self._worth_waiting(offers, deadline):
-                if image_said and self._only_image_evidence():
-                    raise ConfigError(image_said)
-                log(
-                    f"giving up: not enough healthy boxes within {policy.overall_timeout:g}s{short}"
+                why = (
+                    f"not enough healthy boxes within {policy.overall_timeout:g}s{short}"
                     if out_of_time
-                    else f"giving up: nothing left to try{short}"
+                    else f"nothing left to try{short}"
                 )
-                return None
+                return self._give_up(image_said, why)
             time.sleep(policy.poll)
+
+    def _give_up(self, image_said: str | None, why: str) -> None:
+        """End the race without winners: as a configuration error if a host's word
+        against the image is all there is to go on, else as no box."""
+        if image_said and self._only_image_evidence():
+            raise ConfigError(image_said)
+        log(f"giving up: {why}")
 
     def _drop_old_drivers(self, offers: collections.deque) -> collections.deque:
         """The offers whose driver supports the CUDA version a gate said the image needs.
@@ -539,7 +542,7 @@ class Launch:
                 # pulled: this box fails, and a second host settles it.
                 said = (
                     f"image {spec.image!r} is running, but its sshd refuses the run's key: it "
-                    "does not seem to run gpubox's start-up command (an ENTRYPOINT of its own?)"
+                    "does not seem to run gpubox's start-up command"
                 )
                 self._fail(a, None, said)
                 return said

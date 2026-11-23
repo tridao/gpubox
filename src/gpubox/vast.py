@@ -302,8 +302,28 @@ def set_expiry_command(expiry: int) -> str:
     return f"echo {expiry} > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE}"
 
 
-def bootstrap_command(pubkey: str, expiry: int) -> str:
-    """Container command: a self-destruct timer, then sshd for our key.
+# The container's environment (Docker's ENV, Vast's variables), saved for what runs
+# over SSH, which does not inherit it: login shells load it, and so does every
+# command gpubox runs on the box (job.LOAD_ENV). POSIX syntax, so sh can read it.
+ENV_FILE = "/etc/gpubox/env.sh"
+SAVE_ENV = (
+    "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; set -o posix; "
+    f"umask 077; export -p > {ENV_FILE})"
+)
+# A job ends its own box with this: the lease timer, which reads the expiry file
+# every 30 s, then destroys it. One way to destroy a box from inside, not two.
+DESTROY_SELF = "/usr/local/bin/gpubox-destroy-self"
+DESTROY_SELF_SCRIPT = (
+    "#!/bin/sh",
+    "# Ends this box: its lease timer destroys it within 30 s.",
+    f"echo 1 > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE} &&",
+    'echo "gpubox: this box will be destroyed within 30 s" >&2',
+)
+
+
+def bootstrap_script(pubkey: str, expiry: int) -> str:
+    """The container's command, as one line of bash: a self-destruct timer, then the
+    container's environment saved, the self-destroy helper installed, and sshd for our key.
 
     The timer is a dead-man switch that needs neither the launcher nor our API
     key. It has to destroy the instance: merely exiting does not stop the
@@ -319,6 +339,9 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
     that is not a number of at most ten digits falls back to that first expiry. Once the time has
     passed, the delete is sent every 30 s for as long as the timer runs,
     whatever the answers say: if it works, the loop ends with the box.
+
+    It is the container's entrypoint (`create_payload`), so an image's own
+    ENTRYPOINT does not run first; a job that wants it runs it itself.
     """
     check_expiry(expiry)
     watchdog = (
@@ -338,7 +361,14 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
                 "if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq"
                 " && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
                 " --no-install-recommends openssh-server; fi",
-                "mkdir -p /run/sshd /etc/ssh",
+                "mkdir -p /run/sshd /etc/ssh /etc/gpubox /etc/profile.d /usr/local/bin",
+                SAVE_ENV,
+                f"echo {shlex.quote(f'[ -r {ENV_FILE} ] && . {ENV_FILE}')}"
+                " > /etc/profile.d/gpubox-env.sh",
+                "printf '%s\\n' "
+                + " ".join(shlex.quote(line) for line in DESTROY_SELF_SCRIPT)
+                + f" > {DESTROY_SELF}",
+                f"chmod 755 {DESTROY_SELF}",
                 f"printf '%s\\n' {shlex.quote(pubkey)} > {KEYS_FILE}",
                 f"chmod 600 {KEYS_FILE}",
                 "ssh-keygen -A >/dev/null",
@@ -348,7 +378,12 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
             ]
         )
     )
-    return "bash -c " + shlex.quote(script)
+    return script
+
+
+def bootstrap_command(pubkey: str, expiry: int) -> str:
+    """The bootstrap as one shell command line, for a person to read or run."""
+    return "bash -c " + shlex.quote(bootstrap_script(pubkey, expiry))
 
 
 def registry_of(image: str) -> str:
@@ -368,7 +403,10 @@ def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
         "target_state": "running",
         "runtype": "args",
         "env": {"-p 22:22": "1"},
-        "args_str": bootstrap_command(pubkey, expiry),
+        # In the args launch mode, `onstart` replaces the image's ENTRYPOINT (as
+        # `vastai create instance --entrypoint` sends it) and `args` are its arguments.
+        "onstart": "bash",
+        "args": ["-c", bootstrap_script(pubkey, expiry)],
     }
     if spec.registry_user is not None:
         # Vast's form: `docker login` arguments, in one string.

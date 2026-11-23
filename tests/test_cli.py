@@ -1,6 +1,7 @@
 """The commands end to end, against the fake provider and a fake ssh."""
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 from fakes import FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
 
-from gpubox import cli, gate
+from gpubox import cli, gate, job
 from gpubox import policy as pol
 from gpubox import vast as v
 from gpubox.state import State, make_tag, parse_tag, state_lock
@@ -69,18 +70,67 @@ def fake_ssh(monkeypatch, rc=0, timeout=False, before=None):
         def ssh(self, ep, remote):
             return ["ssh", str(self.key_dir), f"{ep[0]}:{ep[1]}", remote]
 
-    def fake_run(argv, input=None, timeout=None):
+    def fake_run(argv, input=None, timeout=None, **kw):
         calls.append((argv, input))
         if before:
             before()
         if fake_run.timeout:
             raise subprocess.TimeoutExpired(argv, timeout)
-        return subprocess.CompletedProcess(argv, fake_run.rc)
+        return subprocess.CompletedProcess(argv, fake_run.rc, b"", b"")
 
     fake_run.rc, fake_run.timeout = rc, timeout
     monkeypatch.setattr(cli, "Prober", FakeSsh)
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     return calls
+
+
+class LocalSsh:
+    """ssh to a box that is this machine: the remote command runs in a local bash, each
+    box with a jobs directory of its own. `fail` holds what the next connections, other
+    than a job's start, do instead: "down" (cannot connect) or an int (the connection drops after that many
+    bytes of output, before the follower can say how the job ended)."""
+
+    root: Path
+    fail: list = []
+    commands: list = []
+
+    def __init__(self, key_dir, create=True):
+        if not create and not (key_dir / "id_ed25519").exists():
+            raise FileNotFoundError(key_dir)
+
+    def ssh(self, ep, remote, **kw):
+        LocalSsh.commands.append(remote)
+        env = ["env", f"GPUBOX_JOBS={LocalSsh.root / ep[0]}", f"PATH={LocalSsh.path}"]
+        if LocalSsh.fail and remote != "bash -s":  # a job's start is not interfered with
+            what = LocalSsh.fail.pop(0)
+            if what == "down":
+                return ["sh", "-c", "echo 'ssh: connect to host: Connection refused' >&2; exit 255"]
+            return [*env, "bash", "-c", f"({remote}) 2>/dev/null | head -c {what}; exit 255"]
+        return [*env, "bash", "-c", remote]
+
+
+@pytest.fixture
+def local_box(world, tmp_path, monkeypatch):
+    """`run` and the job commands against boxes that are this machine (see LocalSsh);
+    `up` keeps the fake provider's prober."""
+    import shutil as sh
+
+    LocalSsh.root, LocalSsh.fail, LocalSsh.commands = tmp_path / "boxes", [], []
+    shim = [str(Path(__file__).parent / "bin")] if sh.which("setsid") is None else []
+    LocalSsh.path = ":".join([*shim, os.environ["PATH"]])
+    launching = cli.Prober
+    monkeypatch.setattr(
+        cli,
+        "Prober",
+        lambda key_dir, create=True: (launching(key_dir) if create else LocalSsh(key_dir, create)),
+    )
+    monkeypatch.setattr(job, "KILL_GRACE", 1)
+    return LocalSsh
+
+
+def box_dir(tmp_path, n=1):
+    """The jobs directory of the box on machine n."""
+    return tmp_path / "boxes" / f"10.0.0.{n}"
 
 
 def script(tmp_path):
@@ -113,14 +163,17 @@ def test_up_run_down(world, tmp_path, monkeypatch, capsys):
     assert 89 * 60 < tag.expiry - time.time() <= 90 * 60  # the default --ttl-min
     assert vast.key_dirs == [tmp_path / "keys" / run_id]
 
-    (tmp_path / "s.sh").write_text("echo hi\n")
-    calls = fake_ssh(monkeypatch, rc=7)
+    keys = []
+    monkeypatch.setattr(cli, "Prober", lambda key_dir, create=True: keys.append(key_dir) or
+                        LocalSsh(key_dir, create))  # fmt: skip
+    LocalSsh.root, LocalSsh.fail = tmp_path / "boxes", []
+    LocalSsh.path = ":".join([str(Path(__file__).parent / "bin"), os.environ["PATH"]])
+    (tmp_path / "s.sh").write_text('echo "hi $GREETING"; exit 7\n')
     argv = ["run", "--script", str(tmp_path / "s.sh"), "--env", "GREETING=it's $HOME; x"]
+    capsys.readouterr()
     assert run(argv) == 7
-    ssh_argv, sent = calls[0]
-    assert sent.decode() == "export GREETING='it'\"'\"'s $HOME; x'\necho hi\n"
-    assert ssh_argv[1] == str(tmp_path / "keys" / run_id)  # this run's key, no other
-    assert "mktemp /tmp/gpubox-script." in ssh_argv[-1] and "</dev/null" in ssh_argv[-1]
+    assert "hi it's $HOME; x\n" in capsys.readouterr().out
+    assert set(keys) == {tmp_path / "keys" / run_id}  # this run's key, no other
 
     assert run(["down"]) == 0
     assert vast.ours() == [] and foreign_untouched(vast)
@@ -144,7 +197,7 @@ def test_the_quack_ci_flags_send_what_the_reference_launcher_sent(world):
     for payload in vast.payloads:
         tag = parse_tag(payload["label"])
         assert 59 * 60 < tag.expiry - time.time() <= 60 * 60  # --ttl-min 60
-        assert f"echo {tag.expiry} > /etc/gpubox-expiry" in payload["args_str"]  # the timer's time
+        assert f"echo {tag.expiry} > /etc/gpubox-expiry" in payload["args"][1]  # the timer's time
         assert same_but_for_the_timer({**payload, "label": "LABEL"}, REFERENCE["create"]["body"])
     want = REFERENCE["gate"]["want"]
     for spec in vast.probers[0].wants:
@@ -618,11 +671,13 @@ def test_run_rejects_malformed_env(world, tmp_path):
         assert run([*script(tmp_path), "--env", bad]) == cli.EXIT_CONFIG
 
 
-def test_run_timeout(world, tmp_path, monkeypatch):
+def test_the_box_ends_a_job_at_its_timeout(world, tmp_path, local_box):
     _, run = world
     assert run(UP) == 0
-    fake_ssh(monkeypatch, timeout=True)
-    assert run(script(tmp_path)) == cli.EXIT_TIMEOUT
+    (tmp_path / "s.sh").write_text("echo started; sleep 30; echo never\n")
+    t0 = time.monotonic()
+    assert run(["run", "--script", str(tmp_path / "s.sh"), "--timeout-min", "0.02"]) == 124
+    assert time.monotonic() - t0 < 10
 
 
 def test_a_box_the_provider_says_is_over_is_recorded_as_died(world, tmp_path, monkeypatch):
@@ -837,7 +892,7 @@ def test_a_registry_login_takes_its_token_from_the_environment(world, monkeypatc
 
 
 def test_several_boxes_are_named_listed_and_each_reachable(
-    world, tmp_path, ssh_dir, capsys, monkeypatch
+    world, tmp_path, ssh_dir, capsys, local_box
 ):
     vast, run = world
     vast.behaviour.update({1: "ok", 2: "ok", 3: "ok"})
@@ -857,13 +912,17 @@ def test_several_boxes_are_named_listed_and_each_reachable(
     status = capsys.readouterr().out
     assert "2 box(es)" in status and "77-1-0" in status and "77-1-1" in status
 
-    calls = fake_ssh(monkeypatch, rc=0)
-    assert run(script(tmp_path)) == cli.EXIT_CONFIG  # which box?
-    assert calls == []
-    assert run([*script(tmp_path), "--box", "1"]) == 0
+    (tmp_path / "which.sh").write_text('echo "box $GPUBOX_BOX_INDEX of $GPUBOX_BOX_COUNT"\n')
+    which = ["run", "--script", str(tmp_path / "which.sh")]
+    assert run(which) == cli.EXIT_CONFIG  # which box?
+    assert local_box.commands == []
+    capsys.readouterr()
+    assert run([*which, "--box", "1"]) == 0
+    assert "box 1 of 2\n" in capsys.readouterr().out
     w = state.winners[1]
-    assert calls[0][0][2] == f"{w['host']}:{w['port']}"
-    assert run([*script(tmp_path), "--box", "2"]) == cli.EXIT_CONFIG
+    machine = w["host"].rsplit(".", 1)[1]
+    assert len(list(box_dir(tmp_path, machine).iterdir())) == 1  # on that box, no other
+    assert run([*which, "--box", "2"]) == cli.EXIT_CONFIG
 
 
 def test_status_of_a_directory_without_a_run(world, capsys):
@@ -893,3 +952,149 @@ def test_a_box_named_like_another_runs_box_replaces_only_that_entry(tmp_path, ss
     sshconfig.add("a.x.000000000003", [("shard-1", "10.0.0.7", 7)], k, h)
     text = (ssh_dir / "gpubox_config").read_text()
     assert "# gpubox run a.shard.000000000001" not in text  # nothing of it left: block gone
+
+
+# ------------------------------------------------------------- detached jobs
+
+
+def job_script(tmp_path, text, name="job.sh"):
+    (tmp_path / name).write_text(text)
+    return ["run", "--script", str(tmp_path / name)]
+
+
+def the_job(tmp_path, n=1):
+    (d,) = box_dir(tmp_path, n).iterdir()
+    return d
+
+
+def test_a_dropped_connection_is_picked_up_where_it_was(world, tmp_path, local_box, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    local_box.fail = [5, "down", 3]  # drop after 5 bytes; refused; drop after 3
+    lines = "".join(f"line {i}\n" for i in range(50))
+    argv = job_script(tmp_path, f"printf '%s' '{lines}'; sleep 0.5; exit 3\n")
+    capsys.readouterr()
+    monkeypatch_retry = pytest.MonkeyPatch()
+    monkeypatch_retry.setattr(job.time, "sleep", lambda s: None)
+    try:
+        assert run(argv) == 3
+    finally:
+        monkeypatch_retry.undo()
+    out = capsys.readouterr().out
+    assert lines in out and out.count("line ") == 50  # every byte, once
+
+
+def test_a_detached_job_is_waited_for_and_read_later(world, tmp_path, local_box, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    capsys.readouterr()
+    assert run([*job_script(tmp_path, "sleep 1; echo done; exit 4\n"), "--detach"]) == 0
+    job_id = capsys.readouterr().out.strip().splitlines()[-1]
+    assert job.JOB_ID.fullmatch(job_id)
+    assert not (the_job(tmp_path) / "exit").exists()  # it runs without us
+    assert run(["wait"]) == 4  # the newest job
+    capsys.readouterr()
+    assert run(["logs", job_id]) == 4 and "done\n" in capsys.readouterr().out
+    assert run(["jobs"]) == 0 and f"{job_id} exit 4" in capsys.readouterr().out
+
+
+def test_logs_of_a_running_job_print_what_there_is(world, tmp_path, local_box, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    assert run([*job_script(tmp_path, "echo early; sleep 30\n"), "--detach"]) == 0
+    time.sleep(0.5)
+    capsys.readouterr()
+    assert run(["logs"]) == 0 and "early\n" in capsys.readouterr().out
+    assert run(["jobs"]) == 0 and " running" in capsys.readouterr().out
+    t0 = time.monotonic()
+    assert run(["kill"]) == 0 and time.monotonic() - t0 < 10
+    assert run(["wait"]) == 128 + 15  # SIGTERM
+
+
+def test_a_job_whose_wrapper_died_is_lost_not_waited_for_forever(world, tmp_path, local_box):
+    # As when the container restarts under it: no exit code will ever be written.
+    vast, run = world
+    assert run(UP) == 0
+    assert run([*job_script(tmp_path, "sleep 30\n"), "--detach"]) == 0
+    time.sleep(0.5)
+    d = the_job(tmp_path)
+    os.kill(int((d / "wpid").read_text().split()[0]), 9)
+    os.killpg(int((d / "pid").read_text()), 9)
+    assert run(["wait"]) == cli.EXIT_INFRA
+
+
+def test_a_job_can_destroy_its_box_when_it_ends(world, tmp_path, local_box, monkeypatch):
+    vast, run = world
+    assert run(UP) == 0
+    marker = tmp_path / "destroyed"
+    helper = tmp_path / "destroy-self"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    helper.chmod(0o755)
+    monkeypatch.setattr(cli.v, "DESTROY_SELF", str(helper))
+    assert run([*job_script(tmp_path, "exit 9\n"), "--destroy-after"]) == 9
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists()
+
+
+def test_secrets_reach_the_job_and_nothing_else(world, tmp_path, local_box, monkeypatch, capsys):
+    vast, run = world
+    assert run(UP) == 0
+    monkeypatch.setenv("MY_TOKEN", "s3cr3t 'quoted' $NOT")
+    (tmp_path / "vars.env").write_text("# comment\nFROM_FILE=a b\nexport QUOTED='x y'\n")
+    argv = [
+        *job_script(tmp_path, 'echo "[$MY_TOKEN] [$FROM_FILE] [$QUOTED] [$GPUBOX_BOX_NAME]"\n'),
+        "--env", "MY_TOKEN", "--env-file", str(tmp_path / "vars.env"),
+    ]  # fmt: skip
+    capsys.readouterr()
+    assert run(argv) == 0
+    assert "[s3cr3t 'quoted' $NOT] [a b] [x y] [77-1]" in capsys.readouterr().out
+    assert all("s3cr3t" not in c for c in local_box.commands)  # never on a command line
+    d = the_job(tmp_path)
+    assert not (d / "env").exists()  # deleted once read
+    assert all("s3cr3t" not in f.read_text() for f in d.iterdir() if f.name != "log")
+    monkeypatch.delenv("MY_TOKEN")
+    assert run([*job_script(tmp_path, "true\n"), "--env", "MY_TOKEN"]) == cli.EXIT_CONFIG
+
+
+def test_a_job_on_every_box_is_followed_on_each_and_its_worst_end_returned(
+    world, tmp_path, local_box, capsys
+):
+    vast, run = world
+    vast.behaviour.update({1: "ok", 2: "ok"})
+    assert run([*UP, "--count", "2"]) == 0
+    capsys.readouterr()
+    argv = job_script(tmp_path, 'echo "hello from $GPUBOX_BOX_INDEX"; exit $GPUBOX_BOX_INDEX\n')
+    assert run([*argv, "--all"]) == 1
+    out = capsys.readouterr().out
+    assert "[77-1-0] hello from 0\n" in out and "[77-1-1] hello from 1\n" in out
+
+
+def test_a_box_that_is_gone_ends_the_wait(world, tmp_path, local_box, monkeypatch):
+    vast, run = world
+    assert run(UP) == 0
+    assert run([*job_script(tmp_path, "sleep 30\n"), "--detach"]) == 0
+    job_id = the_job(tmp_path).name
+    vast.live.pop(vast.ours()[0])  # destroyed by someone else
+    local_box.fail = ["down"] * 100
+    monkeypatch.setattr(job.time, "sleep", lambda s: None)
+    assert run(["wait", job_id]) == cli.EXIT_INFRA
+    assert observations(tmp_path) == [("healthy", None)]  # gone says nothing of the machine
+    assert run(["wait"]) == cli.EXIT_INFRA  # which job is the newest cannot be asked either
+
+
+def test_wait_without_any_job_says_so(world, tmp_path, local_box):
+    vast, run = world
+    assert run(UP) == 0
+    assert run(["wait"]) == cli.EXIT_CONFIG
+    assert run(["logs", "20260101-000000-abcd"]) == cli.EXIT_CONFIG
+    assert run(["logs", "../../etc"]) == cli.EXIT_CONFIG
+
+
+def test_ssh_runs_a_command_on_the_box(world, tmp_path, local_box):
+    vast, run = world
+    assert run(UP) == 0
+    argv = ["ssh", "--state-dir", str(tmp_path), "--", "sh", "-c", "exit 5"]
+    assert cli.main(argv) == 5
+    assert local_box.commands[-1].startswith(job.LOAD_ENV)

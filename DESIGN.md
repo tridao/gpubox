@@ -163,6 +163,45 @@ starts sshd reading only that file. Root's `authorized_keys` cannot be used:
 Vast replaces it with the account's registered key as the container starts.
 Each run has its own key pair, removed when the run is closed.
 
+## 5a. Jobs
+
+A job is a script started on the box in a session of its own (`setsid`), by a
+small wrapper that waits for it and writes its exit code to a file. Nothing
+that happens to an SSH connection reaches it, so a dropped connection, a
+killed `gpubox run` or a cancelled CI step leaves it running; `down` or the
+lease end it with the box. Its directory, `/var/lib/gpubox/jobs/<id>/`, holds
+the script, the log, the wrapper's pid and start time, the job's process
+group, and once it has ended its exit code.
+
+The controller follows a job with a program on the box that prints the log
+from a byte offset and ends with one status line on stderr (an exit code,
+`running`, `lost` or `none`). The controller counts the bytes it has; when a
+connection drops without that line, it asks the provider whether the box is
+still there and starts again from its offset. So every byte arrives once,
+however often the connection drops.
+
+A job is `lost` when its wrapper is gone and it has no exit code: the
+container restarted, or someone killed it. The wrapper is recognised by its
+pid and its start time, so a process that got its pid after a restart is not
+taken for it. The timeout is kept by the wrapper, on the box, so that it holds
+with nobody connected; it kills the job's process group (TERM, then KILL
+after 10 s) and the exit code is 124.
+
+The caller's variables go over SSH stdin into a 0600 file in the job's
+directory, which the wrapper reads and deletes before the script starts. They
+are on no command line, here or on the box, and not in the provider's
+instance settings.
+
+**The container's start.** gpubox sets the container's entrypoint to bash
+(Vast's `onstart` in the args launch mode, which is what its own CLI sends for
+`--entrypoint`) with the bootstrap as its arguments. An image's own
+ENTRYPOINT would otherwise run first, with the bootstrap as its arguments, and
+one that does not end in `exec "$@"` never starts our sshd. The bootstrap also
+saves the container's environment, which sessions over SSH do not inherit, to
+`/etc/gpubox/env.sh` (POSIX syntax; login shells and every gpubox command on
+the box load it), and installs `gpubox-destroy-self`, which writes a past time
+to the expiry file: the lease timer destroys the box within 30 s.
+
 ## 6. Teardown
 
 `down` works in rounds for up to a minute: a short delete-and-lookup round

@@ -2,7 +2,12 @@
 
     up      rent boxes and wait until they are reachable and pass the health gate
     status  show the run's boxes: names, addresses, lease
-    run     run a local script on a box over SSH, streaming its output
+    run     start a local script on a box, detached, and follow its output
+    logs    print a job's output (-f: until it ends)
+    wait    wait for a job to end
+    jobs    list the jobs on a box
+    kill    stop a job
+    ssh     a shell on a box, or a command run there
     renew   move the end of the boxes' lease
     down    destroy everything this state directory's run rented
     reap    report, or destroy, boxes of a namespace whose lease has ended
@@ -10,8 +15,9 @@
 
 Exit codes: 0 ok; 2 configuration (image cannot be pulled, no API key, state
 directory in use, bad arguments); 75 infrastructure (no healthy box, box lost
-mid-run, teardown not confirmed); 124 script timeout. `run` otherwise returns
-the script's own exit code, except that 255 is taken for a lost connection.
+mid-run, teardown not confirmed); 124 script timeout; 130 interrupted (a job
+goes on regardless). `run`, `wait` and `logs -f` otherwise return the job's own
+exit code.
 
 The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
@@ -37,6 +43,7 @@ from pathlib import Path
 
 from . import policy as pol
 from . import sshconfig
+from . import job
 from . import store as st
 from . import vast as v
 from .gate import GATE_VERSION, Prober
@@ -402,72 +409,295 @@ def live_box(state_dir: Path, box: int | None = None) -> tuple[State, dict]:
     return state, ws[box]
 
 
+class InfraError(RuntimeError):
+    """A box could not be reached or did not do what it was asked."""
+
+
+def box_ssh(state_dir: Path, state: State, w: dict):
+    """remote command -> ssh argv, for one box of the run, with the run's key."""
+    try:
+        prober = Prober(key_dir(state_dir, state.run), create=False)
+    except FileNotFoundError:
+        raise StateError(f"run {state.run} has no SSH key in {state_dir} (torn down?)") from None
+    return lambda remote, **kw: prober.ssh((w["host"], w["port"]), remote, **kw)
+
+
+def chosen(state_dir: Path, args) -> tuple[State, list[tuple[int, str, dict]]]:
+    """The run and the boxes a command is for: (index, name, box) for `--box I`, the only
+    box, or with `--all` every box."""
+    state = live_run(state_dir)
+    named = boxes_of(state)
+    if getattr(args, "all", False):
+        return state, [(i, name, w) for i, (name, w) in enumerate(named)]
+    _, w = live_box(state_dir, args.box)
+    i = next(i for i, (_, b) in enumerate(named) if b["id"] == w["id"])
+    return state, [(i, named[i][0], w)]
+
+
+class BoxWatch:
+    """Asks the provider about a box whose SSH connection failed, and remembers the
+    answer, so that a box that is over ends the wait and can be recorded as died."""
+
+    def __init__(self, args, w: dict):
+        self.args, self.w, self.status = args, w, None
+
+    def __call__(self) -> bool | None:
+        """False if the box is over (gone, or in a terminal state); None if not known."""
+        try:
+            inst = v.Vast(api_key(self.args)).instance(self.w["id"])
+        except (v.VastError, ConfigError) as exc:
+            log(f"WARNING: could not ask the provider about the box: {exc}")
+            return None
+        self.status = "gone" if inst is None else inst.get("actual_status")
+        return False if inst is None or self.status in DEAD_STATUSES else None
+
+
+def record_if_died(args, state_dir: Path, state: State, w: dict, status) -> None:
+    """Blame the machine only on the provider's word that the box is over, and only if our
+    own teardown did not start in the meantime. An instance that no longer exists was
+    destroyed by someone (a teardown elsewhere, its own timer, the reaper), which says
+    nothing about the machine. A missing or transitional status, or an API error, is not
+    evidence either."""
+    if status not in DEAD_STATUSES or not _still_ours(state_dir, state.run):
+        return
+    meta = state.meta
+    asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
+    extra = {"gpu": gpu_model(w.get("gpu"), asked), "num_gpus": meta.get("num_gpus")}
+
+    def record():
+        row = pol.observation(
+            "died_after_admission", w.get("machine"), w.get("host_id"), state.run,
+            reason="died", gate_version=GATE_VERSION, **extra,
+        )  # fmt: skip
+        pol.Observations(observations_path(args)).add(row)
+        shared = open_shared(args)
+        shared.queue([row])
+        share(shared, "after the run", pull=False)
+
+    advisory("recording the observation", record)
+    advisory("writing outputs", github_output, observations_changed="true")
+
+
+def lost_box(args, state_dir: Path, state: State, w: dict, watch: BoxWatch) -> int:
+    """Say that the connection to a box is lost, and why if the provider knows."""
+    if watch.status is None:
+        watch()
+    if not _still_ours(state_dir, state.run):
+        log("::error::the box was destroyed by `gpubox down` while the job ran")
+        return EXIT_INFRA
+    log(
+        f"::error::lost the SSH connection to the box (instance status: {watch.status or 'unknown'})"
+    )
+    record_if_died(args, state_dir, state, w, watch.status)
+    return EXIT_INFRA
+
+
+def start_job(args, state_dir, state, box, job_id, script, env) -> bool:
+    """Start the job on one box. True once the box has said it started it."""
+    i, name, w = box
+    count = len(state.winners)
+    env = {
+        **env, "GPUBOX_RUN_ID": state.run, "GPUBOX_JOB": job_id, "GPUBOX_BOX_INDEX": str(i),
+        "GPUBOX_BOX_COUNT": str(count), "GPUBOX_BOX_NAME": name,
+    }  # fmt: skip
+    timeout_s = 0 if not args.timeout_min else max(1, round(args.timeout_min * 60))
+    remote, stdin = job.start_command(
+        job_id, script, env, timeout_s=timeout_s, destroy_after=args.destroy_after
+    )
+    rc, out, err = job.run_remote(box_ssh(state_dir, state, w), remote, stdin, timeout=120)
+    if rc == 0 and out.strip() == job_id:
+        return True
+    if rc == 255:
+        lost_box(args, state_dir, state, w, BoxWatch(args, w))
+        log(f"  job {job_id} may or may not have started on {name}: `gpubox jobs --box {i}`")
+    else:
+        log(f"::error::could not start the job on {name} (exit {rc}): {err.strip()[-300:]}")
+    return False
+
+
+def end_code(args, state_dir, state, box, job_id, end: job.End, watch: BoxWatch) -> int:
+    """The exit code for how waiting on a job ended, said in words where it is not the
+    job's own."""
+    i, name, w = box
+    if end.kind == "exit":
+        if end.rc == EXIT_TIMEOUT:
+            log(f"::error::job {job_id} on {name} ran out of time (--timeout-min)")
+        return end.rc
+    if end.kind == "running":
+        return 0
+    if end.kind == "none":
+        log(f"::error::no job {job_id} on {name}")
+        return EXIT_CONFIG
+    if end.kind == "lost":
+        log(
+            f"::error::job {job_id} on {name} ended without an exit code: its box restarted, "
+            "or it was killed"
+        )
+        return EXIT_INFRA
+    return lost_box(args, state_dir, state, w, watch)
+
+
+class Prefixed:
+    """A binary stream that writes whole lines to stdout, each led by the box's name."""
+
+    def __init__(self, name: str, lock):
+        self.prefix, self.lock, self.partial = f"[{name}] ".encode(), lock, b""
+
+    def write(self, data: bytes) -> None:
+        *lines, self.partial = (self.partial + data).split(b"\n")
+        if lines:
+            with self.lock:
+                for line in lines:
+                    sys.stdout.buffer.write(self.prefix + line + b"\n")
+                sys.stdout.buffer.flush()
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if self.partial:
+            self.write(b"\n")
+
+
+def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wait=True) -> int:
+    """Follow the job on these boxes (streaming its log unless `quiet`) and combine how it
+    ended: a lost box first, then a timeout, then the first failure, else 0."""
+    import threading
+
+    lock = threading.Lock()
+    results: dict[int, int] = {}
+
+    def one(box):
+        i, name, w = box
+        watch = BoxWatch(args, w)
+        if quiet:
+            out = open(os.devnull, "wb")
+        elif len(boxes) == 1:
+            out = sys.stdout.buffer
+        else:
+            out = Prefixed(name, lock)
+        end, _ = job.follow(
+            box_ssh(state_dir, state, w), job_id, out, wait=wait,
+            offset=2**62 if quiet else offset, still_there=watch,
+            patience=args.reconnect_min * 60,
+        )  # fmt: skip
+        if isinstance(out, Prefixed):
+            out.close()
+        results[i] = end_code(args, state_dir, state, box, job_id, end, watch)
+
+    threads = [threading.Thread(target=one, args=(b,), daemon=True) for b in boxes]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(0.5)
+    except KeyboardInterrupt:
+        where = "" if len(boxes) == 1 and len(state.winners) == 1 else f" --box {boxes[0][0]}"
+        log(f"job {job_id} carries on: `gpubox logs -f{where} {job_id}`, "
+            f"`gpubox kill{where} {job_id}` to stop it")  # fmt: skip
+        return EXIT_INTERRUPTED
+    codes = [results.get(i, EXIT_INFRA) for i, _, _ in boxes]
+    for wanted in (EXIT_INFRA, EXIT_TIMEOUT):
+        if wanted in codes:
+            return wanted
+    return next((c for c in codes if c != 0), 0)
+
+
 def cmd_run(args) -> int:
     state_dir = Path(args.state_dir)
     # No lock: `down` must be able to end a run in progress.
-    state, w = live_box(state_dir, args.box)
-    run_id, iid = state.run, w["id"]
-    exports = []
-    for item in args.env:
-        name, sep, value = item.partition("=")
-        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-            raise ConfigError(f"--env expects NAME=VALUE, got {item!r}")
-        exports.append(f"export {name}={shlex.quote(value)}\n")
-    script = "".join(exports) + Path(args.script).read_text()
-    # Store the script first, under a name of its own, so nothing it runs can
-    # swallow it from stdin and a second `run` cannot overwrite it.
-    remote = 'f=$(mktemp /tmp/gpubox-script.XXXXXX) && cat > "$f" && exec bash "$f" </dev/null'
-    # The key belongs to this run: it is gone once the run is torn down.
+    state, boxes = chosen(state_dir, args)
     try:
-        prober = Prober(key_dir(state_dir, run_id), create=False)
-    except FileNotFoundError:
-        raise StateError(f"run {run_id} has no SSH key in {state_dir} (torn down?)") from None
-    argv = prober.ssh((w["host"], w["port"]), remote)
+        script = Path(args.script).read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot read --script {args.script}: {exc}") from None
     try:
-        rc = subprocess.run(argv, input=script.encode(), timeout=args.timeout_min * 60).returncode
-    except subprocess.TimeoutExpired:
-        log(f"::error::remote script exceeded {args.timeout_min} minutes")
-        return EXIT_TIMEOUT
-    if rc != 255:  # 255 is ssh's own failure code (a script exiting 255 reads the same)
-        return rc
-    if not _still_ours(state_dir, run_id):
-        log("::error::the box was destroyed by `gpubox down` while the script ran")
+        env = job.env_from(args.env, args.env_file)
+    except job.JobError as exc:
+        raise ConfigError(str(exc)) from None
+    job_id = job.new_job_id()
+    started = [b for b in boxes if start_job(args, state_dir, state, b, job_id, script, env)]
+    for i, name, _ in started:
+        log(f"job {job_id} started on {name}")
+    github_output(job_id=job_id)
+    if len(started) < len(boxes):
         return EXIT_INFRA
-    status = None
-    try:
-        inst = v.Vast(api_key(args)).instance(iid)
-        status = "gone" if inst is None else inst.get("actual_status")
-    except (v.VastError, ConfigError) as exc:
-        log(f"WARNING: could not ask the provider what happened: {exc}")
-    log(f"::error::lost the SSH connection to the box (instance status: {status or 'unknown'})")
-    # Blame the machine only on the provider's word that the box is over, and
-    # only if our own teardown did not start in the meantime. An instance
-    # that no longer exists was destroyed by someone (a teardown elsewhere,
-    # its own timer, the reaper), which says nothing about the machine. A
-    # missing or transitional status, or an API error, is not evidence either.
-    if status in DEAD_STATUSES and _still_ours(state_dir, run_id):
-        meta = state.meta
-        asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
-        extra = {"gpu": gpu_model(w.get("gpu"), asked), "num_gpus": meta.get("num_gpus")}
+    if args.detach:
+        print(job_id)
+        return 0
+    return wait_for(args, state_dir, state, started, job_id)
 
-        def record():
-            row = pol.observation(
-                "died_after_admission",
-                w.get("machine"),
-                w.get("host_id"),
-                run_id,
-                reason="died",
-                gate_version=GATE_VERSION,
-                **extra,
-            )
-            pol.Observations(observations_path(args)).add(row)
-            shared = open_shared(args)
-            shared.queue([row])
-            share(shared, "after the run", pull=False)
 
-        advisory("recording the observation", record)
-        advisory("writing outputs", github_output, observations_changed="true")
-    return EXIT_INFRA
+def job_of(args, state_dir, state, box) -> str:
+    """The job a command names, else the newest job on the box."""
+    if args.job:
+        try:
+            return job.check_job_id(args.job)
+        except job.JobError as exc:
+            raise ConfigError(str(exc)) from None
+    rc, out, err = job.run_remote(box_ssh(state_dir, state, box[2]), job.latest_command())
+    if rc != 0:
+        raise InfraError(f"could not ask {box[1]} for its jobs (exit {rc}): {err.strip()[-200:]}")
+    if not out.strip():
+        raise ConfigError(f"no job on {box[1]}")
+    return out.strip().splitlines()[-1]
+
+
+def cmd_logs(args) -> int:
+    state_dir = Path(args.state_dir)
+    state, boxes = chosen(state_dir, args)
+    job_id = job_of(args, state_dir, state, boxes[0])
+    return wait_for(args, state_dir, state, boxes, job_id, wait=args.follow)
+
+
+def cmd_wait(args) -> int:
+    state_dir = Path(args.state_dir)
+    state, boxes = chosen(state_dir, args)
+    job_id = job_of(args, state_dir, state, boxes[0])
+    return wait_for(args, state_dir, state, boxes, job_id, quiet=True)
+
+
+def cmd_jobs(args) -> int:
+    state_dir = Path(args.state_dir)
+    state, boxes = chosen(state_dir, args)
+    rc, out, err = job.run_remote(box_ssh(state_dir, state, boxes[0][2]), job.list_command())
+    if rc != 0:
+        log(f"::error::could not list the jobs (exit {rc}): {err.strip()[-200:]}")
+        return EXIT_INFRA
+    print(out, end="")
+    return 0
+
+
+def cmd_kill(args) -> int:
+    state_dir = Path(args.state_dir)
+    state, boxes = chosen(state_dir, args)
+    job_id = job_of(args, state_dir, state, boxes[0])
+    timeout = job.KILL_GRACE + 30
+    rc, _, err = job.run_remote(
+        box_ssh(state_dir, state, boxes[0][2]), job.kill_command(job_id), timeout=timeout
+    )
+    if rc != 0:
+        log(f"::error::could not kill job {job_id} (exit {rc}): {err.strip()[-200:]}")
+        return EXIT_INFRA
+    log(f"job {job_id} killed")
+    return 0
+
+
+def cmd_ssh(args) -> int:
+    """A shell on the box, or a command run there with the container's environment."""
+    state_dir = Path(args.state_dir)
+    state, boxes = chosen(state_dir, args)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    ssh = box_ssh(state_dir, state, boxes[0][2])
+    if command:
+        remote = job.LOAD_ENV + "exec " + " ".join(shlex.quote(c) for c in command)
+        argv = ssh(remote, tty=sys.stdin.isatty())
+    else:
+        argv = ssh(None, tty=True)  # a login shell, which loads the environment itself
+    return subprocess.run(argv).returncode
 
 
 def cmd_renew(args) -> int:
@@ -704,13 +934,77 @@ def main(argv=None) -> int:
     state_args(s)
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("run")
+    def box_arg(s, all_too=False):
+        s.add_argument("--box", type=number(int, 0), help="which box of the run (0, 1, ...)")
+        if all_too:
+            s.add_argument("--all", action="store_true", help="every box of the run")
+
+    def reconnect_arg(s):
+        s.add_argument(
+            "--reconnect-min",
+            type=number(float, 0),
+            default=10,
+            help="how long to keep trying a lost connection before giving up (the job goes on)",
+        )
+
+    s = sub.add_parser("run", help="start a script on the box, detached, and follow it")
     state_args(s)
-    s.add_argument("--box", type=number(int, 0), help="which box of the run (0, 1, ...)")
+    box_arg(s, all_too=True)
     s.add_argument("--script", required=True)
-    s.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
-    s.add_argument("--timeout-min", type=number(float, 0, exclusive=True), default=60)
+    s.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME[=VALUE]",
+        help="a variable for the job; NAME alone takes the value from this environment",
+    )
+    s.add_argument("--env-file", action="append", default=[], metavar="FILE")
+    s.add_argument(
+        "--timeout-min",
+        type=number(float, 0),
+        default=60,
+        help="the box kills the job after this (0: never); exit 124",
+    )
+    s.add_argument("--detach", action="store_true", help="print the job id and return at once")
+    s.add_argument(
+        "--destroy-after",
+        action="store_true",
+        help="destroy the box when the script ends, whatever its exit code",
+    )
+    reconnect_arg(s)
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("logs", help="print a job's output (default: the newest job)")
+    state_args(s)
+    box_arg(s)
+    s.add_argument("job", nargs="?")
+    s.add_argument("-f", "--follow", action="store_true", help="until the job ends; its exit code")
+    reconnect_arg(s)
+    s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("wait", help="wait for a job to end; its exit code")
+    state_args(s)
+    box_arg(s)
+    s.add_argument("job", nargs="?")
+    reconnect_arg(s)
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("jobs", help="the jobs on a box and how they are")
+    state_args(s)
+    box_arg(s)
+    s.set_defaults(fn=cmd_jobs)
+
+    s = sub.add_parser("kill", help="stop a job (default: the newest)")
+    state_args(s)
+    box_arg(s)
+    s.add_argument("job", nargs="?")
+    s.set_defaults(fn=cmd_kill)
+
+    s = sub.add_parser("ssh", help="a shell on the box, or `-- CMD...` run there")
+    state_args(s)
+    box_arg(s)
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_ssh)
 
     s = sub.add_parser("renew")
     state_args(s)
@@ -754,6 +1048,9 @@ def main(argv=None) -> int:
         return EXIT_CONFIG
     except v.VastError as exc:
         log(f"::error::Vast API: {exc}")
+        return EXIT_INFRA
+    except InfraError as exc:
+        log(f"::error::{exc}")
         return EXIT_INFRA
     except OSError as exc:
         log(f"::error::state directory: {exc}")
