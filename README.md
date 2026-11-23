@@ -37,6 +37,8 @@ gpubox down
 `--gpu` can be repeated to accept any of several models (the cheapest offer
 goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
 default it gets max(16, 8 per GPU) CPUs and 32 GB of RAM per GPU.
+`--min-cuda` (default 13.0) is the lowest CUDA version the host's driver must
+support: a CUDA 13.x image runs on any 13.x driver but not on a 12.x one.
 
 A private image: `--registry-user USER` with the token in
 `GPUBOX_REGISTRY_TOKEN` (the registry comes from the image name). Vast and

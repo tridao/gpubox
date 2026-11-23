@@ -627,7 +627,12 @@ def main(argv=None) -> int:
         )
         s.add_argument("--capability", help="required CUDA compute capability, e.g. 12.0")
         s.add_argument("--min-vram-mib", type=number(int, 0), default=0)
-        s.add_argument("--min-cuda", type=number(float, 0), default=12.0)
+        s.add_argument(
+            "--min-cuda",
+            type=number(float, 0),
+            default=13.0,
+            help="lowest CUDA version the host's driver must support (default 13.0)",
+        )
         s.add_argument("--disk-gb", type=number(int, 1), default=40)
         s.add_argument(
             "--min-cpus", type=number(int, 1), help="CPUs for the box (default: max(16, 8 per GPU))"

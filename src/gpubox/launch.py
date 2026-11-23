@@ -63,7 +63,9 @@ class Spec:
     num_gpus: int = 1
     capability: tuple[int, int] | None = None  # None: do not check
     min_vram_mib: int = 0
-    min_cuda: float = 12.0
+    # The host driver's newest CUDA (Vast's cuda_max_good). A CUDA 13.x image runs on any
+    # 13.x driver and not on a 12.x one (measured on Vast, 2026-11).
+    min_cuda: float = 13.0
     disk_gb: int = 40
     min_reliability: float = 0.98
     min_cpus: int | None = None  # for the whole box; None: max(16, 8 per GPU)
