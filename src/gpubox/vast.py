@@ -140,7 +140,7 @@ class Vast:
 
     def account(self) -> str:
         """The id of the account this key belongs to."""
-        data = self._call("GET", "/v0/users/current/", query={"owner": "me"})
+        data = self._call("GET", "/v0/users/current/")  # no `owner`: the API refuses it here
         if (
             isinstance(data, dict)
             and data.get("success", True) is True
