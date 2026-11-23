@@ -240,7 +240,7 @@ def up(
         expiry = int(time.time()) + spec.ttl_min * 60
         meta = {
             "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
-            "count": policy.count,
+            "count": policy.count, "interruptible": spec.interruptible,
         }  # fmt: skip
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
         log(f"run {run_id}")
@@ -368,6 +368,7 @@ class Run:
 
     id = property(lambda self: self._state.run)
     expiry = property(lambda self: self.state.expiry)
+    interruptible = property(lambda self: bool(self._state.meta.get("interruptible")))
 
     @property
     def boxes(self) -> list[Box]:
@@ -553,10 +554,33 @@ class Box:
         if not self.run.live():
             return BoxLost("the box was destroyed by `gpubox down` while the job ran", watch.status)
         msg = f"lost the SSH connection to the box (instance status: {watch.status or 'unknown'})"
+        if self.run.interruptible and watch.status in DEAD_STATUSES:
+            msg += "; it is interruptible, so it was most likely outbid"
         if hint:
             log(hint)
         self._record_if_died(watch.status)
         return BoxLost(msg, watch.status)
+
+    def _moved(self, host: str, port: int) -> None:
+        """The box answers somewhere else now (a resumed interruptible box may): use the new
+        address, and write it to the state file unless a teardown holds the directory."""
+        if (host, port) == (self.host, self.port):
+            return
+        log(f"{self.name} is now at {host}:{port}")
+        self.host, self.port = host, port
+        s = self.run.settings
+        try:
+            with state_lock(s.state_dir):
+                state = State.load(s.state_dir)
+                if state is None or state.run != self.run.id or state.closing:
+                    return
+                winners = state.winners
+                for w in winners:
+                    if w["id"] == self.instance_id:
+                        w["host"], w["port"] = host, port
+                state.publish(winners)
+        except (StateError, OSError) as exc:
+            log(f"WARNING: the new address is not in the state file: {exc}")
 
     def _record_if_died(self, status) -> None:
         """Blame the machine only on the provider's word that the box is over, and only if
@@ -565,6 +589,8 @@ class Box:
         says nothing about the machine. A missing or transitional status, or an API error,
         is not evidence either."""
         if status not in DEAD_STATUSES or not self.run.live():
+            return
+        if self.run.interruptible:  # stopped by the market, most likely: not the machine
             return
         meta, s = self.run.state.meta, self.run.settings
         asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
@@ -599,6 +625,10 @@ class BoxWatch:
             log(f"WARNING: could not ask the provider about the box: {exc}")
             return None
         self.status = "gone" if inst is None else inst.get("actual_status")
+        if inst is not None and self.status == "running":
+            ep = v.endpoint_of(inst)
+            if ep is not None:
+                self.box._moved(*ep)
         return False if inst is None or self.status in DEAD_STATUSES else None
 
 
@@ -643,9 +673,10 @@ class Job:
         if end.kind == "none":
             raise NoSuchJob(f"no job {self.id} on {self.box.name}")
         if end.kind == "lost":
+            why = " (it is interruptible: most likely outbid)" if self.box.run.interruptible else ""
             raise JobLost(
                 f"job {self.id} on {self.box.name} ended without an exit code: its box "
-                "restarted, or it was killed"
+                f"restarted{why}, or it was killed"
             )
         raise self.box._lost(watch=watch)
 

@@ -212,6 +212,27 @@ saves the container's environment, which sessions over SSH do not inherit, to
 the box load it), and installs `gpubox-destroy-self`, which writes a past time
 to the expiry file: the lease timer destroys the box within 30 s.
 
+## 5b. Interruptible boxes
+
+`--interruptible` searches Vast's bid offers and bids `--bid-markup` times an
+offer's minimum bid; the price cap and the cheapest-first order apply to the
+bid plus the disk. What changes:
+
+- An outbid box is stopped, not destroyed, and bills its disk; with its
+  container stopped, its lease timer cannot fire. `down` and the reaper
+  destroy it by tag whatever its state, so a scheduled `reap` is the bound.
+- Being outbid is the market, not the machine: a box that exits, stalls, or
+  never reaches `running` within the start-up timeout fails without blame,
+  and a stopped box is never recorded as `died`.
+- The job dies with its container (Vast kills it 0.1 s after SIGTERM). When
+  the bid wins again the container restarts without it; `wait` sees the
+  wrapper gone and reports the job `lost`.
+- A resumed box may answer on another port. When SSH fails, the provider is
+  asked about the box; a running box's address is taken from the answer and
+  written to the state file (unless a teardown holds the directory).
+- Two of our own bids on one machine outbid each other, so machines the
+  account already has an instance on are skipped.
+
 ## 6. Teardown
 
 `down` works in rounds for up to a minute: a short delete-and-lookup round

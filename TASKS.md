@@ -89,7 +89,7 @@ GitHub secrets, Doppler etc. all work the same way:
 - [x] Values travel over SSH stdin into a 0600 file in the job's directory, read by the job's
   shell and deleted as it starts; never into Vast's instance `env`, label or arguments.
 
-## 10. Interruptible instances [R]
+## 10. Interruptible instances [R] (done; see DESIGN 5b)
 
 New problems they bring, and the answer to each:
 - An outbid box is stopped, not destroyed, and Vast keeps billing its disk; its container is

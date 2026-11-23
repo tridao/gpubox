@@ -138,3 +138,20 @@ def test_a_lost_job_and_a_missing_one_are_errors_of_their_kind(world, tmp_path):
         os.killpg(int((d / "pid").read_text()), 9)
         with pytest.raises(gpubox.JobLost):
             j.wait(io.BytesIO())
+
+
+def test_a_box_that_comes_back_elsewhere_is_followed_there(world, tmp_path):
+    with launch(tmp_path) as run:
+        box = run.box()
+        real = world.instance
+
+        def moved(iid, **kw):
+            row = real(iid, **kw)
+            if row is not None and "ports" in row:
+                row["ports"] = {"22/tcp": [{"HostPort": "40001"}]}
+            return row
+
+        world.instance = moved
+        assert box.watch()() is None  # running: not over
+        assert box.port == 40001
+        assert gpubox.attach(tmp_path).box().port == 40001  # and so is the state file

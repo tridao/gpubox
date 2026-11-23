@@ -47,6 +47,14 @@ A private image: `--registry-user USER` with the token in
 `GPUBOX_REGISTRY_TOKEN` (the registry comes from the image name). Vast and
 the host's docker daemon see the token, so make it a read-only pull token.
 
+`--interruptible` rents interruptible boxes, bidding `--bid-markup` (1.25)
+times each offer's minimum bid; the price cap applies to the bid with the
+disk. An outbid box is stopped: its job dies, and the box keeps billing its
+disk, with its lease timer stopped too, until something destroys it. So run
+`reap` on a schedule, and expect `wait` to report a lost job (75). Machines
+the account already has a box on are skipped (our own bids would outbid each
+other), and a box that stops or never starts is not held against its machine.
+
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 

@@ -1164,3 +1164,32 @@ def test_a_long_line_on_one_of_several_boxes_is_shown_in_pieces(capsys):
     out.write(b"x" * (3 * cli.Prefixed.LONGEST + 5))
     assert len(out.partial) == 5
     assert capsys.readouterr().out.count("[b] ") == 3
+
+
+# ------------------------------------------------------------ interruptible
+
+
+def bidding(vast):
+    for o in vast._offers:
+        o.update(min_bid=0.5, storage_total_cost=0.01)
+
+
+def test_interruptible_bids_at_the_markup(world):
+    vast, run = world
+    bidding(vast)
+    assert run([*UP, "--interruptible", "--bid-markup", "1.5"]) == 0
+    assert vast.queries[0]["type"] == "bid"
+    assert {p["price"] for p in vast.payloads} == {0.75}
+    assert State.load(run.state_dir).meta["interruptible"] is True
+    assert run(["down"]) == 0
+
+
+def test_a_stopped_interruptible_box_is_not_recorded_as_died(world, tmp_path, monkeypatch, capsys):
+    vast, run = world
+    bidding(vast)
+    assert run([*UP, "--interruptible"]) == 0
+    fake_ssh(monkeypatch, rc=255)
+    vast.live[vast.ours()[0]]["status"] = "exited"
+    assert run(script(tmp_path)) == cli.EXIT_INFRA
+    assert observations(tmp_path) == [("healthy", None)]  # outbid is not the machine
+    assert "outbid" in capsys.readouterr().out

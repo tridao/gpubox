@@ -269,7 +269,7 @@ def offer_query(spec) -> dict:
         "disk_space": {"gte": spec.disk_gb},
         # Price the offer with the disk we will actually allocate.
         "allocated_storage": spec.disk_gb,
-        "type": "on-demand",
+        "type": "bid" if spec.interruptible else "on-demand",
         "order": [["dph_total", "asc"]],
         "limit": 200,
     }
@@ -401,7 +401,7 @@ def registry_of(image: str) -> str:
     return "docker.io"
 
 
-def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
+def create_payload(spec, label: str, pubkey: str, expiry: int, bid: float | None = None) -> dict:
     payload = {
         "image": spec.image,
         "disk": spec.disk_gb,
@@ -414,6 +414,10 @@ def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
         "onstart": "bash",
         "args": ["-c", bootstrap_script(pubkey, expiry)],
     }
+    if spec.interruptible:
+        if bid is None:
+            raise ValueError("an interruptible box needs a bid")
+        payload["price"] = bid  # $/hr for the machine, the disk not included
     if spec.registry_user is not None:
         # Vast's form: `docker login` arguments, in one string.
         login = f"-u {spec.registry_user} -p {spec.registry_token} {registry_of(spec.image)}"

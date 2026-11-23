@@ -1110,3 +1110,53 @@ def test_an_interrupt_during_the_hand_off_of_several_boxes(tmp_path, monkeypatch
         assert sorted(vast.ours()) == sorted(w["id"] for w in disk.winners)
         assert {vast.live[i]["machine"] for i in vast.ours()} == {1, 2}  # the loser is gone
     assert L.down(vast, disk, FAST) == [] and vast.ours() == []
+
+
+# ------------------------------------------------------------ interruptible
+
+BIDS = L.Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=0.5, interruptible=True)
+
+
+def bid_offer(machine, min_bid, disk=0.01, **kw):
+    return {**offer(machine, dph=min_bid + disk, **kw), "min_bid": min_bid,
+            "storage_total_cost": disk}  # fmt: skip
+
+
+def test_interruptible_boxes_are_bid_for_at_the_markup_within_the_cap(tmp_path):
+    offers = [
+        bid_offer(1, 0.30),
+        bid_offer(2, 0.10),
+        bid_offer(3, 0.45),
+        {**offer(4), "min_bid": None},
+    ]
+    vast = FakeVast({1: "ok", 2: "ok", 3: "ok", 4: "ok"}, offers=offers)
+    result, vast, state = run(tmp_path, {}, vast=vast, spec=BIDS, spare=1)
+    assert vast.queries[0]["type"] == "bid"
+    prices = sorted(p["price"] for p in vast.payloads)
+    assert prices == [0.125, 0.375]  # 1.25 x the minimum; 0.45 x 1.25 + disk is over the cap
+    assert result.winner.machine_id == 2 and result.winner.dph == pytest.approx(0.135)
+
+
+def test_no_bid_on_a_machine_the_account_already_has_a_box_on(tmp_path):
+    offers = [bid_offer(1, 0.10), bid_offer(2, 0.20)]
+    vast = FakeVast({1: "ok", 2: "ok"}, offers=offers)
+    vast.live[8000] = {"id": 8000, "label": None, "machine": 1}  # ours, rented elsewhere
+    launch, vast, state = start(tmp_path, {}, vast=vast, spec=BIDS, spare=0)
+    result = launch.run({})
+    assert result.winner.machine_id == 2 and vast.names("create") == [("create", 2)]
+    assert 8000 in vast.live  # not ours to touch
+
+
+@pytest.mark.parametrize("kind", ["exited", "stuck"])
+def test_an_interruptible_box_that_stops_or_never_starts_is_not_blamed(tmp_path, kind):
+    offers = [bid_offer(1, 0.10), bid_offer(2, 0.20)]
+    vast = FakeVast({1: kind, 2: "ok"}, offers=offers)
+    result, vast, state = run(tmp_path, {}, vast=vast, spec=BIDS, spare=0)
+    assert result.winner.machine_id == 2 and reasons(result)[1] is None
+    assert "outbid" in result.attempts[0].detail or kind == "stuck"
+
+
+def test_a_bid_markup_is_checked():
+    for bad in (0.5, 1000):
+        with pytest.raises(ValueError):
+            L.Spec(image="i", gpus=("H100",), max_dph_per_gpu=1, interruptible=True, bid_markup=bad)

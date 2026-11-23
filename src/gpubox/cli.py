@@ -120,6 +120,8 @@ def spec_from(args, image: str = "") -> Spec:
         exclude_countries=countries(args),
         gate_script=gate_script(args),
         **registry_login(args),
+        interruptible=getattr(args, "interruptible", False),
+        bid_markup=getattr(args, "bid_markup", 1.25),
         gate_timeout=getattr(args, "gate_timeout", 600),
         ttl_min=getattr(args, "ttl_min", 90),
     )
@@ -470,6 +472,18 @@ def main(argv=None) -> int:
             "--min-ram-gb", type=number(int, 1), help="GB of RAM for the box (default: 32 per GPU)"
         )
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
+        s.add_argument(
+            "--interruptible",
+            action="store_true",
+            help="bid for interruptible boxes: cheaper, but stopped when outbid "
+            "(run `reap` on a schedule)",
+        )
+        s.add_argument(
+            "--bid-markup",
+            type=number(float, 1),
+            default=1.25,
+            help="bid this times the offer's minimum bid (default 1.25)",
+        )
         s.add_argument(
             "--exclude-country",
             action="append",
