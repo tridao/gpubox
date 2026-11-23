@@ -7,10 +7,10 @@ close the gaps found when comparing the two. Work them in order; each is one or 
 
 ## 1. Gate: CUDA checks only where PyTorch has CUDA; a custom gate hook
 
-- [ ] Torch not installed, or a CPU-only build (`torch.version.cuda is None`): skip the matmul
+- [x] Torch not installed, or a CPU-only build (`torch.version.cuda is None`): skip the matmul
   and VRAM checks and say so in the report. A CUDA build that cannot initialise CUDA is
   still `cuda_init` (that is the machine). `nvidia-smi` checks always run. `GATE_VERSION` 2.
-- [ ] `--gate-script FILE`: run on the box after the built-in gate passes, same SSH channel,
+- [x] `--gate-script FILE`: run on the box after the built-in gate passes, same SSH channel,
   `--gate-timeout` (default 600 s). Exit 0 passes. To blame the machine, the script prints a
   last line `{"ok": false, "reason": "<code>", "detail": "..."}` with an existing reason code
   (`no_network`, `runtime_error`, ...); anything else fails the box without blame. No new

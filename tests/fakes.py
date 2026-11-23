@@ -70,6 +70,9 @@ class FakeVast:
     vanish    passes the gate, and the instance is gone the moment it does
     api_down  rented, but the provider never answers a status query
     nokey     comes up, and its sshd refuses the run's key
+    hook_fail passes the gate; the caller's gate script fails without a verdict
+    hook_net  passes the gate; the caller's gate script blames the network
+    hook_late passes the gate; the caller's gate script never finishes
     """
 
     def __init__(self, behaviour, offers=None, slow_secs=0.2):
@@ -290,6 +293,7 @@ class FakeProber:
     def __init__(self, vast):
         self.vast = vast
         self.wants = []  # the spec each gate was asked to check
+        self.hooked = []  # machines whose gate script was started
         self.checks = []  # every child process started
         self.ran, self.run_rc = [], 0  # commands run on a box, and what they return
 
@@ -333,6 +337,20 @@ class FakeProber:
             return True, None, "", dict(REPORT)
 
         self.checks.append(FakeCheck(result))
+        return self.checks[-1]
+
+    def start_hook(self, ep, spec):
+        machine = int(ep[0].rsplit(".", 1)[1])
+        kind = self.vast.behaviour[machine]
+        assert spec.gate_script is not None
+        self.hooked.append(machine)
+        answers = {
+            "hook_fail": (False, None, "gate script exited 1: missing library", {}),
+            "hook_net": (False, "no_network", "gate script: storage at 3 MB/s", {}),
+            "hook_late": None,
+        }
+        answer = answers.get(kind, (True, None, "", {}))
+        self.checks.append(FakeCheck(lambda: answer))
         return self.checks[-1]
 
 

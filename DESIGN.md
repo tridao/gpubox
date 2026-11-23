@@ -186,11 +186,19 @@ directories share these files, so they are changed under a lock of their own.
 
 ## 8. Health gate and blocklist
 
-The gate runs on the box with the image's own Python and PyTorch: GPU count,
-model and VRAM; required URLs reachable; the GPU idle before our first CUDA
-context; CUDA initialises; and per GPU a matmul checked against the CPU and
-80% of free VRAM allocated and filled. It checks the machine, not the
-project under test.
+The gate runs on the box with the image's own Python: GPU count, model and
+VRAM; required URLs reachable; the GPU idle before our first CUDA context.
+Where the image has a CUDA build of PyTorch, also: CUDA initialises, and per
+GPU a matmul checked against the CPU and 80% of free VRAM allocated and
+filled. Without PyTorch, or with a CPU-only build, those are skipped: that
+says nothing about the machine. A CUDA build that cannot use the GPU does.
+It checks the machine, not the project under test.
+
+The caller's own checks (`--gate-script`) run after the gate passes. They are
+the caller's code, so a failure blames nobody unless the script says, in the
+gate's own verdict format and with one of its reason codes, that it is the
+machine. That way no new reason codes reach the store, and the blame rule
+below still applies: only when another box passed the same checks.
 
 A machine is recorded as failed only if another candidate became healthy in
 the same launch; otherwise the cause may be ours. `observations.jsonl` then

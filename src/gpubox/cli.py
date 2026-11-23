@@ -126,8 +126,20 @@ def spec_from(args, image: str = "") -> Spec:
         max_dph_per_gpu=args.max_dph_per_gpu,
         must_reach=tuple(args.must_reach),
         exclude_countries=countries(args),
+        gate_script=gate_script(args),
+        gate_timeout=getattr(args, "gate_timeout", 600),
         ttl_min=getattr(args, "ttl_min", 90),
     )
+
+
+def gate_script(args) -> str | None:
+    path = getattr(args, "gate_script", None)
+    if path is None:
+        return None
+    try:
+        return Path(path).read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"cannot read --gate-script {path}: {exc}") from None
 
 
 def countries(args) -> tuple[str, ...]:
@@ -575,6 +587,17 @@ def main(argv=None) -> int:
     )
     s.add_argument(
         "--ttl-min", type=number(int, 1), default=90, help="the box destroys itself after this"
+    )
+    s.add_argument(
+        "--gate-script",
+        metavar="FILE",
+        help="run this on each box after the health gate passes; exit 0 admits the box",
+    )
+    s.add_argument(
+        "--gate-timeout",
+        type=number(float, 0, exclusive=True),
+        default=600,
+        help="seconds the gate script may take",
     )
     s.set_defaults(fn=cmd_up)
 

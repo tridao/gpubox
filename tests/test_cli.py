@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fakes import FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
 
-from gpubox import cli
+from gpubox import cli, gate
 from gpubox import policy as pol
 from gpubox import vast as v
 from gpubox.state import State, make_tag, parse_tag, state_lock
@@ -633,7 +633,7 @@ def test_a_box_the_provider_says_is_over_is_recorded_as_died(world, tmp_path, mo
     assert run(script(tmp_path)) == cli.EXIT_INFRA
     assert observations(tmp_path) == [("healthy", None), ("died_after_admission", "died")]
     died = pol.Observations(tmp_path / "observations.jsonl").rows[-1]
-    assert died["gpu"] == "RTX 5090" and died["gate_version"] == 1
+    assert died["gpu"] == "RTX 5090" and died["gate_version"] == gate.GATE_VERSION
     assert died["machine_id"] == vast.live[vast.ours()[0]]["machine"]
 
 
@@ -789,3 +789,23 @@ def test_nonsense_arguments_are_rejected_before_anything_is_rented(world, bad):
 def test_bad_capability_is_a_configuration_error(world):
     vast, run = world
     assert run([*UP, "--capability", "twelve"]) == cli.EXIT_CONFIG and vast.creates == 0
+
+
+# ---------------------------------------------------------------- gate script
+
+
+def test_up_runs_the_gate_script_it_is_given(world, tmp_path):
+    vast, run = world
+    (tmp_path / "check.sh").write_text("nvidia-smi\n")
+    argv = [*UP, "--gate-script", str(tmp_path / "check.sh"), "--gate-timeout", "30"]
+    assert run(argv) == 0
+    spec = vast.probers[0].wants[0]
+    assert (spec.gate_script, spec.gate_timeout) == ("nvidia-smi\n", 30)
+    assert vast.probers[0].hooked
+    assert run(["down"]) == 0
+
+
+def test_an_unreadable_gate_script_rents_nothing(world, tmp_path):
+    vast, run = world
+    assert run([*UP, "--gate-script", str(tmp_path / "missing.sh")]) == cli.EXIT_CONFIG
+    assert vast.creates == 0

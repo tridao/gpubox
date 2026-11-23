@@ -1,8 +1,12 @@
 """SSH access to a rented box, and the health gate that admits it.
 
-The gate runs on the box with the image's own python3 and PyTorch and prints
-one JSON line. It checks the machine, not the project: a bug in the code under
-test must fail its tests, not get machines blocked.
+The gate runs on the box with the image's own python3 and prints one JSON
+line. It checks the machine, not the project: a bug in the code under test
+must fail its tests, not get machines blocked. Its CUDA checks use the image's
+PyTorch, and run only where that is a CUDA build.
+
+A caller's own checks (`Spec.gate_script`) run after it passes, and speak the
+same verdict protocol (`read_hook`).
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from pathlib import Path
 
 from .policy import REASONS
 
-GATE_VERSION = 1
+GATE_VERSION = 2  # 2: CUDA checks skipped without a CUDA build of PyTorch
 
 GATE_SCRIPT = r"""
 import json, os, shutil, subprocess, sys, time, urllib.error, urllib.request, warnings
@@ -90,12 +94,28 @@ if util > 20 or used > 512:
 # From here on a failure we did not foresee (an import that dies on a broken
 # driver, a CUDA error) is still a statement about this box, so it becomes a
 # verdict instead of a traceback. done() leaves through SystemExit, untouched.
+#
+# The CUDA checks need a CUDA build of PyTorch. An image without PyTorch, or
+# with a CPU-only build, has no use for them, and that says nothing about the
+# machine: they are skipped. A CUDA build that cannot use the GPU is the machine.
 try:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        import torch
-        available = torch.cuda.is_available()
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            if exc.name != "torch":
+                raise  # PyTorch is there, and something it needs is not
+            torch = None
+        cuda_build = torch is not None and bool(getattr(torch.version, "cuda", None))
+        available = cuda_build and torch.cuda.is_available()
+    if torch is None:
+        out["checks"] = "no PyTorch in the image: CUDA checks skipped"
+        done()
     out["torch"] = torch.__version__
+    if not cuda_build:
+        out["checks"] = "CPU-only PyTorch: CUDA checks skipped"
+        done()
     if not available:
         done("cuda_init", "CUDA unavailable: " + "; ".join(str(w.message) for w in caught)[:300])
     if torch.cuda.device_count() != want["num_gpus"]:
@@ -122,6 +142,7 @@ try:
             done("runtime_error", "%s: memory read-back failed" % dev)
         del x
         torch.cuda.empty_cache()
+    out["checks"] = "CUDA checks passed"
 except Exception as exc:
     done("runtime_error", "%s: %s" % (type(exc).__name__, str(exc)[:300]))
 done()
@@ -137,6 +158,7 @@ def _clean_report(raw: dict) -> dict:
         "cpus": raw.get("cpus") if type(raw.get("cpus")) is int else None,
         "driver": text(raw.get("driver")),
         "torch": text(raw.get("torch")),
+        "checks": text(raw.get("checks")),
     }
 
 
@@ -224,9 +246,23 @@ class Prober:
         argv = self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want)))
         return self._start(argv, read_gate, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT)
 
+    def start_hook(self, ep: tuple[str, int], spec) -> Check:
+        """Start the caller's own gate script. Its result is (ok, reason_code, detail, {})."""
+        argv = self.ssh(ep, HOOK_REMOTE)
+        timeout = spec.gate_timeout
+        read = lambda done: read_hook(done, timeout)
+        return self._start(argv, read, stdin=spec.gate_script, timeout=timeout)
+
 
 READY_TIMEOUT = 25
 GATE_TIMEOUT = 240
+# The caller's gate script is stored first, so nothing it runs can read it from
+# stdin, then run: by its own #! line if it has one, else by bash.
+HOOK_REMOTE = (
+    'f=$(mktemp /tmp/gpubox-gate.XXXXXX) && cat > "$f" && chmod 700 "$f" && '
+    'if [ "$(head -c 2 "$f")" = "#!" ]; then exec "$f" </dev/null; '
+    'else exec bash "$f" </dev/null; fi'
+)
 KEEP = 1 << 20  # bytes of a child's output that are read back
 
 
@@ -362,3 +398,32 @@ def read_gate(done: Done) -> tuple[bool, str | None, str, dict]:
     if not isinstance(reason, str) or reason not in REASONS:
         return False, None, f"health gate gave an unknown reason {reason!r}: {detail}", report
     return False, reason, detail, report
+
+
+def read_hook(done: Done, timeout: float) -> tuple[bool, str | None, str, dict]:
+    """(ok, reason_code, detail, {}) from how the caller's gate script ended.
+
+    It passes on exit 0. It blames the machine only with an explicit verdict,
+    a last line `{"ok": false, "reason": CODE, "detail": TEXT}` naming a known
+    reason code; any other failure (an exit code, a crash, a hang) fails the box
+    and blames nobody, since the script is the caller's code, not ours. As for
+    the built-in gate, exit 255 reads as a dropped connection.
+    """
+    if done.timed_out:
+        return False, None, f"gate script did not finish within {timeout:g}s", {}
+    if done.rc == 255:
+        detail = f"ssh dropped during gate script: {done.stderr.strip()[-200:]}"
+        return False, "unreachable", detail, {}
+    try:
+        raw = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raw = None
+    tail = (done.stderr or done.stdout).strip()[-300:]
+    if isinstance(raw, dict) and raw.get("ok") is False:
+        reason, detail = raw.get("reason"), str(raw.get("detail") or "")[:400]
+        if isinstance(reason, str) and reason in REASONS:
+            return False, reason, f"gate script: {detail}", {}
+        return False, None, f"gate script failed (reason {reason!r}): {detail or tail}", {}
+    if done.rc == 0:
+        return True, None, "", {}
+    return False, None, f"gate script exited {done.rc}: {tail}", {}

@@ -83,7 +83,7 @@ def test_gate_verdicts(tmp_path, monkeypatch, rc, stdout, expect):
 )
 def test_the_report_handed_on_always_has_the_same_shape(tmp_path, monkeypatch, stdout):
     (ok, _, _, report), _ = verdict(tmp_path, monkeypatch, 0, stdout)
-    assert ok and set(report) == {"gpus", "cpus", "driver", "torch"}
+    assert ok and set(report) == {"gpus", "cpus", "driver", "torch", "checks"}
     assert isinstance(report["gpus"], list) and all(isinstance(g, str) for g in report["gpus"])
     assert report["cpus"] is None and report["driver"] is None and report["torch"] is None
 
@@ -175,7 +175,13 @@ def test_whatever_bytes_the_box_prints_are_read_without_raising(tmp_path, monkey
         ],
     )
     ok, reason, detail, report = finish(p.start_gate(("10.0.0.1", 22), SPEC))
-    assert (ok, reason) == (False, None) and set(report) == {"gpus", "cpus", "driver", "torch"}
+    assert (ok, reason) == (False, None) and set(report) == {
+        "gpus",
+        "cpus",
+        "driver",
+        "torch",
+        "checks",
+    }
     assert finish(p.start_ready(("10.0.0.1", 22))) == (True, "\ufffd")
 
 
@@ -274,7 +280,7 @@ def test_a_check_reads_the_result_of_its_child():
 )
 def test_every_outcome_carries_a_report_of_the_same_shape(tmp_path, monkeypatch, rc, stdout):
     (_, _, _, report), _ = verdict(tmp_path, monkeypatch, rc, stdout)
-    assert report == {"gpus": [], "cpus": None, "driver": None, "torch": None}
+    assert report == {"gpus": [], "cpus": None, "driver": None, "torch": None, "checks": None}
 
 
 def test_loading_a_key_never_creates_one(tmp_path):
@@ -283,3 +289,136 @@ def test_loading_a_key_never_creates_one(tmp_path):
     assert not (tmp_path / "gone").exists()
     made = Prober(tmp_path / "run-a")
     assert Prober(tmp_path / "run-a", create=False).pubkey == made.pubkey
+
+
+# ------------------------------------------------------- the gate, for real
+
+SMI = """#!/bin/sh
+echo "0, NVIDIA GeForce RTX 5090, 32607, 1, 0, 20.5, 570.86"
+"""
+WANT = {"num_gpus": 1, "gpu": "RTX 5090", "min_vram_mib": 0, "capability": None, "must_reach": []}
+
+
+def real_gate(tmp_path, torch_source=None, want=WANT):
+    """Run the real gate script against a stand-in nvidia-smi and, if given, a stand-in
+    PyTorch package; the interpreter's own packages are out of reach (-S)."""
+    bin_dir, lib = tmp_path / "bin", tmp_path / "lib"
+    bin_dir.mkdir()
+    lib.mkdir()
+    (bin_dir / "nvidia-smi").write_text(SMI)
+    (bin_dir / "nvidia-smi").chmod(0o755)
+    if torch_source is not None:
+        (lib / "torch").mkdir()
+        (lib / "torch" / "__init__.py").write_text(torch_source)
+    r = subprocess.run(
+        [sys.executable, "-S", "-", json.dumps(want)],
+        input=gate.GATE_SCRIPT,
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "PYTHONPATH": str(lib)},
+        timeout=60,
+    )
+    return gate.read_gate(gate.Done(r.returncode, r.stdout, r.stderr))
+
+
+CPU_TORCH = """
+__version__ = "2.7.1+cpu"
+class version:
+    cuda = None
+"""
+CUDA_TORCH_WITHOUT_GPU = """
+__version__ = "2.7.1+cu128"
+class version:
+    cuda = "12.8"
+class cuda:
+    @staticmethod
+    def is_available():
+        return False
+"""
+
+
+def test_an_image_without_pytorch_skips_the_cuda_checks(tmp_path):
+    ok, reason, detail, report = real_gate(tmp_path)
+    assert (ok, reason) == (True, None), detail
+    assert report["torch"] is None and "skipped" in report["checks"]
+    assert report["gpus"] == ["NVIDIA GeForce RTX 5090"]
+
+
+def test_a_cpu_only_pytorch_skips_the_cuda_checks(tmp_path):
+    ok, reason, detail, report = real_gate(tmp_path, CPU_TORCH)
+    assert (ok, reason) == (True, None), detail
+    assert report["torch"] == "2.7.1+cpu" and "CPU-only" in report["checks"]
+
+
+def test_a_cuda_build_of_pytorch_that_cannot_use_the_gpu_is_the_machine(tmp_path):
+    ok, reason, detail, report = real_gate(tmp_path, CUDA_TORCH_WITHOUT_GPU)
+    assert (ok, reason) == (False, "cuda_init")
+
+
+def test_a_pytorch_that_is_missing_a_part_is_not_taken_for_no_pytorch(tmp_path):
+    ok, reason, detail, _ = real_gate(tmp_path, "import torch_part_that_is_missing\n")
+    assert (ok, reason) == (False, "runtime_error") and "torch_part_that_is_missing" in detail
+
+
+def test_the_nvidia_smi_checks_run_whatever_pytorch_there_is(tmp_path):
+    ok, reason, detail, _ = real_gate(tmp_path, want={**WANT, "gpu": "H100"})
+    assert (ok, reason) == (False, "wrong_hardware")
+
+
+# ------------------------------------------------------- the caller's gate script
+
+
+@pytest.mark.parametrize(
+    "rc,stdout,expect",
+    [
+        (0, "", (True, None)),
+        (0, "all good\n", (True, None)),
+        (0, '{"ok": true}', (True, None)),
+        (1, "", (False, None)),  # the caller's code failed: nobody is blamed
+        (3, '{"ok": true}', (False, None)),
+        (0, '{"ok": false, "reason": "no_network", "detail": "storage at 3 MB/s"}', (False, "no_network")),
+        (1, '{"ok": false, "reason": "runtime_error", "detail": "missing library"}', (False, "runtime_error")),
+        (0, '{"ok": false, "reason": "gremlins"}', (False, None)),
+        (0, '{"ok": false}', (False, None)),
+        (255, "", (False, "unreachable")),
+    ],
+)  # fmt: skip
+def test_gate_script_verdicts(rc, stdout, expect):
+    ok, reason, _, _ = gate.read_hook(gate.Done(rc, stdout, ""), 600)
+    assert (ok, reason) == expect
+
+
+def test_a_hung_gate_script_blames_nobody():
+    ok, reason, detail, _ = gate.read_hook(gate.Done(None, "", ""), 600)
+    assert (ok, reason) == (False, None) and "600" in detail
+
+
+def test_the_gate_script_is_sent_on_stdin_with_its_own_timeout(tmp_path, monkeypatch):
+    calls = []
+
+    class Recorded:
+        def __init__(self, argv, **kw):
+            calls.append((argv, kw))
+
+    monkeypatch.setattr(gate, "Child", Recorded)
+    spec = Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1, gate_script="echo hi\n",
+                gate_timeout=42)  # fmt: skip
+    prober(tmp_path).start_hook(("10.0.0.1", 22), spec)
+    argv, kw = calls[0]
+    assert argv[-1] == gate.HOOK_REMOTE
+    assert kw == {"stdin": "echo hi\n", "timeout": 42}
+
+
+@pytest.mark.parametrize(
+    "script,expect",
+    [
+        ("echo from bash; read x && echo stdin was readable\nexit 4\n", (4, "from bash")),
+        ("#!/usr/bin/env python3\nimport sys\nprint('from python', sys.stdin.read() == '')\n",
+         (0, "from python True")),
+    ],
+)  # fmt: skip
+def test_the_remote_side_runs_the_script_by_its_interpreter_with_no_stdin(script, expect):
+    r = subprocess.run(["sh", "-c", gate.HOOK_REMOTE], input=script, capture_output=True,
+                       text=True, timeout=30)  # fmt: skip
+    assert (r.returncode, r.stdout.splitlines()[0]) == expect
+    assert "stdin was readable" not in r.stdout

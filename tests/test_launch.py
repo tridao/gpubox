@@ -858,3 +858,47 @@ def test_a_run_without_a_box_cannot_be_renewed(tmp_path):
     launch, vast, state = start(tmp_path, {1: "ok"})
     with pytest.raises(L.ConfigError):
         L.renew(vast, state, FakeProber(vast), EXPIRY + 60)
+
+
+# ---------------------------------------------------------- the gate script
+
+HOOKED = L.Spec(image="img", gpu="RTX 5090", max_dph_per_gpu=1.25, gate_script="exit 0\n")
+
+
+def test_a_gate_script_runs_after_the_gate_and_admits_the_box(tmp_path):
+    result, vast, state = run(tmp_path, {1: "ok"}, spec=HOOKED, spare=0)
+    assert result.winner.machine_id == 1 and result.winner.phase == "healthy"
+    only_winner_left(result, vast, state)
+
+
+def test_no_gate_script_is_run_unless_one_is_given(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok"}, spare=0)
+    assert launch.run({}).winner and launch.prober.hooked == []
+
+
+def test_a_gate_script_is_not_run_on_a_box_that_failed_the_gate(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "bad_gpu", 2: "ok"}, spec=HOOKED, spare=0)
+    result = launch.run({})
+    assert result.winner.machine_id == 2 and launch.prober.hooked == [2]
+
+
+def test_a_failed_gate_script_replaces_the_box_and_blames_nobody(tmp_path):
+    result, vast, state = run(tmp_path, {1: "hook_fail", 2: "ok"}, spec=HOOKED, spare=0)
+    assert result.winner.machine_id == 2 and reasons(result)[1] is None
+    assert "missing library" in result.attempts[0].detail
+    only_winner_left(result, vast, state)
+    assert observed(result) == {(2, "healthy", None)}
+
+
+def test_a_gate_script_verdict_blames_the_machine(tmp_path):
+    result, vast, state = run(tmp_path, {1: "hook_net", 2: "ok"}, spec=HOOKED, spare=0)
+    assert result.winner.machine_id == 2 and reasons(result)[1] == "no_network"
+    assert observed(result) == {(1, "failed_admission", "no_network"), (2, "healthy", None)}
+
+
+def test_a_box_in_its_gate_script_is_waited_for_and_stopped_when_it_loses(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "hook_late", 2: "ok"}, spec=HOOKED)
+    result = launch.run({})
+    assert result.winner.machine_id == 2 and 1 in launch.prober.hooked
+    assert reasons(result)[1] is None
+    only_winner_left(result, vast, state)

@@ -85,9 +85,15 @@ run, and `observations.jsonl`.
   one machine per host. A box that fails is destroyed and replaced, up to
   `--max-attempts` rentals.
 - **Health gate.** GPU model, count and VRAM; required URLs reachable
-  (`--must-reach`); the GPU idle before we touch it; CUDA works; a matmul on
-  every GPU matches the CPU; most of the VRAM can be allocated. It needs
-  PyTorch in the image.
+  (`--must-reach`); the GPU idle before we touch it. Where the image has a
+  CUDA build of PyTorch, also: CUDA works, a matmul on every GPU matches the
+  CPU, and most of the VRAM can be allocated. It needs `python3` in the image.
+- **Your own checks.** `--gate-script FILE` runs on each box after the gate
+  passes (by its `#!` line, else bash; at most `--gate-timeout` seconds).
+  Exit 0 admits the box; anything else fails it and another is tried. To
+  have the machine blocklisted, print a last line
+  `{"ok": false, "reason": "no_network", "detail": "..."}` with one of the
+  gate's reason codes (`policy.REASONS`).
 - **Tag.** Every box is labelled `<namespace>.<name>.<random>.a<n>.<expiry>`
   when it is rented. Anything that knows the run id can find the run's boxes
   and destroy them.

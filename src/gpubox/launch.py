@@ -69,6 +69,9 @@ class Spec:
     min_ram_gb_per_gpu: int = 32
     min_inet_down_mbps: int = 200
     must_reach: tuple[str, ...] = ()
+    # The caller's own checks, run on the box after the built-in gate passes (gate.read_hook).
+    gate_script: str | None = None
+    gate_timeout: float = 600
     ttl_min: int = 90
     # Hosts in mainland China took a median of 250 s to load the CI image against 65 s
     # elsewhere, and 2 of 6 never did (DESIGN.md, section 10).
@@ -117,7 +120,7 @@ class Attempt:
     # unanswered: the create got no usable answer, so a box may exist that we have no id for
     state: str = "unanswered"  # unanswered | refused | rented
     instance_id: int | None = None
-    phase: str = ""  # of a rented box: booting | probing | gating | healthy | failed
+    phase: str = ""  # of a rented box: booting | probing | gating | checking | healthy | failed
     gone: bool = False  # a lookup said its box does not exist
     endpoint: tuple[str, int] | None = None
     reason: str | None = None  # a policy.REASONS code when the machine is at fault
@@ -228,6 +231,9 @@ def tagged(vast, run_id: str, policy: Policy, timeout: float | None = None) -> s
 
 
 # ---------------------------------------------------------------------- launch
+
+# The phases of a rented box on its way to a verdict.
+PENDING = ("booting", "probing", "gating", "checking")
 
 
 class Launch:
@@ -343,7 +349,7 @@ class Launch:
         image_said = None  # the same, from any box, also one whose host we cannot name
         while True:
             for a in list(self.attempts.values()):
-                if a.state == "rented" and a.phase in ("booting", "probing", "gating"):
+                if a.state == "rented" and a.phase in PENDING:
                     said = self._advance(a)
                     if said is not None:
                         image_said = said
@@ -395,18 +401,32 @@ class Launch:
         problem: its host cannot pull it, or it runs but refuses our key.
         """
         policy, spec = self.policy, self.spec
+        if a.phase == "checking":
+            result = a.check.poll()
+            if result is None:
+                return None
+            a.check = None
+            ok, reason, detail, _ = result
+            if ok:
+                self._healthy(a)
+            else:
+                self._fail(a, reason, detail)
+            return None
         if a.phase == "gating":
             result = a.check.poll()
             if result is None:
                 return None
             a.check = None
             ok, reason, detail, a.report = result
-            a.timings["healthy"] = self._elapsed(a)
-            if ok:
-                a.phase = "healthy"
-                log(f"  {a.tag_name} healthy after {a.timings['healthy']:.0f}s")
-            else:
+            if not ok:
                 self._fail(a, reason, detail)
+            elif spec.gate_script is not None:
+                a.timings["gate"] = self._elapsed(a)
+                log(f"  {a.tag_name} passed the health gate, running the gate script")
+                a.check = self.prober.start_hook(a.endpoint, spec)
+                a.phase = "checking"
+            else:
+                self._healthy(a)
             return None
         if a.phase == "probing":
             result = a.check.poll()
@@ -491,6 +511,11 @@ class Launch:
         a.check = self.prober.start_ready(ep)
         a.phase = "probing"
         return None
+
+    def _healthy(self, a: Attempt) -> None:
+        a.phase = "healthy"
+        a.timings["healthy"] = self._elapsed(a)
+        log(f"  {a.tag_name} healthy after {a.timings['healthy']:.0f}s")
 
     def _destroy_failed(self) -> None:
         """One delete and one lookup for every failed box. It keeps its slot until the
@@ -579,7 +604,7 @@ class Launch:
         for a in self.attempts.values():
             if a.state != "rented":
                 continue
-            if a.phase in ("booting", "probing", "gating", "healthy"):
+            if a.phase in PENDING or a.phase == "healthy":
                 return True
             if a.phase == "failed" and not a.gone and now - a.failed_at < policy.confirm_timeout:
                 return True  # its delete may still show, and free its slot
