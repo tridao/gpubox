@@ -11,7 +11,9 @@ directory in use, bad arguments); 75 infrastructure (no healthy box, box lost
 mid-run, teardown not confirmed); 124 script timeout. `run` otherwise returns
 the script's own exit code, except that 255 is taken for a lost connection.
 
-The API key is read from VASTAI_API_KEY.
+The API key is read from VASTAI_API_KEY. If GPUBOX_STORE_URL and
+GPUBOX_STORE_TOKEN are set, observations of machines are shared through that
+store; it is advisory and never fails a command.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import time
 from pathlib import Path
 
 from . import policy as pol
+from . import store as st
 from . import vast as v
 from .gate import GATE_VERSION, Prober
 from .journal import RUN_ID, Journal, StateError, new_run_id, state_lock
@@ -125,6 +128,25 @@ def observations_path(args) -> Path:
     return Path(args.state_dir) / "observations.jsonl"
 
 
+def open_shared(args) -> st.Shared:
+    """The shared reputation store, if one is configured and its settings make sense."""
+    store = None
+    try:
+        store = st.from_env()
+    except st.StoreError as exc:
+        log(f"WARNING: reputation store not used: {exc}")
+    return st.Shared(observations_path(args), store)
+
+
+def share(shared: st.Shared, what: str, **kw) -> None:
+    """Talk to the store. Whatever happens there, the command carries on."""
+    if shared.store:
+        try:
+            log(f"reputation store: {shared.sync(**kw)}")
+        except Exception as exc:
+            log(f"WARNING: reputation store ({what}): {exc}")
+
+
 def advisory(what: str, fn, *a, **kw) -> None:
     """Run something whose failure must not fail the command (reports, reputation)."""
     try:
@@ -178,11 +200,17 @@ def cmd_up(args) -> int:
         advisory("writing outputs", github_output, run_id=run_id)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
+        shared = open_shared(args)
+        share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
+        known = [*obs.rows, *shared.remote_rows()]
         prober = Prober(key_dir(state_dir, run_id))
         launch = Launch(v.Vast(key), spec, policy, journal, prober, run_id)
-        result = launch.run(pol.blocklist(obs.rows, time.time()))
+        result = launch.run(pol.blocklist(known, time.time()))
     # The outcome is decided and journalled; nothing below may change it.
     advisory("recording observations", observe, result, spec, run_id, obs)
+    if obs.added:
+        advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
+        share(shared, "after the launch", pull=False)
     advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
     advisory("writing the summary", write_summary, spec, result)
     advisory("reporting", report_result, spec, result)
@@ -267,18 +295,20 @@ def cmd_run(args) -> int:
         extra = {k: meta[k] for k in ("gpu", "num_gpus") if k in meta}
 
         def record():
-            pol.Observations(observations_path(args)).add(
-                pol.observation(
-                    "died_after_admission",
-                    box.machine_id if box else None,
-                    box.host_id if box else None,
-                    state.run_id,
-                    reason="died",
-                    gate_version=GATE_VERSION,
-                    **extra,
-                )
+            row = pol.observation(
+                "died_after_admission",
+                box.machine_id if box else None,
+                box.host_id if box else None,
+                state.run_id,
+                reason="died",
+                gate_version=GATE_VERSION,
+                **extra,
             )
+            pol.Observations(observations_path(args)).add(row)
             github_output(observations_changed="true")
+            shared = open_shared(args)
+            shared.queue([row])
+            share(shared, "after the run", pull=False)
 
         advisory("recording the observation", record)
     return EXIT_INFRA
@@ -318,7 +348,7 @@ def cmd_reap(args) -> int:
 def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
-    blocked = pol.blocklist(obs.rows, time.time())
+    blocked = pol.blocklist([*obs.rows, *open_shared(args).remote_rows()], time.time())
     offers = pol.select_offers(v.Vast(api_key(args)).offers(v.offer_query(spec)), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
