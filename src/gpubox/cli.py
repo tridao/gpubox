@@ -61,6 +61,8 @@ def settings(args) -> api.Settings:
         account_id=getattr(args, "account_id", None),
         keys_file=args.keys_file,
         observations=getattr(args, "observations", None),
+        # Said at once, not when the command ends: a CI step may be cancelled first.
+        on_observation=lambda: github_output(observations_changed="true"),
     )
 
 
@@ -194,12 +196,13 @@ def cmd_up(args) -> int:
         changed = str(run.observations_changed).lower()
         advisory("writing outputs", github_output, observations_changed=changed)
         advisory("writing the summary", write_summary, spec, result)
-        advisory("reporting", report_result, spec, result, run.state)
+        advisory("reporting", report_result, spec, result, run.id, run.expiry)
 
     try:
         api.up(
             spec, namespace=args.namespace, name=args.name, count=args.count, policy=policy,
             ssh_config=args.ssh_config, on_run_id=publish, on_result=reported,
+            teardown_on_failure=False,  # CI runs `down` anyway, within its own deadline
             settings=settings(args),
         )  # fmt: skip
     except NoBoxes:
@@ -207,7 +210,7 @@ def cmd_up(args) -> int:
     return 0
 
 
-def report_result(spec: Spec, result: Result, state: State) -> None:
+def report_result(spec: Spec, result: Result, run_id: str, expiry: int) -> None:
     for iid in result.left:
         log(f"::warning::instance {iid} is not confirmed destroyed; `gpubox down` retries")
     for a in result.unanswered:
@@ -218,12 +221,12 @@ def report_result(spec: Spec, result: Result, state: State) -> None:
     if not result.winners:
         log(f"::error::no healthy {spec.gpu_text} box")
         return
-    until = time.strftime("%H:%M UTC", time.gmtime(state.expiry))
+    until = time.strftime("%H:%M UTC", time.gmtime(expiry))
     n = len(result.winners)
     for i, w in enumerate(result.winners):
         r = w.report
         log(
-            f"READY in {result.seconds:.0f}s: {box_name(state.run, i, n)} is instance "
+            f"READY in {result.seconds:.0f}s: {box_name(run_id, i, n)} is instance "
             f"{w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo}); "
             f"{len(r.get('gpus') or [])}x {w.gpu or 'GPU'}, {r.get('cpus')} CPUs, "
             f"driver {r.get('driver')}, torch {r.get('torch')}; lease until {until}"
@@ -239,34 +242,34 @@ def chosen(args) -> tuple[api.Run, list[api.Box]]:
     return run, [run.box(args.box)]
 
 
-def outcome_code(run: api.Run, job_: api.Job, result) -> int:
+def outcome_code(o: api.Outcome) -> int:
     """The exit code for how waiting on a job ended, said in words where it is not the
     job's own."""
-    if isinstance(result, GpuboxError):
-        log(f"::error::{result}")
-        return EXIT_CONFIG if isinstance(result, (ConfigError, StateError)) else EXIT_INFRA
-    if result is None:  # still running
+    if o.error is not None:
+        if isinstance(o.error, GpuboxError):
+            log(f"::error::{o.error}")
+            return EXIT_CONFIG if isinstance(o.error, (ConfigError, StateError)) else EXIT_INFRA
+        log(f"::error::following job {o.job.id} on {o.job.box.name}: {o.error!r}")
+        return EXIT_INFRA
+    if o.code is None:  # still running
         return 0
-    if result == EXIT_TIMEOUT:
-        log(f"::error::job {job_.id} on {job_.box.name} ran out of time (--timeout-min)")
-    return result
+    if o.code == EXIT_TIMEOUT:
+        log(f"::error::job {o.job.id} on {o.job.box.name} ran out of time (--timeout-min)")
+    return o.code
 
 
 def wait_jobs(args, run: api.Run, jobs_: list[api.Job], *, quiet=False, follow=True) -> int:
     """Follow the jobs and combine how they ended: a lost box first, then a timeout,
     then the first failure, else 0."""
     try:
-        results = api.wait_all(jobs_, quiet=quiet, follow=follow, reconnect_min=args.reconnect_min)
+        outcomes = api.wait_all(jobs_, quiet=quiet, follow=follow, reconnect_min=args.reconnect_min)
     except KeyboardInterrupt:
         j = jobs_[0]
-        where = "" if len(run.boxes) == 1 else f" --box {j.box.index}"
+        where = "" if run.meta.get("count", 1) == 1 else f" --box {j.box.index}"
         log(f"job {j.id} carries on: `gpubox logs -f{where} {j.id}`, "
             f"`gpubox kill{where} {j.id}` to stop it")  # fmt: skip
         return EXIT_INTERRUPTED
-    finally:
-        if run.observations_changed:
-            advisory("writing outputs", github_output, observations_changed="true")
-    codes = [outcome_code(run, j, r) for j, r in zip(jobs_, results)]
+    codes = [outcome_code(o) for o in outcomes]
     for wanted in (EXIT_INFRA, EXIT_TIMEOUT):
         if wanted in codes:
             return wanted
@@ -297,12 +300,10 @@ def cmd_run(args) -> int:
                     job_id=job_id,
                 )  # fmt: skip
             )
-        except GpuboxError as exc:
+        except InfraError as exc:  # our own mistakes (ConfigError, StateError) end it at once
             log(f"::error::{exc}")
             failed = True
     advisory("writing outputs", github_output, job_id=job_id)
-    if run.observations_changed:
-        advisory("writing outputs", github_output, observations_changed="true")
     if failed:
         return EXIT_INFRA
     if args.detach:
@@ -369,12 +370,12 @@ def cmd_status(args) -> int:
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(state.expiry))
     left = (state.expiry - time.time()) / 60
     what = "closing" if state.closing else f"lease ends {until} ({left:.0f} min)"
-    print(f"run {state.run}: {len(state.winners)} box(es), {what}")
-    for b in api.Run(settings(args), state).boxes:
-        gpu = f"  {b.gpu}" if b.gpu else ""
-        print(
-            f"  {b.index}  {b.name:<20} instance {b.instance_id:<10} root@{b.host} -p {b.port}{gpu}"
-        )
+    ws = state.winners
+    print(f"run {state.run}: {len(ws)} box(es), {what}")
+    for i, w in enumerate(ws):
+        name = box_name(state.run, i, len(ws))
+        gpu = f"  {w['gpu']}" if w.get("gpu") else ""
+        print(f"  {i}  {name:<20} instance {w['id']:<10} root@{w['host']} -p {w['port']}{gpu}")
     return 0
 
 

@@ -42,7 +42,7 @@ from . import policy as pol
 from . import sshconfig
 from . import store as st
 from . import vast as v
-from .errors import BoxLost, ConfigError, InfraError, JobLost, NoBoxes, NoSuchJob
+from .errors import BoxLost, ConfigError, GpuboxError, InfraError, JobLost, NoBoxes, NoSuchJob
 from .errors import TeardownIncomplete
 from .gate import GATE_VERSION, Prober
 from .launch import Policy, Spec, log
@@ -67,10 +67,12 @@ class Settings:
     """Where things are, and how to reach the provider."""
 
     state_dir: Path = Path(".gpubox")
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     account_id: str | None = None
     keys_file: str = LOCAL_KEYS_FILE
     observations: Path | None = None  # None: <state_dir>/observations.jsonl
+    # Told, as it happens, that a machine was recorded as died (the CLI writes a step output).
+    on_observation: object = field(default=None, repr=False)
     _vast: object = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -135,8 +137,15 @@ class Settings:
         return st.Shared(self.observations_path, None)
 
 
-def _settings(state_dir, **kw) -> Settings:
-    return kw.pop("settings", None) or Settings(state_dir=Path(state_dir), **kw)
+def _settings(state_dir=None, settings: Settings | None = None, **kw) -> Settings:
+    """The settings a call gives: `settings=`, or the keywords (and `state_dir`), not both:
+    a mix would leave one of them silently unused."""
+    if settings is not None:
+        if state_dir is not None or kw:
+            given = ", ".join(["state_dir"] * (state_dir is not None) + sorted(kw))
+            raise ConfigError(f"pass either settings= or {given}, not both")
+        return settings
+    return Settings(state_dir=Path(state_dir if state_dir is not None else ".gpubox"), **kw)
 
 
 def share(shared: st.Shared, what: str, **kw) -> None:
@@ -192,25 +201,39 @@ def up(
     *,
     namespace: str,
     name: str,
-    count: int = 1,
+    count: int | None = None,
     policy: Policy | None = None,
-    state_dir=".gpubox",
+    state_dir=None,
     ssh_config: bool = False,
     on_run_id=None,
     on_result=None,
+    teardown_on_failure: bool = True,
     **settings,
 ) -> Run:
-    """Rent `count` boxes for `spec` and wait until they pass the health gate.
+    """Rent `count` boxes for `spec` (default: `policy.count`, 1) and wait until they
+    pass the health gate.
 
     Returns the run, with its boxes, once they are in the state file; raises
-    `NoBoxes` if the launch ended without them (it destroyed what it rented, or
-    says what is left), `ConfigError` for our own mistakes. `on_run_id(run_id)`
-    is called before anything is rented: whoever must tear the run down needs it
-    whenever a box may exist, so if it raises, nothing is rented. `on_result(
-    result)` is told how the launch went, whichever way. A live run in the state
-    directory must be torn down first.
+    `NoBoxes` if the launch ended without them, `ConfigError` for our own
+    mistakes. A live run in the state directory must be torn down first.
+
+    `on_run_id(run_id)` is called before anything is rented: whoever must tear the
+    run down needs it whenever a box may exist, so if it raises, nothing is
+    rented. `on_result(result, run)` is told how the launch went, whichever way;
+    it cannot change the outcome.
+
+    If anything fails or interrupts `up` once it has begun the run, it tears the
+    run down before raising (`teardown_on_failure`; the command line leaves that
+    to its own `down`, as CI runs it anyway). If that teardown cannot be confirmed
+    either, the exception carries a note with the run id to retry with.
     """
     policy = policy or Policy()
+    if count is None:
+        count = policy.count
+    elif count != policy.count and policy.count != 1:
+        raise ConfigError(f"count={count} and policy.count={policy.count} disagree")
+    if type(count) is not int or count < 1:
+        raise ConfigError(f"count must be a positive integer: {count!r}")
     if count != policy.count:
         policy = Policy(**{**policy.__dict__, "count": count})
     if policy.attempts < policy.count:
@@ -224,6 +247,23 @@ def up(
         )
     s = _settings(state_dir, **settings)
     vast = s.vast()
+    begun: list[str] = []  # the run id, once its state is begun: from then on, it is ours
+    try:
+        return _up(spec, namespace, name, policy, s, vast, ssh_config, on_run_id, on_result,
+                   begun)  # fmt: skip
+    except BaseException as exc:
+        if teardown_on_failure and begun:
+            try:
+                down(begun[0], settings=s)
+            except BaseException as also:
+                exc.add_note(
+                    f"its teardown failed too ({also!r}): `gpubox down --run-id {begun[0]}` "
+                    "retries; each box also ends at its lease"
+                )
+        raise
+
+
+def _up(spec, namespace, name, policy, s, vast, ssh_config, on_run_id, on_result, begun):
     with state_lock(s.state_dir):
         old = State.load(s.state_dir)  # StateError if it cannot be read
         if old is not None and not old.closed:
@@ -243,6 +283,7 @@ def up(
             "count": policy.count, "interruptible": spec.interruptible,
         }  # fmt: skip
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
+        begun.append(run_id)
         log(f"run {run_id}")
         obs = pol.Observations(s.observations_path)
         shared = s.shared()
@@ -250,10 +291,11 @@ def up(
         keys = key_dir(s.state_dir, run_id)
         launch = L.Launch(vast, spec, policy, state, Prober(keys))
         result = launch.run(pol.blocklist(known_rows(obs, shared), time.time()))
+        won = bool(result.winners)  # the outcome, decided: nothing below may change it
         run = Run(s, state)
-        if result.winners and ssh_config:
+        run.result = result
+        if won and ssh_config:
             advisory("writing the SSH configuration", run.write_ssh_config)
-    # The outcome is decided and in the state file; nothing below may change it.
     advisory("recording observations", L.observe, result, spec, run_id, obs)
     if obs.added:
         advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
@@ -261,12 +303,12 @@ def up(
     run.observations_changed = obs.added > 0
     if on_result is not None:
         advisory("reporting", on_result, result, run)
-    if not result.winners:
+    if not won:
         raise NoBoxes(f"no healthy {spec.gpu_text} box", result)
     return run
 
 
-def attach(state_dir=".gpubox", **settings) -> Run:
+def attach(state_dir=None, **settings) -> Run:
     """The live run in a state directory."""
     s = _settings(state_dir, **settings)
     state = State.load(s.state_dir)
@@ -275,7 +317,7 @@ def attach(state_dir=".gpubox", **settings) -> Run:
     return Run(s, state)
 
 
-def down(run_id: str | None = None, state_dir=".gpubox", policy: Policy | None = None,
+def down(run_id: str | None = None, state_dir=None, policy: Policy | None = None,
          **settings) -> None:  # fmt: skip
     """Destroy everything of a run: the state directory's, or with `run_id` the one of that
     id, found by its tag if the directory has no state of it. Returns once every box is
@@ -323,12 +365,12 @@ def reap(namespace: str, *, destroy: bool = False, policy: Policy | None = None,
     ended. Returns how many could not be destroyed."""
     if not NAMESPACE.fullmatch(namespace):
         raise ConfigError(f"not a namespace: {namespace!r}")
-    s = _settings(".gpubox", **settings)
+    s = _settings(**settings)
     s.check_account()
     return L.reap(s.vast(), policy or Policy(), namespace, destroy=destroy)
 
 
-def search(spec: Spec, *, want: int = 2, state_dir=".gpubox", **settings):
+def search(spec: Spec, *, want: int = 2, state_dir=None, **settings):
     """(offers `up` would try, in order; the blocked machines). Rents nothing."""
     s = _settings(state_dir, **settings)
     obs = pol.Observations(s.observations_path)
@@ -346,33 +388,46 @@ def search(spec: Spec, *, want: int = 2, state_dir=".gpubox", **settings):
 class Run:
     """A run in a state directory: its boxes, their lease, and their teardown.
 
-    As a context manager it destroys the run when the block ends, however it ends,
-    unless `keep()` was called.
+    A handle, not a lock: another process (or `gpubox down`) can end the run, and
+    then everything here that would touch its boxes raises `StateError`. As a
+    context manager it destroys the run when the block ends, however it ends,
+    unless `keep()` was called inside that block.
     """
 
     def __init__(self, settings: Settings, state: State):
-        self.settings, self._state = settings, state
+        self.settings = settings
+        self._id, self._meta, self._expiry = state.run, dict(state.meta), state.expiry
         self._keep = False
         self.observations_changed = False
+        self.result = None  # how `up` went, for a run that `up` returned
+
+    id = property(lambda self: self._id)
+    meta = property(lambda self: dict(self._meta))  # what was asked for
+    interruptible = property(lambda self: bool(self._meta.get("interruptible")))
+
+    def _live(self) -> State:
+        """The run's state on disk, or StateError if the directory no longer holds it live
+        (torn down, being torn down, replaced by another run, unreadable)."""
+        state = State.load(self.settings.state_dir)
+        if state is None or state.run != self.id:
+            raise StateError(f"run {self.id} is no longer in {self.settings.state_dir}")
+        if state.closing or not state.winners:
+            raise StateError(f"run {self.id} has been torn down, or is being torn down")
+        self._expiry = state.expiry
+        return state
 
     @property
-    def state(self) -> State:
-        """The state as it is on disk now (another process may have changed it)."""
+    def expiry(self) -> int:
+        """When the lease ends (Unix time), as last seen."""
         try:
-            on_disk = State.load(self.settings.state_dir)
+            self._live()
         except StateError:
-            on_disk = None
-        if on_disk is not None and on_disk.run == self._state.run:
-            self._state = on_disk
-        return self._state
-
-    id = property(lambda self: self._state.run)
-    expiry = property(lambda self: self.state.expiry)
-    interruptible = property(lambda self: bool(self._state.meta.get("interruptible")))
+            pass
+        return self._expiry
 
     @property
     def boxes(self) -> list[Box]:
-        state = self.state
+        state = self._live()
         ws = state.winners
         return [Box(self, i, box_name(state.run, i, len(ws)), w) for i, w in enumerate(ws)]
 
@@ -385,7 +440,7 @@ class Run:
                     f"the run has {len(boxes)} boxes: say which with --box 0..{len(boxes) - 1}"
                 )
             index = 0
-        if not 0 <= index < len(boxes):
+        if type(index) is not int or not 0 <= index < len(boxes):
             raise StateError(
                 f"no box {index}: the run has {len(boxes)} (--box 0..{len(boxes) - 1})"
             )
@@ -401,23 +456,35 @@ class Run:
 
     def start(self, script: str, env: dict[str, str] | None = None, *, boxes=None,
               timeout_min: float = 60, destroy_after: bool = False) -> list[Job]:  # fmt: skip
-        """Start `script` on each of `boxes` (default: all), as one job id. Raises if a
-        box could not start it; the jobs started on the others carry on."""
+        """Start `script` on each box (`boxes`: their indices; default all), as one job id.
+        If a box cannot start it, the error is raised with `.jobs`, the jobs that did start
+        and carry on."""
+        chosen = self.boxes if boxes is None else [self.box(i) for i in boxes]
         job_id = jobs.new_job_id()
         started = []
-        for box in boxes if boxes is not None else self.boxes:
-            started.append(
-                box.start(
-                    script, env, timeout_min=timeout_min, destroy_after=destroy_after, job_id=job_id
-                )  # fmt: skip
-            )
+        for box in chosen:
+            try:
+                started.append(
+                    box.start(
+                        script,
+                        env,
+                        timeout_min=timeout_min,
+                        destroy_after=destroy_after,
+                        job_id=job_id,
+                    )  # fmt: skip
+                )
+            except GpuboxError as exc:
+                exc.jobs = started
+                raise
         return started
 
     def renew(self, ttl_min: int) -> int:
         """Move the end of every box's lease to `ttl_min` from now. Returns the new expiry."""
+        if type(ttl_min) is not int or ttl_min < 1:
+            raise ConfigError(f"ttl_min must be a positive number of minutes: {ttl_min!r}")
         s = self.settings
         with state_lock(s.state_dir):
-            state = attach(settings=s).state
+            state = self._live()  # this run, under the lock: not one that replaced it
             account = s.check_account()
             s.same_account(state, account)  # before anything on the box is changed
             try:
@@ -426,31 +493,45 @@ class Run:
                 raise StateError(f"run {state.run} has no SSH key in {s.state_dir}") from None
             expiry = int(time.time()) + ttl_min * 60
             L.renew(s.vast(), state, prober, expiry)
+        self._expiry = expiry
         return expiry
 
     def down(self, policy: Policy | None = None) -> None:
         down(self.id, policy=policy, settings=self.settings)
 
     def keep(self) -> Run:
-        """Do not destroy the run when the `with` block ends."""
+        """Do not destroy the run when the current `with` block ends."""
         self._keep = True
         return self
 
     def write_ssh_config(self) -> Path:
         """`Host` entries in ~/.ssh/gpubox_config for each box (see sshconfig)."""
+        boxes = self.boxes
         keys = key_dir(self.settings.state_dir, self.id)
-        hosts = [(b.name, b.host, b.port) for b in self.boxes]
+        hosts = [(b.name, b.host, b.port) for b in boxes]
         path = sshconfig.add(self.id, hosts, keys / "id_ed25519", keys / "known_hosts")
-        names = " / ".join(f"`ssh {b.name}`" for b in self.boxes)
+        names = " / ".join(f"`ssh {b.name}`" for b in boxes)
         log(f"{names} now reach{'es' if len(hosts) == 1 else ''} the box(es) (entries in {path})")
         return path
 
     def __enter__(self) -> Run:
+        self._keep = False
         return self
 
-    def __exit__(self, *exc) -> None:
-        if not self._keep:
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        keep, self._keep = self._keep, False
+        if keep:
+            return False
+        try:
             self.down()
+        except BaseException as failed:
+            if exc_type is None:
+                raise
+            # The block's own exception is what the caller needs to see; the
+            # teardown's failure is said, with how to finish it.
+            log(f"WARNING: the teardown of run {self.id} failed ({failed!r}); "
+                f"`gpubox down --run-id {self.id}` retries; each box also ends at its lease")  # fmt: skip
+        return False
 
 
 # -------------------------------------------------------------------- a box
@@ -592,7 +673,7 @@ class Box:
             return
         if self.run.interruptible:  # stopped by the market, most likely: not the machine
             return
-        meta, s = self.run.state.meta, self.run.settings
+        meta, s = self.run.meta, self.run.settings
         asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
         extra = {"gpu": L.gpu_model(self.gpu, asked), "num_gpus": meta.get("num_gpus")}
 
@@ -608,6 +689,8 @@ class Box:
 
         advisory("recording the observation", record)
         self.run.observations_changed = True
+        if s.on_observation is not None:
+            advisory("telling of the observation", s.on_observation)
 
 
 class BoxWatch:
@@ -645,27 +728,29 @@ class Job:
         return f"Job({self.id} on {self.box.name})"
 
     def wait(self, output=None, *, quiet: bool = False, reconnect_min: float = 10,
-             started=None) -> int:  # fmt: skip
+             started=None, cancel=None) -> int:  # fmt: skip
         """Wait for the job to end, copying its log to `output` (a binary stream; default
         stdout) unless `quiet`, and return its exit code (124: it ran out of time). Raises
         `JobLost`, `BoxLost` or `NoSuchJob`. A dropped connection is picked up again."""
         return self._follow(output, wait=True, quiet=quiet, reconnect_min=reconnect_min,
-                            started=started)  # fmt: skip
+                            started=started, cancel=cancel)  # fmt: skip
 
     def logs(self, output=None, *, follow: bool = False, reconnect_min: float = 10,
-             started=None) -> int | None:  # fmt: skip
+             started=None, cancel=None) -> int | None:  # fmt: skip
         """Copy the job's log so far to `output`; with `follow`, until it ends. Returns its
         exit code once it has ended, else None."""
         return self._follow(output, wait=follow, quiet=False, reconnect_min=reconnect_min,
-                            started=started)  # fmt: skip
+                            started=started, cancel=cancel)  # fmt: skip
 
-    def _follow(self, output, *, wait, quiet, reconnect_min, started):
+    def _follow(self, output, *, wait, quiet, reconnect_min, started, cancel):
         watch = self.box.watch()
         out = output if output is not None else sys.stdout.buffer
         end, _ = jobs.follow(
             self.box.ssh_argv, self.id, out, wait=wait, quiet=quiet, still_there=watch,
-            patience=reconnect_min * 60, started=started,
+            patience=reconnect_min * 60, started=started, cancel=cancel,
         )  # fmt: skip
+        if end.kind == "cancelled":
+            raise KeyboardInterrupt
         if end.kind == "exit":
             return end.rc
         if end.kind == "running":
@@ -721,30 +806,39 @@ class Prefixed:
             self.write(b"\n")
 
 
+@dataclass
+class Outcome:
+    """How waiting on one job ended: its exit `code` (None: still running, when not
+    following), or the `error` it ended with (a `GpuboxError`, or whatever else went
+    wrong here, as it was)."""
+
+    job: Job
+    code: int | None = None
+    error: BaseException | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.code in (0, None)
+
+
 def wait_all(job_list: list[Job], *, output=None, quiet: bool = False, follow: bool = True,
-             reconnect_min: float = 10) -> list:  # fmt: skip
+             reconnect_min: float = 10) -> list[Outcome]:  # fmt: skip
     """Follow several jobs at once (each box's output led by its name when there is more
-    than one) and return, for each, its exit code, None (still running, without
-    `follow`) or the `GpuboxError` it ended with. On KeyboardInterrupt the followers
-    are stopped, the jobs are not, and the interrupt is raised again."""
+    than one) and return how each ended. On KeyboardInterrupt the followers are stopped
+    and joined, the jobs are not, and the interrupt is raised again."""
     lock = threading.Lock()
-    results: dict[int, object] = {}
+    results: dict[int, Outcome] = {}
     procs: list = []  # the ssh processes following, to stop if we are interrupted
+    cancel = threading.Event()
 
     def one(k, j):
         out = output if (len(job_list) == 1 or quiet) else Prefixed(j.box.name, lock, output)
+        kw = {"reconnect_min": reconnect_min, "started": procs.append, "cancel": cancel}
         try:
-            if follow:
-                results[k] = j.wait(out, quiet=quiet, reconnect_min=reconnect_min,
-                                    started=procs.append)  # fmt: skip
-            else:
-                results[k] = j.logs(out, reconnect_min=reconnect_min, started=procs.append)
-        except Exception as exc:
-            results[k] = (
-                exc
-                if isinstance(exc, (InfraError, ConfigError, StateError))
-                else (InfraError(f"{type(exc).__name__}: {exc}"))
-            )
+            code = j.wait(out, quiet=quiet, **kw) if follow else j.logs(out, **kw)
+            results[k] = Outcome(j, code)
+        except BaseException as exc:  # noqa: BLE001 - handed back, not lost in a thread
+            results[k] = Outcome(j, error=exc)
         if isinstance(out, Prefixed):
             out.close()
 
@@ -758,10 +852,15 @@ def wait_all(job_list: list[Job], *, output=None, quiet: bool = False, follow: b
             while t.is_alive():
                 t.join(0.5)
     except KeyboardInterrupt:
+        cancel.set()  # no follower starts another connection
         for proc in procs:  # our followers, not the jobs
             try:
                 proc.kill()
             except OSError:
                 pass
+        for t in threads:
+            t.join(5)
         raise
-    return [results.get(k, InfraError("no result")) for k in range(len(job_list))]
+    return [
+        results.get(k, Outcome(j, error=InfraError("no result"))) for k, j in enumerate(job_list)
+    ]

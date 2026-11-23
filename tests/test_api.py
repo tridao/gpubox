@@ -74,7 +74,7 @@ def test_jobs_through_the_library(world, tmp_path):
     with launch(tmp_path, count=2) as run:
         jobs = run.start('echo "box $GPUBOX_BOX_INDEX"; exit $GPUBOX_BOX_INDEX\n')
         out = io.BytesIO()
-        assert gpubox.wait_all(jobs, output=out) == [0, 1]
+        assert [o.code for o in gpubox.wait_all(jobs, output=out)] == [0, 1]
         assert b"[t-0] box 0\n" in out.getvalue() and b"[t-1] box 1\n" in out.getvalue()
         box = run.box(1)
         assert box.job().id == jobs[1].id  # the newest
@@ -155,3 +155,128 @@ def test_a_box_that_comes_back_elsewhere_is_followed_there(world, tmp_path):
         assert box.watch()() is None  # running: not over
         assert box.port == 40001
         assert gpubox.attach(tmp_path).box().port == 40001  # and so is the state file
+
+
+# ------------------------------------------------------- ownership, after review
+
+
+def test_an_old_handle_cannot_touch_the_run_that_replaced_it(world, tmp_path):
+    a = launch(tmp_path)
+    a.down(policy=FAST)
+    b = launch(tmp_path)
+    labels = {i: world.live[i]["label"] for i in world.ours()}
+    with pytest.raises(gpubox.StateError):
+        a.renew(5)
+    with pytest.raises(gpubox.StateError):
+        a.boxes
+    assert {i: world.live[i]["label"] for i in world.ours()} == labels  # b's tags as they were
+    b.down(policy=FAST)
+
+
+def test_a_failure_after_the_hand_off_tears_the_run_down(world, tmp_path):
+    def interrupted(result, run):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        launch(tmp_path, on_result=interrupted)
+    assert world.ours() == [] and State.load(tmp_path).closed
+
+
+def test_a_launch_without_boxes_leaves_the_directory_ready_for_the_next(world, tmp_path):
+    world.behaviour.update({1: "bad_gpu", 2: "bad_gpu", 3: "bad_gpu"})
+    with pytest.raises(gpubox.NoBoxes):
+        launch(tmp_path)
+    world.behaviour.update({1: "ok", 2: "ok", 3: "ok"})
+    with launch(tmp_path):  # no `down` needed in between
+        pass
+
+
+def test_a_reporter_cannot_change_the_outcome(world, tmp_path):
+    def meddle(result, run):
+        result.winners.clear()
+
+    with launch(tmp_path, on_result=meddle) as run:
+        assert run.boxes
+
+
+def test_settings_and_keywords_are_not_mixed(world, tmp_path):
+    s = gpubox.Settings(state_dir=tmp_path, api_key="secret-key")
+    with pytest.raises(gpubox.ConfigError):
+        gpubox.down(state_dir=tmp_path / "other", settings=s)
+    with pytest.raises(gpubox.ConfigError):
+        gpubox.attach(account_id="1", settings=s)
+    assert "secret-key" not in repr(s)
+
+
+def test_the_blocks_own_exception_wins_over_a_failed_teardown(world, tmp_path, capsys):
+    with pytest.raises(ZeroDivisionError):
+        with launch(tmp_path) as run:
+            world.sticky.add(world.live[world.ours()[0]]["machine"])
+            run.down = lambda policy=None: (_ for _ in ()).throw(gpubox.TeardownIncomplete("x"))
+            1 / 0
+    assert f"gpubox down --run-id {run.id}" in capsys.readouterr().out
+    world.sticky.clear()
+    gpubox.down(run.id, state_dir=tmp_path, policy=FAST)
+
+
+def test_keep_holds_for_one_block_only(world, tmp_path):
+    run = launch(tmp_path)
+    with run:
+        run.keep()
+    assert world.ours()
+    with run:
+        pass
+    assert world.ours() == []
+
+
+def test_arguments_are_checked_like_the_command_lines(world, tmp_path):
+    with pytest.raises(gpubox.ConfigError):
+        gpubox.up(SPEC, namespace="lib", name="t", count=2, policy=gpubox.Policy(count=3),
+                  state_dir=tmp_path)  # fmt: skip
+    assert world.creates == 0
+    with launch(tmp_path, count=2) as run:
+        with pytest.raises(gpubox.ConfigError):
+            run.renew(0)
+        jobs = run.start("exit 0\n", boxes=[1])
+        assert [j.box.index for j in jobs] == [1]
+        with pytest.raises(gpubox.StateError):
+            run.start("exit 0\n", boxes=[5])
+
+
+def test_a_start_that_fails_on_one_box_hands_back_the_others(world, tmp_path):
+    with launch(tmp_path, count=2) as run:
+        LocalSsh.fail = []
+        real = LocalSsh.ssh
+
+        def second_box_down(self, ep, remote, **kw):
+            if ep[0].endswith(".2") and remote == "bash -s":
+                return ["sh", "-c", "exit 255"]
+            return real(self, ep, remote, **kw)
+
+        LocalSsh.ssh = second_box_down
+        try:
+            with pytest.raises(gpubox.BoxLost) as caught:
+                run.start("exit 0\n")
+        finally:
+            LocalSsh.ssh = real
+        assert [j.box.index for j in caught.value.jobs] == [0]
+
+
+def test_a_death_is_told_as_it_is_recorded(world, tmp_path):
+    told = []
+    s = gpubox.Settings(state_dir=tmp_path, on_observation=lambda: told.append(1))
+    run = gpubox.up(SPEC, namespace="lib", name="t", policy=FAST, settings=s)
+    world.live[world.ours()[0]]["status"] = "exited"
+    run.box()._record_if_died("exited")
+    assert told == [1]
+    gpubox.down(run.id, policy=FAST, settings=s)
+
+
+def test_a_cancelled_follow_starts_no_new_connection():
+    import threading
+
+    cancel = threading.Event()
+    cancel.set()
+    end, _ = job.follow(lambda r: pytest.fail("connected"), "20261123-000000-000-abcd",
+                        io.BytesIO(), cancel=cancel)  # fmt: skip
+    assert end.kind == "cancelled"

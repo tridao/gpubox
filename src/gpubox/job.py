@@ -328,6 +328,7 @@ class End:
     none      there is no such job on the box
     gone      the box no longer exists
     unreachable  no connection for longer than we were prepared to wait
+    cancelled    the caller asked to stop following (the job goes on)
     """
 
     kind: str
@@ -362,6 +363,7 @@ def follow(
     patience: float = 600,
     retry: float = 5,
     started=None,
+    cancel=None,
 ) -> tuple[End, int]:
     """Copy a job's log to `out` (a binary stream) from `offset` until the job ends (or,
     without `wait`, until what there is has been copied; with `quiet`, copy nothing and
@@ -373,11 +375,14 @@ def follow(
     the box still exists (False ends it as "gone"; None, unknown, keeps trying). After
     `patience` seconds without a connection, it gives up as "unreachable"; the job, if
     any, carries on regardless. `started(proc)`, if given, is told of each ssh process,
-    so that an interrupted caller can stop it.
+    so that an interrupted caller can stop it; once `cancel` (a threading.Event) is set,
+    no new connection is made and it ends as "cancelled".
     """
     mode = 2 if quiet else (1 if wait else 0)
     failing_since = None
     while True:
+        if cancel is not None and cancel.is_set():
+            return End("cancelled"), offset
         before, t0 = offset, time.monotonic()
         with tempfile.TemporaryFile() as err:
             proc = subprocess.Popen(
@@ -414,7 +419,10 @@ def follow(
         if now - failing_since > patience:
             tail = stderr.strip().splitlines()[-1:] or ["no answer"]
             return End("unreachable", detail=tail[0][:200]), offset
-        time.sleep(retry)
+        if cancel is not None:
+            cancel.wait(retry)
+        else:
+            time.sleep(retry)
 
 
 def run_remote(ssh_argv, remote: str, stdin: str | None = None, timeout: float = 60):

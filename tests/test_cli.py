@@ -1193,3 +1193,12 @@ def test_a_stopped_interruptible_box_is_not_recorded_as_died(world, tmp_path, mo
     assert run(script(tmp_path)) == cli.EXIT_INFRA
     assert observations(tmp_path) == [("healthy", None)]  # outbid is not the machine
     assert "outbid" in capsys.readouterr().out
+
+
+def test_a_run_whose_key_is_gone_is_a_configuration_error(world, tmp_path, local_box):
+    import shutil as sh
+
+    vast, run = world
+    assert run(UP) == 0
+    sh.rmtree(tmp_path / "keys")
+    assert run(job_script(tmp_path, "true\n")) == cli.EXIT_CONFIG

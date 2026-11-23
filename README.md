@@ -145,9 +145,14 @@ spec = gpubox.Spec(image="ghcr.io/org/img:1", gpus=("RTX 5090", "RTX 4090"),
                    max_dph_per_gpu=1.0, min_cpus=12, min_ram_gb=64, ttl_min=240)
 with gpubox.up(spec, namespace="eval", name="shard", count=4) as run:
     jobs = run.start(open("shard.sh").read(), env={"TOKEN": token}, timeout_min=180)
-    codes = gpubox.wait_all(jobs)   # exit codes, or the error each ended with
+    outcomes = gpubox.wait_all(jobs)   # per job: .code, or .error
 # the boxes are destroyed when the block ends, however it ends (run.keep() to keep them)
 ```
+
+If `up` fails or is interrupted after it began the run, it tears the run down
+before raising (and says how to retry if that fails too). A `Run` is a
+handle, not a lock: once the run is torn down or replaced in its state
+directory, whatever would touch its boxes raises `StateError`.
 
 `gpubox.attach(state_dir)` picks up a run left in a state directory (also by
 the command line); `run.boxes[i]` has `ssh_argv`, `sh`, `start`, `job`,
@@ -155,8 +160,8 @@ the command line); `run.boxes[i]` has `ssh_argv`, `sh`, `start`, `job`,
 `gpubox.reap(namespace)` are the teardowns. Failures are exceptions:
 `ConfigError` and `StateError` for our own mistakes, `InfraError` (`NoBoxes`,
 `TeardownIncomplete`, `BoxLost`, `JobLost`) for the provider's or a box's.
-`gpubox.set_log(fn)` sends what it says somewhere other than stdout. The
-command line is a thin layer over this (`gpubox/api.py`).
+`gpubox.set_log(fn)` sends what it says somewhere other than stdout, for the
+whole process. The command line is a thin layer over this (`gpubox/api.py`).
 
 ## Commands
 
