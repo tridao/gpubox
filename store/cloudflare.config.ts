@@ -5,7 +5,7 @@ export default {
   worker: {
     name: "gpubox-reputation",
     entrypoint: "./src/worker.js",
-    compatibilityDate: "2026-09-17",
+    compatibilityDate: "2025-09-01", // the tests run the Worker under the same date
     env: {
       DB: { type: "d1", name: "gpubox-reputation", id: "<database-uuid>" },
     },

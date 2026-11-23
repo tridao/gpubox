@@ -54,19 +54,25 @@ worked).
 
 ## Sharing what machines did
 
-Set `GPUBOX_STORE_URL` and `GPUBOX_STORE_TOKEN` and gpubox shares its
+Set `GPUBOX_STORE_URL` (https) and `GPUBOX_STORE_TOKEN` and gpubox shares its
 observations of machines (which worked, which failed and with what reason
 code; never logs or run names) through the Worker in `store/`:
 
-- before a launch it sends what it has not sent yet and reads everyone's
-  observations of the last 30 days; machines that failed for others are
-  skipped like machines that failed here;
+- before a launch it sends what it has not sent yet and reads what is new;
+  machines that failed for others are skipped like machines that failed here;
 - after a launch, and when a box dies mid-run, it sends what it learned.
 
-Both steps together may take at most 5 seconds and never fail a command. If
-the store cannot be reached, the last complete copy is used and unsent rows
-wait in `outbox.jsonl`. Without the two variables nothing is contacted, and
-`observations.jsonl` alone is used (cache it between CI runs in that case).
+Everything a command says to the store takes at most 5 seconds in total and
+never fails the command. The token is sent to the configured origin only;
+redirects are refused. Each source is judged on its own: somebody else's
+"healthy" does not unblock a machine that failed here.
+
+If the store cannot be reached, what was read earlier is used and unsent rows
+wait in `observations.jsonl.outbox` (the oldest are dropped beyond 1,000).
+Without the two variables nothing is contacted and nothing read earlier is
+used; `observations.jsonl` alone decides (cache it between CI runs in that
+case). With a store, a fresh CI runner reads the last 30 days of failures
+each time unless `observations.jsonl.remote` and `.cursor` are cached too.
 
 ## QuACK CI mapping
 

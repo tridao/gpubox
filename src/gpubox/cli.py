@@ -143,8 +143,10 @@ def share(shared: st.Shared, what: str, **kw) -> None:
     if shared.store:
         try:
             log(f"reputation store: {shared.sync(**kw)}")
-        except Exception as exc:
+        except st.StoreError as exc:  # its messages never contain the URL or the token
             log(f"WARNING: reputation store ({what}): {exc}")
+        except Exception as exc:
+            log(f"WARNING: reputation store ({what}): {type(exc).__name__}")
 
 
 def advisory(what: str, fn, *a, **kw) -> None:
@@ -202,7 +204,11 @@ def cmd_up(args) -> int:
         obs = pol.Observations(observations_path(args))
         shared = open_shared(args)
         share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
-        known = [*obs.rows, *shared.remote_rows()]
+        known = list(obs.rows)  # this client's own rows first: see policy.blocklist
+        try:
+            known += shared.remote_rows()
+        except Exception as exc:
+            log(f"WARNING: reputation store not used: {type(exc).__name__}")
         prober = Prober(key_dir(state_dir, run_id))
         launch = Launch(v.Vast(key), spec, policy, journal, prober, run_id)
         result = launch.run(pol.blocklist(known, time.time()))
@@ -348,7 +354,12 @@ def cmd_reap(args) -> int:
 def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
-    blocked = pol.blocklist([*obs.rows, *open_shared(args).remote_rows()], time.time())
+    remote = []
+    try:
+        remote = open_shared(args).remote_rows()
+    except Exception as exc:
+        log(f"WARNING: reputation store not used: {type(exc).__name__}")
+    blocked = pol.blocklist([*obs.rows, *remote], time.time())
     offers = pol.select_offers(v.Vast(api_key(args)).offers(v.offer_query(spec)), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:

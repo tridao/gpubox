@@ -298,6 +298,10 @@ class Launch:
             )
             kind = v.classify_status(msg)
             if kind == "image":
+                # Close the renting window here, where the error is seen, and
+                # not only when the race loop gets round to this result: it
+                # may be busy, and would rent a replacement meanwhile.
+                self.rent_until = time.monotonic()
                 raise ConfigError(f"image {spec.image!r} cannot be pulled: {msg[:200]}")
             if kind == "machine":
                 a.reason, a.detail = "runtime_error", msg[:200]

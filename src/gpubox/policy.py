@@ -101,43 +101,62 @@ def _valid(row) -> bool:
 def blocklist(rows: list[dict], now: float) -> dict[int, dict]:
     """machine_id -> {"until", "class", "reason"} for machines blocked at `now`.
 
-    Repeats are counted per class (soft, hard), not per reason: a machine that
-    was busy yesterday and is unreachable today is on its second soft strike.
-    A row seen twice (same id) counts once. Rows in the same second are
-    ordered by id, which is arbitrary but the same for every reader.
+    Rows are judged per source: this client's own (no `src` field) and each
+    remote source separately, and a machine is blocked if any source's rows
+    block it. So a `healthy` row takes back soft failures of its own source
+    only: nobody else's report can unblock a machine that failed here, and
+    several sources cannot pile their strikes into one long block.
+
+    Within a source, repeats are counted per class (soft, hard), not per
+    reason: a machine that was busy yesterday and is unreachable today is on
+    its second soft strike. A row seen twice (same id) counts once, for the
+    source it was seen under first; pass this client's own rows first. Rows in
+    the same second are ordered by id, which is arbitrary but the same for
+    every reader.
     """
-    per_machine: dict[int, list[dict]] = {}
+    by_source: dict[str, dict[int, list[dict]]] = {}
     seen = set()
     for row in rows:
         if not _valid(row) or row.get("policy_version", 1) > POLICY_VERSION:
+            continue
+        src = row.get("src", "")
+        if not isinstance(src, str):
             continue
         if row.get("id") is not None:
             if row["id"] in seen:
                 continue
             seen.add(row["id"])
-        per_machine.setdefault(row["machine_id"], []).append(row)
-    out = {}
-    for machine, obs in per_machine.items():
-        block = {"soft": (0, None), "hard": (0, None)}  # class -> (until, reason)
-        strikes: dict[str, list[int]] = {"soft": [], "hard": []}
-        for o in sorted(obs, key=lambda o: (o["ts"], str(o.get("id", "")))):
-            if o["kind"] == "healthy":
-                block["soft"] = (0, None)  # it works now; history still counts
-                continue
-            reason = o.get("reason_code")
-            if reason not in REASONS:
-                continue
-            cls, first, cap = REASONS[reason]
-            recent = [t for t in strikes[cls] if o["ts"] - t <= STRIKE_WINDOW]
-            strikes[cls] = [*recent, o["ts"]]
-            until = o["ts"] + min(first * 2 ** len(recent), cap)
-            if until > block[cls][0]:
-                block[cls] = (until, reason)
-        cls = "hard" if block["hard"][0] > now else "soft"
-        until, reason = block[cls]
-        if until > now:
-            out[machine] = {"until": until, "class": cls, "reason": reason}
+        by_source.setdefault(src, {}).setdefault(row["machine_id"], []).append(row)
+    out: dict[int, dict] = {}
+    rank = lambda b: (b["class"] == "hard", b["until"])
+    for machines in by_source.values():
+        for machine, obs in machines.items():
+            block = _block(obs, now)
+            if block and (machine not in out or rank(block) > rank(out[machine])):
+                out[machine] = block
     return out
+
+
+def _block(obs: list[dict], now: float) -> dict | None:
+    """What one source's rows about one machine amount to at `now`."""
+    block = {"soft": (0, None), "hard": (0, None)}  # class -> (until, reason)
+    strikes: dict[str, list[int]] = {"soft": [], "hard": []}
+    for o in sorted(obs, key=lambda o: (o["ts"], str(o.get("id", "")))):
+        if o["kind"] == "healthy":
+            block["soft"] = (0, None)  # it works now; history still counts
+            continue
+        reason = o.get("reason_code")
+        if reason not in REASONS:
+            continue
+        cls, first, cap = REASONS[reason]
+        recent = [t for t in strikes[cls] if o["ts"] - t <= STRIKE_WINDOW]
+        strikes[cls] = [*recent, o["ts"]]
+        until = o["ts"] + min(first * 2 ** len(recent), cap)
+        if until > block[cls][0]:
+            block[cls] = (until, reason)
+    cls = "hard" if block["hard"][0] > now else "soft"
+    until, reason = block[cls]
+    return {"until": until, "class": cls, "reason": reason} if until > now else None
 
 
 def select_offers(offers: list[dict], blocked: dict[int, dict], want: int) -> list[dict]:

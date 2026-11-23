@@ -1,11 +1,11 @@
 // gpubox reputation store: storage and validation, no policy.
 //
 //   POST /v1/observations   {"observations": [...]}   at most MAX_BATCH
-//   GET  /v1/observations?provider=vast[&after=CURSOR][&limit=N]
+//   GET  /v1/observations?provider=vast[&after=SEQ][&limit=N]
 //   GET  /v1/health
 //
 // Every client has its own bearer token, a Worker secret named TOKEN_<SOURCE>.
-// The Worker decides `source` (from the token) and `received_at` (its own
+// The Worker decides who wrote a row (from the token) and when (the database's
 // clock); whatever a client says about either is ignored. What clients do
 // with the rows (the blocklist policy) lives in the Python package.
 //
@@ -13,10 +13,11 @@
 // exports anything but handlers.
 
 const MAX_BATCH = 50;
+const MAX_BODY_BYTES = 64 * 1024;
 const MAX_PAGE = 1000;
 const WINDOW_DAYS = 30; // how far back a read goes
 const RETENTION_DAYS = 90; // rows older than this are deleted
-const MAX_ROWS_PER_SOURCE_PER_DAY = 2000;
+const MAX_ROWS_PER_SOURCE_PER_DAY = 500;
 const FAILURE_SPACING_MS = 3600 * 1000; // one counted failure per source and machine
 
 const DAY_MS = 86400 * 1000;
@@ -26,6 +27,8 @@ const REASONS = [
   "runtime_error", "wrong_hardware", "cuda_init", "compute_mismatch",
 ];
 const PROVIDERS = ["vast"];
+// The database's clock in ms, evaluated when the statement runs.
+const NOW_SQL = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 
 const json = (status, body) =>
   new Response(JSON.stringify(body), {
@@ -72,6 +75,8 @@ async function digest(text) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
 }
 
+const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+
 /** The source a bearer token belongs to, or null. Compares digests in constant time. */
 async function sourceOf(request, env) {
   const header = request.headers.get("authorization") || "";
@@ -88,10 +93,44 @@ async function sourceOf(request, env) {
   return found;
 }
 
-async function post(request, env, source, now) {
+/** What readers see instead of a source's name: stable, and meaningless without the salt. */
+async function opaque(source, env) {
+  const salt = typeof env.SOURCE_SALT === "string" ? env.SOURCE_SALT : "";
+  return hex(await digest(`gpubox-source:${salt}:${source}`)).slice(0, 16);
+}
+
+/** The request body as text, or null if it is longer than `limit` bytes. Stops reading there. */
+async function boundedText(request, limit) {
+  if (Number(request.headers.get("content-length") || 0) > limit) return null;
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    all.set(c, at);
+    at += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+
+async function post(request, env, source) {
+  const text = await boundedText(request, MAX_BODY_BYTES);
+  if (text === null) return json(413, { error: `body larger than ${MAX_BODY_BYTES} bytes` });
   let body;
   try {
-    body = JSON.parse(await request.text());
+    body = JSON.parse(text);
   } catch {
     return json(400, { error: "body is not JSON" });
   }
@@ -105,79 +144,110 @@ async function post(request, env, source, now) {
     if (typeof row === "string") return json(400, { error: `observation ${i}: bad ${row}` });
     clean.push(row);
   }
-  const today = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM observations WHERE source = ?1 AND received_at > ?2",
+
+  // Rows we have already (a resend) cost nothing and take nobody's place.
+  const known = await env.DB.prepare(
+    "SELECT id FROM observations WHERE id IN (SELECT value FROM json_each(?1))",
   )
-    .bind(source, now - DAY_MS)
+    .bind(JSON.stringify(clean.map((r) => r.id)))
+    .all();
+  const have = new Set(known.results.map((r) => r.id));
+  const fresh = [];
+  const failed = new Set();
+  for (const row of clean) {
+    if (have.has(row.id)) continue;
+    have.add(row.id); // the same id twice in one request counts once
+    if (row.kind !== "healthy") {
+      // One counted failure per machine in a request; the statement below
+      // applies the same rule against what is already stored.
+      const key = `${row.provider}:${row.machine_id}`;
+      if (failed.has(key)) continue;
+      failed.add(key);
+    }
+    fresh.push({ ...row, n: fresh.length });
+  }
+  if (fresh.length === 0) return json(200, { accepted: 0, ignored: clean.length });
+
+  const used = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM observations WHERE source = ?1 AND received_at > ${NOW_SQL} - ?2`,
+  )
+    .bind(source, DAY_MS)
     .first("n");
-  if (today + clean.length > MAX_ROWS_PER_SOURCE_PER_DAY) {
+  if (used + fresh.length > MAX_ROWS_PER_SOURCE_PER_DAY) {
     return json(429, { error: "daily limit for this source reached" });
   }
-  let accepted = 0;
-  let ignored = 0;
-  const failedInBatch = new Set();
-  for (const row of clean) {
-    if (row.kind !== "healthy") {
-      // One source cannot pile strikes on a machine: one counted failure an hour.
-      const key = `${row.provider}:${row.machine_id}`;
-      const recent = await env.DB.prepare(
-        "SELECT 1 AS hit FROM observations WHERE source = ?1 AND provider = ?2 AND machine_id = ?3" +
-          " AND kind != 'healthy' AND received_at > ?4 AND id != ?5 LIMIT 1",
-      )
-        .bind(source, row.provider, row.machine_id, now - FAILURE_SPACING_MS, row.id)
-        .first("hit");
-      if (recent || failedInBatch.has(key)) {
-        ignored++;
-        continue;
-      }
-      failedInBatch.add(key);
-    }
-    const result = await env.DB.prepare(
-      "INSERT OR IGNORE INTO observations (id, received_at, source, provider, machine_id," +
-        " host_id, kind, reason_code, gpu, num_gpus, gate_version, policy_version, secs_to_ready)" +
-        " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-    )
-      .bind(
-        row.id, now, source, row.provider, row.machine_id, row.host_id, row.kind,
-        row.reason_code, row.gpu, row.num_gpus, row.gate_version, row.policy_version,
-        row.secs_to_ready,
-      )
-      .run();
-    if (result.meta.changes) accepted++;
-    else ignored++; // seen before: a resend
-  }
-  return json(200, { accepted, ignored });
+
+  // One statement, so that the limits hold however many requests race: the
+  // database runs statements one at a time, and this one counts and checks
+  // what is stored at the moment it inserts.
+  const result = await env.DB.prepare(
+    "INSERT OR IGNORE INTO observations (id, received_at, source, provider, machine_id," +
+      " host_id, kind, reason_code, gpu, num_gpus, gate_version, policy_version, secs_to_ready)" +
+      ` SELECT r.value ->> 'id', ${NOW_SQL}, ?2, r.value ->> 'provider', r.value ->> 'machine_id',` +
+      " r.value ->> 'host_id', r.value ->> 'kind', r.value ->> 'reason_code', r.value ->> 'gpu'," +
+      " r.value ->> 'num_gpus', r.value ->> 'gate_version', r.value ->> 'policy_version'," +
+      " r.value ->> 'secs_to_ready'" +
+      " FROM json_each(?1) AS r" +
+      " WHERE (SELECT COUNT(*) FROM observations q WHERE q.source = ?2" +
+      `        AND q.received_at > ${NOW_SQL} - ?3) + (r.value ->> 'n') < ?4` +
+      "   AND (r.value ->> 'kind' = 'healthy' OR NOT EXISTS (" +
+      "        SELECT 1 FROM observations f WHERE f.source = ?2" +
+      "          AND f.provider = r.value ->> 'provider' AND f.machine_id = r.value ->> 'machine_id'" +
+      `          AND f.kind != 'healthy' AND f.received_at > ${NOW_SQL} - ?5))`,
+  )
+    .bind(JSON.stringify(fresh), source, DAY_MS, MAX_ROWS_PER_SOURCE_PER_DAY, FAILURE_SPACING_MS)
+    .run();
+  const accepted = result.meta.changes;
+  return json(200, { accepted, ignored: clean.length - accepted });
 }
 
-async function get(url, env, now) {
+async function get(url, env) {
   const provider = url.searchParams.get("provider");
   if (!PROVIDERS.includes(provider)) return json(400, { error: "provider" });
   const limit = Number(url.searchParams.get("limit") || MAX_PAGE);
   if (!isInt(limit, 1, MAX_PAGE)) return json(400, { error: "limit" });
-  let afterTime = now - WINDOW_DAYS * DAY_MS;
-  let afterId = "";
-  const after = url.searchParams.get("after");
-  if (after !== null) {
-    const m = /^(\d{1,16}):([0-9a-f]{16,64})$/.exec(after);
-    if (!m) return json(400, { error: "after" });
-    afterTime = Math.max(afterTime, Number(m[1]));
-    afterId = Number(m[1]) >= afterTime ? m[2] : "";
+  const afterText = url.searchParams.get("after") ?? "0";
+  if (!/^\d{1,15}$/.test(afterText)) return json(400, { error: "after" });
+  const after = Number(afterText);
+  // What a reader needs to decide whom to skip: every failure, and a healthy
+  // row only where the same source had failed that machine before (it then
+  // takes back that source's own soft verdict). Healthy rows of machines
+  // nobody complained about, the bulk of the table, are not sent.
+  const [page, revoked] = await env.DB.batch([
+    env.DB.prepare(
+      "SELECT o.seq, o.id, o.received_at, o.source, o.provider, o.machine_id, o.kind," +
+        " o.reason_code, o.policy_version FROM observations o" +
+        ` WHERE o.provider = ?1 AND o.seq > ?2 AND o.received_at > ${NOW_SQL} - ?3` +
+        " AND o.source NOT IN (SELECT source FROM revoked_sources)" +
+        " AND (o.kind != 'healthy' OR EXISTS (SELECT 1 FROM observations f" +
+        "      WHERE f.source = o.source AND f.provider = o.provider" +
+        "        AND f.machine_id = o.machine_id AND f.kind != 'healthy' AND f.seq < o.seq" +
+        `        AND f.received_at > ${NOW_SQL} - ?3))` +
+        " ORDER BY o.seq LIMIT ?4",
+    ).bind(provider, after, WINDOW_DAYS * DAY_MS, limit + 1),
+    env.DB.prepare("SELECT source FROM revoked_sources"),
+  ]);
+  const rows = page.results.slice(0, limit);
+  const names = new Map();
+  for (const name of [...rows.map((r) => r.source), ...revoked.results.map((r) => r.source)]) {
+    if (!names.has(name)) names.set(name, await opaque(name, env));
   }
-  const { results } = await env.DB.prepare(
-    "SELECT id, received_at, source, provider, machine_id, host_id, kind, reason_code, gpu," +
-      " num_gpus, gate_version, policy_version, secs_to_ready FROM observations" +
-      " WHERE provider = ?1 AND (received_at > ?2 OR (received_at = ?2 AND id > ?3))" +
-      " AND source NOT IN (SELECT source FROM revoked_sources)" +
-      " ORDER BY received_at, id LIMIT ?4",
-  )
-    .bind(provider, afterTime, afterId, limit + 1)
-    .all();
-  const page = results.slice(0, limit);
-  const last = page[page.length - 1];
   return json(200, {
-    // `ts` is when we received the row, in seconds: the only time clients may rely on.
-    observations: page.map(({ received_at, ...row }) => ({ ...row, ts: received_at / 1000 })),
-    next: results.length > limit ? `${last.received_at}:${last.id}` : null,
+    observations: rows.map((r) => ({
+      seq: r.seq,
+      id: r.id,
+      ts: r.received_at / 1000, // when we received it: the only time clients may rely on
+      src: names.get(r.source),
+      provider: r.provider,
+      machine_id: r.machine_id,
+      kind: r.kind,
+      reason_code: r.reason_code,
+      policy_version: r.policy_version,
+    })),
+    // Resume after this sequence number; null when there is nothing more for now.
+    next: page.results.length > limit ? rows[rows.length - 1].seq : null,
+    // Rows of these sources are no longer served; drop the ones you kept.
+    revoked: revoked.results.map((r) => names.get(r.source)),
   });
 }
 
@@ -193,9 +263,8 @@ export default {
         .bind(source)
         .first("hit");
       if (revoked) return json(403, { error: "this source is revoked" });
-      const now = Date.now();
-      if (request.method === "POST") return await post(request, env, source, now);
-      if (request.method === "GET") return await get(url, env, now);
+      if (request.method === "POST") return await post(request, env, source);
+      if (request.method === "GET") return await get(url, env);
       return json(405, { error: "method" });
     } catch (err) {
       console.error(err && err.stack ? err.stack : String(err));
@@ -204,8 +273,8 @@ export default {
   },
 
   async scheduled(event, env) {
-    await env.DB.prepare("DELETE FROM observations WHERE received_at < ?1")
-      .bind(Date.now() - RETENTION_DAYS * DAY_MS)
+    await env.DB.prepare(`DELETE FROM observations WHERE received_at < ${NOW_SQL} - ?1`)
+      .bind(RETENTION_DAYS * DAY_MS)
       .run();
   },
 };

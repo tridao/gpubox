@@ -213,6 +213,27 @@ def test_a_queued_worker_does_not_rent_after_an_image_error(tmp_path, monkeypatc
     nothing_left(vast, journal)
 
 
+def test_no_replacement_is_rented_between_an_image_error_and_its_collection(tmp_path):
+    # Host 1 fails its gate; while we confirm its delete, host 2's worker is
+    # told the image cannot be pulled. When the delete returns, host 1's slot
+    # is free and host 2's result has not been looked at yet: renting host 3
+    # now would be renting after we knew better.
+    launch, vast, journal = start(tmp_path, {1: "bad_gpu", 2: "image", 3: "ok"}, image_grace=0.3)
+    vast.image_gate = threading.Event()
+
+    def confirm_slowly(iid):
+        if vast.live.get(iid, {}).get("machine") == 1:
+            vast.image_gate.set()  # only now does host 2 report the image error
+            assert vast.image_seen.wait(5)
+            time.sleep(0.1)  # let that worker act on what it saw
+
+    vast.on_destroy = confirm_slowly
+    assert isinstance(outcome(launch), L.ConfigError)
+    assert vast.creates == 2
+    assert len(launch.attempts) == 2  # host 3 was never even lined up
+    nothing_left(vast, journal)
+
+
 def test_an_image_error_is_reported_when_nothing_else_comes_up(tmp_path):
     launch, vast, journal = start(tmp_path, {1: "image", 2: "bad_gpu", 3: "ok"})
     with pytest.raises(L.ConfigError):

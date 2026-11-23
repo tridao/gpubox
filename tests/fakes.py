@@ -65,6 +65,8 @@ class FakeVast:
         self.revealed = False
         self.slow_secs = slow_secs
         self.release = threading.Event()  # lets "hold" boxes through the gate
+        self.image_seen = threading.Event()  # a worker has been told the image cannot be pulled
+        self.image_gate = None  # if set, an Event that must be set before "image" boxes say so
         self.in_gate = {}  # machine -> Event, set when its gate starts
         self.list_fails = 0  # number of listing calls that raise first
         self.on_destroy = None  # called with the instance id before each destroy
@@ -116,6 +118,8 @@ class FakeVast:
         if box is None:
             return None
         kind = self.behaviour.get(box["machine"], "ok")
+        if kind == "image" and self.image_gate and not self.image_gate.is_set():
+            kind = "stuck"  # still pulling, as far as anyone can tell
         if kind == "api_down":
             raise v.VastError(503, "unavailable")
         row = {"id": iid, "label": box["label"], "actual_status": "loading", "status_msg": ""}
@@ -125,6 +129,7 @@ class FakeVast:
             )
         elif kind == "image":
             row["status_msg"] = "Error response from daemon: manifest unknown"
+            self.image_seen.set()
         elif kind == "exited":
             row["actual_status"] = "exited"
         elif kind != "stuck":

@@ -6,25 +6,42 @@ policy stays in the Python package. The store is advisory: nothing depends on
 it for cleanup, and a launch never fails because of it.
 
 ```
-POST /v1/observations   {"observations": [...]}   at most 50 per request
-GET  /v1/observations?provider=vast[&after=CURSOR][&limit=N]   last 30 days, paged
+POST /v1/observations   {"observations": [...]}   at most 50 rows and 64 KB
+GET  /v1/observations?provider=vast[&after=SEQ][&limit=N]
 GET  /v1/health
 ```
 
 - Each client has its own bearer token, a Worker secret named `TOKEN_<SOURCE>`
-  (at least 32 characters). The Worker sets `source` from the token and the
-  time from its own clock; what a client says about either is ignored.
-- A row is stored once (`INSERT OR IGNORE` on its id), so resending is safe.
-- Per source: 2,000 rows a day, and one counted failure per machine per hour.
+  (at least 32 characters; names must differ in more than case). The Worker
+  decides who wrote a row, from the token, and when, from the database's
+  clock; what a client says about either is ignored.
+- A row is stored once (its id is unique), so resending is safe and free.
+- Per source: 500 new rows a day, and one counted failure per machine per
+  hour. Both are part of the insert statement itself, so requests that race
+  cannot get past them.
+- Reads are by sequence number, in commit order: ask for what comes after the
+  last number you have. Rows of the last 30 days are served.
+- Readers get reason codes only: `seq, id, ts, src, provider, machine_id,
+  kind, reason_code, policy_version`. `src` is an opaque id of the source
+  (a salted hash), not its name. A `healthy` row is served only where the same
+  source had reported a failure of that machine before; the healthy rows of
+  machines nobody complained about stay in the database.
 - Rows are deleted after 90 days by a daily scheduled run.
 - To cut a source off: `INSERT INTO revoked_sources (source, revoked_at) VALUES
-  ('laptop', <ms>)`. It can then neither write nor read, and its rows are no
-  longer served.
+  ('laptop', <ms>)`. It can then neither write nor read, its rows are no
+  longer served, and every read lists the revoked sources' opaque ids so that
+  clients drop what they had kept.
+
+What one valid token can still do: mark up to 500 machines a day as failed
+for everyone, for as long as the policy blocks on one source's word (two
+hours to 14 days on a first report). It cannot unblock a machine for anyone
+else, and revoking it undoes its rows. Requests are not rate-limited beyond
+that; add a Cloudflare rate-limiting rule if that matters.
 
 ## Develop
 
 ```bash
-npm install          # wrangler (build), cf (deploy), miniflare (tests); all pinned
+npm ci               # wrangler (build), cf (deploy), miniflare (tests); all pinned
 npm test             # the Worker against a local D1; no network
 ```
 
@@ -39,8 +56,11 @@ npx cf d1 migrations apply <database-uuid>
 npx cf deploy --secrets-file ~/.config/gpubox/store-secrets.json
 ```
 
-The secrets file is JSON, `{"TOKEN_LAPTOP": "...", "TOKEN_QUACK_CI": "..."}`,
-and stays out of the repository.
+The secrets file is JSON and stays out of the repository:
+
+```json
+{"TOKEN_LAPTOP": "...", "TOKEN_QUACK_CI": "...", "SOURCE_SALT": "..."}
+```
 
 The Worker's entry module must export nothing but the default handler object;
 the runtime rejects any other export (the tests catch this, `cf deploy
