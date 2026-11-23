@@ -796,6 +796,11 @@ MUTATIONS = [
      '    if args.namespace is not None and args.max_age_min is not None:',
      '    if False:',
      'does_not_say_what_it_is_for'),
+    ('excluded countries are rented anyway',
+     'launch.py',
+     '        allowed = v.in_allowed_country(found, spec.exclude_countries)',
+     '        allowed = found',
+     'hosts_in_china_are_skipped'),
 ]
 # fmt: on
 

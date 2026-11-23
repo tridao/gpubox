@@ -98,6 +98,10 @@ runs.
 The shared reputation store (`store/`, `src/gpubox/store.py`) is parked: its
 code and tests are kept, and no command talks to it.
 
+Hosts in mainland China are skipped by default (`--exclude-country`, default
+`CN`; `none` to skip none): in `experiments/pull_time` they took a median of
+250 s to load the CI image against 65 s elsewhere, and 2 of 6 never did.
+
 ## QuACK CI mapping
 
 The flags that reproduce `tools/ci/vast/vast_ci.py` (checked against a pinned

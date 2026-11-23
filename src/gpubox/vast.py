@@ -332,6 +332,21 @@ def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
     }
 
 
+def country_of(offer: dict) -> str | None:
+    """The country code an offer's location ends in ("Anhui, CN" -> "CN"), if it has one."""
+    geo = offer.get("geolocation")
+    if not isinstance(geo, str):
+        return None
+    code = geo.rsplit(",", 1)[-1].strip().upper()
+    return code if len(code) == 2 and code.isalpha() else None
+
+
+def in_allowed_country(offers: list[dict], excluded) -> list[dict]:
+    """Offers not located in an excluded country. An offer without a location is kept."""
+    excluded = {c.upper() for c in excluded}
+    return [o for o in offers if country_of(o) not in excluded]
+
+
 def classify_status(msg: str) -> str | None:
     """'image', 'machine', or None for a status message that decides nothing."""
     low = msg.lower()

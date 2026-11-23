@@ -106,8 +106,21 @@ def spec_from(args, image: str = "") -> Spec:
         disk_gb=args.disk_gb,
         max_dph_per_gpu=args.max_dph_per_gpu,
         must_reach=tuple(args.must_reach),
+        exclude_countries=countries(args),
         ttl_min=getattr(args, "ttl_min", 90),
     )
+
+
+def countries(args) -> tuple[str, ...]:
+    """The country codes to skip: CN unless --exclude-country says otherwise ("none": skip none)."""
+    given = args.exclude_country if args.exclude_country is not None else ["CN"]
+    codes = tuple(c.upper() for c in given if c.lower() != "none")
+    for code in codes:
+        if not re.fullmatch(r"[A-Z]{2}", code):
+            raise ConfigError(
+                f"--exclude-country expects a two-letter code or 'none', got {code!r}"
+            )
+    return codes
 
 
 def observations_path(args) -> Path:
@@ -374,7 +387,8 @@ def cmd_search(args) -> int:
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
     blocked = pol.blocklist(obs.rows, time.time())
-    offers = pol.select_offers(v.Vast(api_key(args)).offers(v.offer_query(spec)), blocked, 2)
+    found = v.Vast(api_key(args)).offers(v.offer_query(spec))
+    offers = pol.select_offers(v.in_allowed_country(found, spec.exclude_countries), blocked, 2)
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
         note = blocked.get(o.get("machine_id"), {}).get("reason", "")
@@ -436,6 +450,12 @@ def main(argv=None) -> int:
         s.add_argument("--min-cuda", type=number(float, 0), default=12.0)
         s.add_argument("--disk-gb", type=number(int, 1), default=40)
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
+        s.add_argument(
+            "--exclude-country",
+            action="append",
+            metavar="CC",
+            help="skip hosts in this country (repeatable); default CN; 'none' to skip none",
+        )
         state_args(s)
 
     s = sub.add_parser("up")

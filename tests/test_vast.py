@@ -365,6 +365,21 @@ def same_but_for_the_timer(payload, reference):
     return ours == theirs and rest == old_rest + old_sshd
 
 
+def test_offers_in_an_excluded_country_are_dropped_and_unknown_locations_kept():
+    offers = [
+        {"id": 1, "geolocation": "Anhui, CN"},
+        {"id": 2, "geolocation": "China, CN"},
+        {"id": 3, "geolocation": "Taiwan, TW"},
+        {"id": 4, "geolocation": "California, US"},
+        {"id": 5, "geolocation": None},
+        {"id": 6},
+        {"id": 7, "geolocation": "CN"},
+        {"id": 8, "geolocation": "Somewhere"},
+    ]
+    assert [o["id"] for o in v.in_allowed_country(offers, ("cn",))] == [3, 4, 5, 6, 8]
+    assert v.in_allowed_country(offers, ()) == offers
+
+
 def test_offer_query_scales_with_gpu_count():
     q = v.offer_query(Spec(image="i", gpu="RTX 5090", num_gpus=4, max_dph_per_gpu=1.25))
     assert q["num_gpus"] == {"eq": 4} and q["dph_total"] == {"lte": 5.0}

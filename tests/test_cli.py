@@ -200,6 +200,22 @@ def test_the_run_id_is_published_before_anything_is_rented(world, tmp_path, monk
     assert seen and all("run_id=quack-ci.77-1." in text for text in seen)
 
 
+def test_hosts_in_china_are_skipped_unless_asked_for(world):
+    vast, run = world
+    vast._offers[0]["geolocation"] = "Anhui, CN"  # machine 1, the cheapest
+    vast._offers[1]["geolocation"] = "Texas, US"
+    assert run([*UP, "--spare", "0"]) == 0
+    assert vast.names("create") == [("create", 2)]
+    assert run(["down"]) == 0
+    assert run([*UP, "--spare", "0", "--exclude-country", "none"]) == 0
+    assert vast.names("create")[-1] == ("create", 1)
+    assert run(["down"]) == 0
+    assert run([*UP, "--exclude-country", "us", "--exclude-country", "CN"]) == cli.EXIT_INFRA
+    assert len(vast.names("create")) == 2  # nothing left to rent
+    assert run(["down"]) == 0
+    assert run([*UP, "--exclude-country", "China"]) == cli.EXIT_CONFIG
+
+
 def test_up_proves_it_can_list_before_it_rents(world):
     vast, run = world
     vast.list_fails = 1

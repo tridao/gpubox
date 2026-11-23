@@ -56,6 +56,9 @@ class Spec:
     min_inet_down_mbps: int = 200
     must_reach: tuple[str, ...] = ()
     ttl_min: int = 90
+    # Hosts in mainland China took a median of 250 s to load the CI image against 65 s
+    # elsewhere, and 2 of 6 never did (experiments/pull_time, 2026-11-23).
+    exclude_countries: tuple[str, ...] = ("CN",)
 
 
 @dataclass(frozen=True)
@@ -335,12 +338,13 @@ class Launch:
     def _race(self, blocked: dict[int, dict], t0: float) -> Attempt | None:
         spec, policy = self.spec, self.policy
         deadline = t0 + policy.overall_timeout - policy.cleanup_reserve
-        offers = collections.deque(
-            pol.select_offers(self.vast.offers(v.offer_query(spec)), blocked, policy.max_live)
-        )
+        found = self.vast.offers(v.offer_query(spec))
+        allowed = v.in_allowed_country(found, spec.exclude_countries)
+        offers = collections.deque(pol.select_offers(allowed, blocked, policy.max_live))
         log(
             f"{len(offers)} candidate host(s) for {spec.num_gpus}x {spec.gpu} "
-            f"({len(blocked)} machine(s) blocked); racing {policy.max_live}, "
+            f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
+            f"excluded countries); racing {policy.max_live}, "
             f"up to {policy.max_attempts} attempts"
         )
         image_error = None

@@ -442,7 +442,9 @@ The blocklist is one pure function of `observations.jsonl`:
 
 A later `healthy` row clears the first two. If fewer candidates than the cap
 remain, the first two are re-admitted, soonest to expire first. Offers are
-taken cheapest first, one machine per host. Doubling on repeats goes away.
+taken cheapest first, one machine per host. Offers in excluded countries
+(`--exclude-country`, default `CN`) are dropped before that, on the client,
+so the search request itself is unchanged. Doubling on repeats goes away.
 The row format is kept, so the store can be wired back without a migration.
 
 ## 12. What the launcher asks of a provider
