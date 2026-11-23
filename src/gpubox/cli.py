@@ -102,6 +102,13 @@ def write_summary(spec: Spec, result: Result) -> None:
 
 
 def spec_from(args, image: str = "") -> Spec:
+    try:
+        return _spec_from(args, image)
+    except ValueError as exc:  # what Spec itself refuses
+        raise ConfigError(str(exc)) from None
+
+
+def _spec_from(args, image: str = "") -> Spec:
     cap = None
     if args.capability:
         if not re.fullmatch(r"\d+\.\d+", args.capability):
@@ -347,7 +354,10 @@ def cmd_ssh(args) -> int:
         argv = box.ssh_argv(remote, tty=sys.stdin.isatty())
     else:
         argv = box.ssh_argv(None, tty=True)  # a login shell, which loads the environment itself
-    return subprocess.run(argv).returncode
+    rc = subprocess.run(argv).returncode
+    if box._refreshed(rc):  # not run again: the command may have run before the drop
+        log(f"{box.name} answers at a new address now; run the command again")
+    return rc
 
 
 def cmd_renew(args) -> int:
@@ -477,7 +487,7 @@ def main(argv=None) -> int:
             "--interruptible",
             action="store_true",
             help="bid for interruptible boxes: cheaper, but stopped when outbid "
-            "(run `reap` on a schedule)",
+            "(run `reap --destroy` on a schedule)",
         )
         s.add_argument(
             "--bid-markup",

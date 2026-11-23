@@ -51,7 +51,10 @@ the host's docker daemon see the token, so make it a read-only pull token.
 times each offer's minimum bid; the price cap applies to the bid with the
 disk. An outbid box is stopped: its job dies, and the box keeps billing its
 disk, with its lease timer stopped too, until something destroys it. So run
-`reap` on a schedule, and expect `wait` to report a lost job (75). Machines
+`gpubox reap --namespace NS --destroy` on a schedule, and expect `wait` to
+report a lost job (75). Two launches in different state directories can still
+bid on one machine at the same moment: the account's boxes are looked at
+once, when a launch starts. Machines
 the account already has a box on are skipped (our own bids would outbid each
 other), and a box that stops or never starts is not held against its machine.
 

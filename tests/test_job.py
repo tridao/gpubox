@@ -1,6 +1,7 @@
 """Jobs on a box: what is sent, and how the follower's answers are read."""
 
 import io
+import os
 import subprocess
 
 import pytest
@@ -138,3 +139,13 @@ def test_a_connection_that_held_for_a_while_starts_the_outage_count_again(monkey
     end, _ = job.follow(ssh, "20261123-000000-000-abcd", io.BytesIO(), patience=150)
     # Without the held connection it would give up after the third try (200 s > 150).
     assert end.kind == "unreachable" and len(tries) == 5
+
+
+def test_a_start_the_box_stopped_under_is_listed_lost_once_it_is_old(tmp_path, monkeypatch):
+    monkeypatch.setenv("GPUBOX_JOBS", str(tmp_path))
+    young, old = tmp_path / "20261123-000000-000-aaaa", tmp_path / "20261123-000000-000-bbbb"
+    young.mkdir()
+    old.mkdir()
+    os.utime(old, (1, 1))
+    r = subprocess.run(["bash", "-c", job.list_command()], capture_output=True, text=True)
+    assert r.stdout.splitlines() == [f"{young.name} running", f"{old.name} lost"]

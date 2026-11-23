@@ -78,6 +78,7 @@ class FakeVast:
     hook_fail passes the gate; the caller's gate script fails without a verdict
     hook_net  passes the gate; the caller's gate script blames the network
     hook_late passes the gate; the caller's gate script never finishes
+    preempted its gate loses the connection, and the box is then stopped (outbid)
     """
 
     def __init__(self, behaviour, offers=None, slow_secs=0.2):
@@ -175,7 +176,7 @@ class FakeVast:
             row.update(
                 actual_status=box.get("status", "running"),
                 public_ipaddr=f"10.0.0.{box['machine']}",
-                ports={"22/tcp": [{"HostPort": "2222"}]},
+                ports={"22/tcp": [{"HostPort": str(box.get("port", 2222))}]},
             )
         return row
 
@@ -198,7 +199,9 @@ class FakeVast:
             row = {k: box.get(k) for k in ("id", "label", "start_date", "image_uuid")}
             if iid in self.unlabelled:
                 row["label"] = None
-            rows.append({**row, "machine_id": box["machine"], "actual_status": "running"})
+            # Others' boxes are on machines too, just not ones we rent here.
+            machine = box["machine"] if box["machine"] is not None else 70000 + iid
+            rows.append({**row, "machine_id": machine, "actual_status": "running"})
         for iid, entry in list(self.lingering.items()):
             if iid not in self.live and entry[1] > 0:
                 entry[1] -= 1
@@ -336,6 +339,11 @@ class FakeProber:
                 return False, "cuda_init", "CUDA unavailable", {}
             if kind == "busy":
                 return False, "busy_gpu", "util 100%", {}
+            if kind == "preempted":
+                for b in vast.live.values():
+                    if b["machine"] == machine:
+                        b["status"] = "exited"
+                return False, "unreachable", "ssh dropped during gate", {}
             if kind == "old_driver":
                 return False, None, "driver supports CUDA 12.8", {"needs_cuda": 13}
             if kind == "vanish":

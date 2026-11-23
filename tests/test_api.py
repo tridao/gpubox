@@ -280,3 +280,46 @@ def test_a_cancelled_follow_starts_no_new_connection():
     end, _ = job.follow(lambda r: pytest.fail("connected"), "20261123-000000-000-abcd",
                         io.BytesIO(), cancel=cancel)  # fmt: skip
     assert end.kind == "cancelled"
+
+
+def test_search_shows_the_bids_up_would_make(world, tmp_path):
+    world._offers[:] = [
+        {"id": 1001, "machine_id": 1, "host_id": 1, "dph_total": 0.11, "min_bid": 0.10},
+        {"id": 1002, "machine_id": 2, "host_id": 2, "dph_total": 1.10, "min_bid": 1.0},
+    ]
+    world.live[8000] = {"id": 8000, "label": None, "machine": 3}
+    world._offers.append({"id": 1003, "machine_id": 3, "host_id": 3, "dph_total": 0.05,
+                          "min_bid": 0.04})  # fmt: skip
+    bids = gpubox.Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25, interruptible=True)
+    offers, _ = gpubox.search(bids, state_dir=tmp_path)
+    assert [(o["machine_id"], o["_bid"]) for o in offers] == [(1, 0.125)]  # 2 over cap, 3 ours
+    world.live.pop(8000)
+
+
+def test_a_move_that_could_not_be_written_is_written_later(world, tmp_path):
+    from gpubox.state import state_lock
+
+    with launch(tmp_path) as run:
+        box = run.box()
+        with state_lock(tmp_path):  # another command holds the directory
+            box._moved("10.9.9.9", 4000)
+        assert gpubox.attach(tmp_path).box().port != 4000
+        box._moved("10.9.9.9", 4000)
+        assert gpubox.attach(tmp_path).box().port == 4000
+
+
+def test_naming_the_newest_job_follows_a_box_that_moved(world, tmp_path):
+    with launch(tmp_path) as run:
+        box = run.box()
+        first = box.start("exit 0\n")
+        real = world.instance
+
+        def moved(iid, **kw):
+            row = real(iid, **kw)
+            if row is not None and "ports" in row:
+                row["ports"] = {"22/tcp": [{"HostPort": "40001"}]}
+            return row
+
+        world.instance = moved
+        LocalSsh.fail = ["down"]  # the old address no longer answers
+        assert box.job().id == first.id and box.port == 40001

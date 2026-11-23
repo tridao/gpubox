@@ -1202,3 +1202,9 @@ def test_a_run_whose_key_is_gone_is_a_configuration_error(world, tmp_path, local
     assert run(UP) == 0
     sh.rmtree(tmp_path / "keys")
     assert run(job_script(tmp_path, "true\n")) == cli.EXIT_CONFIG
+
+
+def test_a_bid_markup_out_of_bounds_is_a_configuration_error(world):
+    vast, run = world
+    assert run([*UP, "--interruptible", "--bid-markup", "1000"]) == cli.EXIT_CONFIG
+    assert vast.creates == 0

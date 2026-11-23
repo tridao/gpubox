@@ -163,8 +163,9 @@ def select_offers(offers: list[dict], blocked: dict[int, dict], want: int) -> li
     def one_per_host(candidates):
         out, hosts = [], set()
         for offer in candidates:
-            # An offer without a host id is its own host.
-            host = offer.get("host_id") or ("offer", offer.get("id"))
+            # An offer without a host id is its own host, unless it names a machine
+            # already chosen: two offers of one machine are never raced.
+            host = offer.get("host_id") or ("machine", offer.get("machine_id"))
             if host not in hosts:
                 hosts.add(host)
                 out.append(offer)

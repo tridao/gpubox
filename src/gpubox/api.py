@@ -377,8 +377,7 @@ def search(spec: Spec, *, want: int = 2, state_dir=None, **settings):
     shared = s.shared()
     share(shared, "search")
     blocked = pol.blocklist(known_rows(obs, shared), time.time())
-    found = s.vast().offers(v.offer_query(spec))
-    offers = pol.select_offers(v.in_allowed_country(found, spec.exclude_countries), blocked, want)
+    offers, _, _ = L.candidates(s.vast(), spec, blocked, want)
     return offers, blocked
 
 
@@ -603,6 +602,8 @@ class Box:
             except jobs.JobError as exc:
                 raise ConfigError(str(exc)) from None
         rc, out, err = jobs.run_remote(self.ssh_argv, jobs.latest_command())
+        if self._refreshed(rc):
+            rc, out, err = jobs.run_remote(self.ssh_argv, jobs.latest_command())
         if rc != 0:
             raise InfraError(
                 f"could not ask {self.name} for its jobs (exit {rc}): {err.strip()[-200:]}"
@@ -617,6 +618,8 @@ class Box:
     def jobs(self) -> list[tuple[str, str]]:
         """(job id, `exit N` / `running` / `lost`) for each job on the box, oldest first."""
         rc, out, err = jobs.run_remote(self.ssh_argv, jobs.list_command())
+        if self._refreshed(rc):
+            rc, out, err = jobs.run_remote(self.ssh_argv, jobs.list_command())
         if rc != 0:
             raise InfraError(f"could not list the jobs (exit {rc}): {err.strip()[-200:]}")
         return [tuple(line.split(" ", 1)) for line in out.splitlines() if " " in line]
@@ -643,25 +646,38 @@ class Box:
         return BoxLost(msg, watch.status)
 
     def _moved(self, host: str, port: int) -> None:
-        """The box answers somewhere else now (a resumed interruptible box may): use the new
-        address, and write it to the state file unless a teardown holds the directory."""
-        if (host, port) == (self.host, self.port):
+        """The box answers at this address now (a resumed interruptible box may move): use
+        it, and write it to the state file unless a teardown holds the directory. A write
+        that could not be made (the directory was busy) is tried again at the next call."""
+        if (host, port) != (self.host, self.port):
+            log(f"{self.name} is now at {host}:{port}")
+            self.host, self.port, self._unsaved = host, port, True
+        if not getattr(self, "_unsaved", False):
             return
-        log(f"{self.name} is now at {host}:{port}")
-        self.host, self.port = host, port
         s = self.run.settings
         try:
             with state_lock(s.state_dir):
                 state = State.load(s.state_dir)
                 if state is None or state.run != self.run.id or state.closing:
+                    self._unsaved = False  # not ours to write any more
                     return
                 winners = state.winners
                 for w in winners:
                     if w["id"] == self.instance_id:
                         w["host"], w["port"] = host, port
                 state.publish(winners)
+                self._unsaved = False
         except (StateError, OSError) as exc:
-            log(f"WARNING: the new address is not in the state file: {exc}")
+            log(f"WARNING: the new address is not in the state file yet: {exc}")
+
+    def _refreshed(self, rc: int) -> bool:
+        """After an ssh failure (255): ask the provider where the box is now. True if it
+        answers somewhere else, so that a read-only command is worth one more try."""
+        if rc != 255:
+            return False
+        before = (self.host, self.port)
+        self.watch()()
+        return (self.host, self.port) != before
 
     def _record_if_died(self, status) -> None:
         """Blame the machine only on the provider's word that the box is over, and only if

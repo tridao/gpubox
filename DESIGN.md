@@ -357,7 +357,13 @@ handed over together with the spare destroyed; the image's environment in SSH
 sessions; a job on each box with its index; a job followed across killed
 connections with every byte once and its exit code kept; Ctrl-C leaving the
 job running; the box ending a job at its timeout with nothing left of it; and
-`--destroy-after` (the instance gone 26 s after the job ended).
+`--destroy-after` (the instance gone 26 s after the job ended). Through the
+Python API: an interruptible box rented at 1.25 times the minimum bid; a job
+killed through its wrapper (143); a job with a child that ignores SIGTERM
+ended at its timeout (124), the child gone; and the box stopped through the
+API, as when outbid (`actual_status` exited, `intended_status` stopped): the
+wait ended as a lost box with nothing recorded as died, and once the box ran
+again its job was reported lost and the saved environment was there.
 
 ## 11. Considered, and decided against
 

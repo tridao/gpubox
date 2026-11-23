@@ -369,6 +369,9 @@ def bootstrap_script(pubkey: str, expiry: int) -> str:
                 " --no-install-recommends openssh-server; fi",
                 "mkdir -p /run/sshd /etc/ssh /etc/gpubox /etc/profile.d /usr/local/bin",
                 SAVE_ENV,
+                # The variables of a job whose start the container stopped under, the only
+                # ones still on disk: a started job deletes its own at once.
+                'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
                 f"echo {shlex.quote(f'[ -r {ENV_FILE} ] && . {ENV_FILE}')}"
                 " > /etc/profile.d/gpubox-env.sh",
                 "printf '%s\\n' "

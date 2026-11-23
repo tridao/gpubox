@@ -212,7 +212,11 @@ def status(d):
     rc = exit_code(d)
     if rc is not None:
         return "exit " + rc
-    return "running" if alive(d) or not os.path.exists(os.path.join(d, "wpid")) else "lost"
+    if not os.path.exists(os.path.join(d, "wpid")):
+        # Being started, unless that was long ago: a start the box stopped under.
+        young = time.time() - os.path.getmtime(d) < %(start_wait)d + 60
+        return "running" if young else "lost"
+    return "running" if alive(d) else "lost"
 def jobs(root):
     try:
         names = os.listdir(root)
@@ -287,7 +291,7 @@ elif cmd == "latest":
     print((jobs(sys.argv[2]) or [""])[-1])
 elif cmd == "kill":
     kill(sys.argv[2], int(sys.argv[3]))
-""" % {"job_id": JOB_ID.pattern}
+""" % {"job_id": JOB_ID.pattern, "start_wait": START_WAIT}
 
 
 def _tool(*args: str) -> str:

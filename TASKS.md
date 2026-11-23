@@ -60,7 +60,7 @@ Partly done: the lease timer destroys a box when its lease ends, and writing a p
 - [x] `--min-cpus N`, `--min-ram-gb N` for the whole box (defaults as now: max(16, 8 per GPU)
   CPUs, 32 GB per GPU).
 
-## 7. Python API [R]
+## 7. Python API [R] (reviewed; used live for task 10)
 
 - [x] `gpubox.api`: `up(spec, ...) -> Run` (context manager: `down` on exit unless told to keep),
   `Run.boxes -> [Box]`, `Box.ssh_argv(cmd)`, `Box.start(script, env) -> Job`, `Job.wait()`,
@@ -89,7 +89,7 @@ GitHub secrets, Doppler etc. all work the same way:
 - [x] Values travel over SSH stdin into a 0600 file in the job's directory, read by the job's
   shell and deleted as it starts; never into Vast's instance `env`, label or arguments.
 
-## 10. Interruptible instances [R] (done; see DESIGN 5b)
+## 10. Interruptible instances [R] (done, checked on a real box; see DESIGN 5b)
 
 New problems they bring, and the answer to each:
 - An outbid box is stopped, not destroyed, and Vast keeps billing its disk; its container is

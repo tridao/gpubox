@@ -33,6 +33,7 @@ answers are well formed, or that one host is right about the image.
 from __future__ import annotations
 
 import collections
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -275,6 +276,45 @@ def tagged(vast, run_id: str, policy: Policy, timeout: float | None = None) -> s
 
 # ---------------------------------------------------------------------- launch
 
+
+def priced_bids(vast, spec: Spec, found: list[dict]) -> list[dict]:
+    """Interruptible offers, each with what we would bid (`_bid`, at least the minimum,
+    rounded up) and what that costs an hour with the disk (`dph_total`; the disk's price
+    is what the offer's total says beyond its minimum bid). An offer that cannot be priced
+    so is left out, and so is any machine this account already has an instance on: two
+    bids of ours on one machine outbid each other. A listing row that does not say its
+    machine fails the launch rather than let such a bid through."""
+    ours = set()
+    for r in vast.instances():
+        if type(r.get("machine_id")) is not int:
+            raise v.VastError(200, f"instance {r.get('id')} is listed without its machine")
+        ours.add(r["machine_id"])
+    priced = []
+    for o in found:
+        min_bid, total = o.get("min_bid"), o["dph_total"]
+        if type(min_bid) not in (int, float) or not 0 < min_bid <= total < 1e4:
+            continue
+        if o["machine_id"] in ours:
+            continue
+        bid = max(min_bid, math.ceil(min_bid * spec.bid_markup * 1e4) / 1e4)
+        priced.append({**o, "_bid": bid, "dph_total": bid + (total - min_bid)})
+    return priced
+
+
+def candidates(vast, spec: Spec, blocked: dict[int, dict], want: int):
+    """(offers to try, in order; the offers within the price cap; those also in an allowed
+    country). What `up` rents from and `search` shows."""
+    found = vast.offers(v.offer_query(spec))
+    if spec.interruptible:
+        found = priced_bids(vast, spec, found)
+    # The search is asked for the price cap and the order; neither is taken
+    # on trust, since what comes back is what gets rented.
+    cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
+    found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
+    allowed = v.in_allowed_country(found, spec.exclude_countries)
+    return pol.select_offers(allowed, blocked, want), found, allowed
+
+
 # The phases of a rented box on its way to a verdict.
 PENDING = ("booting", "probing", "gating", "checking")
 
@@ -379,15 +419,8 @@ class Launch:
     def _race(self, blocked: dict[int, dict], t0: float) -> list[Attempt] | None:
         spec, policy = self.spec, self.policy
         deadline = t0 + policy.overall_timeout - policy.cleanup_reserve
-        found = self.vast.offers(v.offer_query(spec))
-        if spec.interruptible:
-            found = self._priced_bids(found)
-        # The search is asked for the price cap and the order; neither is taken
-        # on trust, since what comes back is what gets rented.
-        cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
-        found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
-        allowed = v.in_allowed_country(found, spec.exclude_countries)
-        offers = collections.deque(pol.select_offers(allowed, blocked, policy.max_live))
+        chosen, found, allowed = candidates(self.vast, spec, blocked, policy.max_live)
+        offers = collections.deque(chosen)
         want = f"{policy.count} boxes" if policy.count > 1 else "a box"
         log(
             f"{len(offers)} candidate host(s) for {spec.gpu_text} "
@@ -437,26 +470,6 @@ class Launch:
                 )
                 return self._give_up(image_said, why)
             time.sleep(policy.poll)
-
-    def _priced_bids(self, found: list[dict]) -> list[dict]:
-        """Interruptible offers, each with what we would bid (`_bid`) and what that costs
-        an hour with the disk (`dph_total`). Machines this account already has an
-        instance on are left out: two bids of ours on one machine outbid each other."""
-        ours = {r.get("machine_id") for r in self.vast.instances()}
-        priced = []
-        for o in found:
-            min_bid, disk = o.get("min_bid"), o.get("storage_total_cost") or 0
-            if (
-                type(min_bid) not in (int, float)
-                or not 0 < min_bid < 1e4
-                or o["machine_id"] in ours
-            ):
-                continue
-            if type(disk) not in (int, float) or not 0 <= disk < 1e4:
-                continue
-            bid = round(min_bid * self.spec.bid_markup, 4)
-            priced.append({**o, "_bid": bid, "dph_total": bid + disk})
-        return priced
 
     def _give_up(self, image_said: str | None, why: str) -> None:
         """End the race without winners: as a configuration error if a host's word
@@ -509,6 +522,12 @@ class Launch:
         return round(time.monotonic() - a.t0, 1)
 
     def _fail(self, a: Attempt, reason: str | None, detail: str) -> None:
+        if reason == "unreachable" and self.spec.interruptible and a.state == "rented":
+            # Lost while being admitted: if the provider does not say it still runs, it
+            # was most likely outbid, which is the market, not the machine.
+            answered, inst = self._lookup(a.instance_id)
+            if not answered or inst is None or inst.get("actual_status") != "running":
+                reason, detail = None, f"{detail} (stopped: most likely outbid)"
         a.phase, a.reason, a.detail = "failed", reason, detail
         a.failed_at = time.monotonic()
         log(f"  {a.tag_name} failed ({reason or 'not blamed'}): {detail}")
@@ -683,6 +702,11 @@ class Launch:
                 self._fail(a, None, "passed the gate, then the instance no longer existed")
             elif str(inst.get("actual_status")) != "running":
                 self._fail(a, None, f"passed the gate, then was {inst.get('actual_status')}")
+            elif (ep := v.endpoint_of(inst)) is not None and ep != a.endpoint:
+                # It restarted somewhere else (an interruptible box resumed): what passed
+                # the gate is not what would be handed over. Admit it again.
+                log(f"  {a.tag_name} moved to {ep[0]}:{ep[1]}; checking it again")
+                a.phase, a.endpoint, a.check = "booting", None, None
             else:
                 chosen.append(a)
                 if len(chosen) == count:
@@ -888,8 +912,14 @@ def explain_leftovers(state: State, left: list[int] | None) -> None:
         "  Or destroy them at https://cloud.vast.ai/instances/ (their labels start with the run id)"
     )
     if when:
-        log(f"  If nothing is done, each box destroys itself when its lease ends, at {when},")
-        log("  and the reaper removes whatever is left after that.")
+        log(
+            f"  If nothing is done, each running box destroys itself when its lease ends, at {when}."
+        )
+        ns = state.run.split(".")[0]
+        stopped = "an interruptible box that was outbid" if state.meta.get("interruptible") else (
+            "one stuck before it ran")  # fmt: skip
+        log(f"  A box that is not running ({stopped}) cannot: after the lease, run")
+        log(f"  `gpubox reap --namespace {ns} --destroy`, as a scheduled job should anyway.")
 
 
 # ---------------------------------------------------------------------- reaper
