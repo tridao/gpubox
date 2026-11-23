@@ -62,7 +62,8 @@ needs a newer one than 0.15.
 
 ```bash
 export CLOUDFLARE_ACCOUNT_ID=<your-account-id>
-npx cf d1 create --name gpubox-reputation       # once; put its uuid in cloudflare.config.ts
+npx cf d1 create --name gpubox-reputation       # once; put its uuid in cloudflare.config.ts,
+                                                # in place of this project's
 npx cf d1 migrations apply <database-uuid>
 npx cf deploy --secrets-file ~/.config/gpubox/store-secrets.json
 ```
