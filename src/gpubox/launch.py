@@ -77,12 +77,21 @@ class Spec:
     # Hosts in mainland China took a median of 250 s to load the CI image against 65 s
     # elsewhere, and 2 of 6 never did (DESIGN.md, section 10).
     exclude_countries: tuple[str, ...] = ("CN",)
+    # A private image: the registry's user and a (read-only) token. Vast and the
+    # host's docker daemon see both; the token is kept out of the repr.
+    registry_user: str | None = None
+    registry_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         gpus = (self.gpus,) if isinstance(self.gpus, str) else tuple(self.gpus)
         if not gpus or not all(isinstance(g, str) and g.strip() for g in gpus):
             raise ValueError(f"gpus must name at least one GPU model: {self.gpus!r}")
         object.__setattr__(self, "gpus", gpus)
+        if (self.registry_user is None) != (self.registry_token is None):
+            raise ValueError("a registry login needs both a user and a token")
+        for value in (self.registry_user, self.registry_token):
+            if value is not None and (not value or any(c.isspace() for c in value)):
+                raise ValueError("a registry user or token cannot be empty or contain spaces")
 
     @property
     def gpu_text(self) -> str:

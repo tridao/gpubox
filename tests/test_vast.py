@@ -601,3 +601,37 @@ def test_cpus_and_ram_asked_for_the_whole_box_replace_the_per_gpu_defaults():
              min_ram_gb=200)
     )  # fmt: skip
     assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 12}, {"gte": 200 * 1024})
+
+
+@pytest.mark.parametrize(
+    "image,registry",
+    [
+        ("ghcr.io/example/fleet:deps", "ghcr.io"),
+        ("registry.example.com:5000/team/img:1", "registry.example.com:5000"),
+        ("localhost/img", "localhost"),
+        ("tridao/quack-kernels:cu13.2", "docker.io"),
+        ("ubuntu:24.04", "docker.io"),
+        ("ubuntu", "docker.io"),
+    ],
+)
+def test_the_registry_is_read_from_the_image_as_docker_reads_it(image, registry):
+    assert v.registry_of(image) == registry
+
+
+def test_a_private_image_sends_its_login_and_a_public_one_sends_none():
+    spec = Spec(image="ghcr.io/org/img:1", gpus=("RTX 5090",), max_dph_per_gpu=1)
+    assert "image_login" not in v.create_payload(spec, "L", "ssh-ed25519 K", 1795400000)
+    private = Spec(image="ghcr.io/org/img:1", gpus=("RTX 5090",), max_dph_per_gpu=1,
+                   registry_user="bot", registry_token="ghp_secret")  # fmt: skip
+    payload = v.create_payload(private, "L", "ssh-ed25519 K", 1795400000)
+    assert payload["image_login"] == "-u bot -p ghp_secret ghcr.io"
+    assert "ghp_secret" not in repr(private)
+
+
+@pytest.mark.parametrize(
+    "user,token", [("bot", None), (None, "t"), ("bot", ""), ("b ot", "t"), ("bot", "t t")]
+)
+def test_a_registry_login_is_whole_and_one_word_each(user, token):
+    with pytest.raises(ValueError):
+        Spec(image="i", gpus=("H100",), max_dph_per_gpu=1, registry_user=user,
+             registry_token=token)  # fmt: skip

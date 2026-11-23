@@ -130,9 +130,27 @@ def spec_from(args, image: str = "") -> Spec:
         must_reach=tuple(args.must_reach),
         exclude_countries=countries(args),
         gate_script=gate_script(args),
+        **registry_login(args),
         gate_timeout=getattr(args, "gate_timeout", 600),
         ttl_min=getattr(args, "ttl_min", 90),
     )
+
+
+REGISTRY_TOKEN = "GPUBOX_REGISTRY_TOKEN"
+
+
+def registry_login(args) -> dict:
+    """A private image's login: the user from --registry-user, the token from the
+    environment, never from the command line."""
+    user = getattr(args, "registry_user", None)
+    if user is None:
+        return {}
+    token = os.environ.get(REGISTRY_TOKEN)
+    if not token:
+        raise ConfigError(f"--registry-user needs the registry token in {REGISTRY_TOKEN}")
+    if any(c.isspace() for c in user + token):
+        raise ConfigError("the registry user and token cannot contain spaces")
+    return {"registry_user": user, "registry_token": token}
 
 
 def gate_script(args) -> str | None:
@@ -603,6 +621,11 @@ def main(argv=None) -> int:
     )
     s.add_argument(
         "--ttl-min", type=number(int, 1), default=90, help="the box destroys itself after this"
+    )
+    s.add_argument(
+        "--registry-user",
+        metavar="USER",
+        help=f"log in to the image's registry as USER, with the token in ${REGISTRY_TOKEN}",
     )
     s.add_argument(
         "--gate-script",

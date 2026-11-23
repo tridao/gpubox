@@ -820,3 +820,14 @@ def test_several_models_cpus_and_ram_reach_the_search(world):
     assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 12}, {"gte": 64 * 1024})
     assert vast.probers[0].wants[0].gpus == ("RTX 5090", "RTX 4090")
     assert run(["down"]) == 0
+
+
+def test_a_registry_login_takes_its_token_from_the_environment(world, monkeypatch):
+    vast, run = world
+    monkeypatch.delenv(cli.REGISTRY_TOKEN, raising=False)
+    assert run([*UP, "--registry-user", "bot"]) == cli.EXIT_CONFIG
+    assert vast.creates == 0
+    monkeypatch.setenv(cli.REGISTRY_TOKEN, "ghp_secret")
+    assert run([*UP, "--registry-user", "bot"]) == 0
+    assert {p["image_login"] for p in vast.payloads} == {"-u bot -p ghp_secret docker.io"}
+    assert run(["down"]) == 0

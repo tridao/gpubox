@@ -38,6 +38,10 @@ gpubox down
 goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
 default it gets max(16, 8 per GPU) CPUs and 32 GB of RAM per GPU.
 
+A private image: `--registry-user USER` with the token in
+`GPUBOX_REGISTRY_TOKEN` (the registry comes from the image name). Vast and
+the host's docker daemon see the token, so make it a read-only pull token.
+
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 

@@ -351,8 +351,17 @@ def bootstrap_command(pubkey: str, expiry: int) -> str:
     return "bash -c " + shlex.quote(script)
 
 
+def registry_of(image: str) -> str:
+    """The registry an image reference names, as docker reads it: the first path component
+    if it looks like a host (has a dot or a port, or is localhost), else Docker Hub."""
+    first, slash, _ = image.partition("/")
+    if slash and ("." in first or ":" in first or first == "localhost"):
+        return first
+    return "docker.io"
+
+
 def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
-    return {
+    payload = {
         "image": spec.image,
         "disk": spec.disk_gb,
         "label": label,
@@ -361,6 +370,11 @@ def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
         "env": {"-p 22:22": "1"},
         "args_str": bootstrap_command(pubkey, expiry),
     }
+    if spec.registry_user is not None:
+        # Vast's form: `docker login` arguments, in one string.
+        login = f"-u {spec.registry_user} -p {spec.registry_token} {registry_of(spec.image)}"
+        payload["image_login"] = login
+    return payload
 
 
 def country_of(offer: dict) -> str | None:
