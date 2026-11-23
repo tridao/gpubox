@@ -215,15 +215,22 @@ to the expiry file: the lease timer destroys the box within 30 s.
 ## 5b. Interruptible boxes
 
 `--interruptible` searches Vast's bid offers and bids `--bid-markup` times an
-offer's minimum bid; the price cap and the cheapest-first order apply to the
-bid plus the disk. What changes:
+offer's minimum bid, rounded up and never below it; the price cap and the
+cheapest-first order apply to the bid plus the disk, whose price is what the
+offer's total says beyond its minimum bid (an offer that cannot be priced so
+is not a candidate). `search` shows the same candidates. What changes:
 
 - An outbid box is stopped, not destroyed, and bills its disk; with its
   container stopped, its lease timer cannot fire. `down` and the reaper
-  destroy it by tag whatever its state, so a scheduled `reap` is the bound.
+  destroy it by tag whatever its state, so a scheduled
+  `reap --namespace NS --destroy` is the bound, and a teardown that could
+  not finish says so.
 - Being outbid is the market, not the machine: a box that exits, stalls, or
-  never reaches `running` within the start-up timeout fails without blame,
-  and a stopped box is never recorded as `died`.
+  never reaches `running` within the start-up timeout fails without blame; so
+  does one that loses its connection while being admitted unless the provider
+  then says it still runs; and a stopped box is never recorded as `died`.
+- A healthy box waiting for the others may stop and resume elsewhere; the
+  last look before the hand-off sees its new address and admits it again.
 - The job dies with its container (Vast kills it 0.1 s after SIGTERM). When
   the bid wins again the container restarts without it; `wait` sees the
   wrapper gone and reports the job `lost`.
@@ -231,7 +238,14 @@ bid plus the disk. What changes:
   asked about the box; a running box's address is taken from the answer and
   written to the state file (unless a teardown holds the directory).
 - Two of our own bids on one machine outbid each other, so machines the
-  account already has an instance on are skipped.
+  account already has an instance on are skipped (a listing row that does
+  not say its machine fails the launch), and no launch races two offers of
+  one machine. Two launches in different state directories that start at the
+  same moment can still bid on one machine: the account's boxes are looked
+  at once, when a launch starts.
+- A start cut short by a stop leaves the job's variables on the box's disk:
+  the bootstrap deletes any it finds when the container starts again, and a
+  job directory that never got a wrapper is listed `lost` after a minute.
 
 ## 6. Teardown
 
