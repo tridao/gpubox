@@ -869,3 +869,27 @@ def test_several_boxes_are_named_listed_and_each_reachable(
 def test_status_of_a_directory_without_a_run(world, capsys):
     vast, run = world
     assert run(["status"]) == 0 and "no run" in capsys.readouterr().out
+
+
+def test_attempts_too_few_for_the_count_rent_nothing(world):
+    vast, run = world
+    assert run([*UP, "--count", "3", "--max-attempts", "2"]) == cli.EXIT_CONFIG
+    assert vast.creates == 0
+
+
+def test_a_box_named_like_another_runs_box_replaces_only_that_entry(tmp_path, ssh_dir):
+    from gpubox import sshconfig
+
+    k, h = tmp_path / "k", tmp_path / "h"
+    sshconfig.add(
+        "a.shard.000000000001", [("shard-0", "10.0.0.1", 1), ("shard-1", "10.0.0.2", 2)], k, h
+    )
+    sshconfig.add("a.shard-0.000000000002", [("shard-0", "10.0.0.9", 9)], k, h)
+    text = (ssh_dir / "gpubox_config").read_text()
+    assert "Host shard-1" in text and text.count("Host shard-0") == 1 and "10.0.0.9" in text
+    sshconfig.remove("a.shard-0.000000000002")
+    text = (ssh_dir / "gpubox_config").read_text()
+    assert "Host shard-1" in text and "Host shard-0" not in text
+    sshconfig.add("a.x.000000000003", [("shard-1", "10.0.0.7", 7)], k, h)
+    text = (ssh_dir / "gpubox_config").read_text()
+    assert "# gpubox run a.shard.000000000001" not in text  # nothing of it left: block gone

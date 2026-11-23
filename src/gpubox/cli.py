@@ -276,6 +276,10 @@ def cmd_up(args) -> int:
         stall_timeout=args.stall_timeout,
         overall_timeout=args.overall_timeout,
     )
+    if policy.attempts < policy.count:
+        raise ConfigError(
+            f"--max-attempts {policy.attempts} cannot rent --count {policy.count} boxes"
+        )
     if spec.ttl_min * 60 < policy.overall_timeout + policy.min_lease:
         raise ConfigError(
             f"--ttl-min {spec.ttl_min} leaves no lease after a launch of up to "

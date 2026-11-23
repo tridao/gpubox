@@ -75,8 +75,18 @@ def _quoted(path) -> str:
     return f'"{text}"'
 
 
-def _is_host(block: list[str], alias: str) -> bool:
-    return any(line.strip() == f"Host {alias}" for line in block)
+def _without_hosts(block: list[str], aliases: set[str]) -> list[str]:
+    """The block without the `Host` entries for these aliases (an entry runs from its
+    `Host` line to the next one); empty if no entry is left in it."""
+    out, skipping = [], False
+    for line in block:
+        stripped = line.strip()
+        if stripped.startswith("Host "):
+            skipping = stripped[5:].strip() in aliases
+        if not skipping:
+            out.append(line)
+    has_host = any(line.strip().startswith("Host ") for line in out)
+    return out if has_host or not block[0].startswith("# gpubox run ") else []
 
 
 def _included_at_the_top(text: str) -> bool:
@@ -103,15 +113,16 @@ def add(run_id: str, hosts, key: Path, known_hosts: Path) -> Path:
             f"    UserKnownHostsFile {_quoted(Path(known_hosts).resolve())}",
             "    StrictHostKeyChecking accept-new",
         ]
-    aliases = [alias for alias, _, _ in hosts]
+    aliases = set(alias for alias, _, _ in hosts)
     with _locked() as d:
         owned = d / OWNED
         old = owned.read_text() if owned.exists() else ""
-        # Not this run's earlier block, and not a stale box of the same name.
+        # Not this run's earlier block, and not a stale box of the same name: only that
+        # box's entry goes, so another run's other boxes keep theirs.
         others = [
-            b
+            kept
             for b in _blocks(old)
-            if b[0] != _marker(run_id) and not any(_is_host(b, a) for a in aliases)
+            if b[0] != _marker(run_id) and (kept := _without_hosts(b, aliases))
         ]
         _write(owned, "".join("\n".join(b) + "\n" for b in [*others, block]))
         config = d / "config"

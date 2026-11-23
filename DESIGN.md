@@ -114,13 +114,20 @@ One thread. Each pass:
    `healthy` or `failed`. Probes and gates are child processes that are
    polled, never waited for.
 2. Send a delete for each failed box and look it up. It keeps its slot until
-   the lookup says it is gone, so there are never more than `1 + spare`
+   the lookup says it is gone, so there are never more than `count + spare`
    billable boxes that we know of.
 3. If `--count` candidates are healthy, look them up once more (still
    running, at least 10 minutes of lease left) and hand over the cheapest
    `--count`. A healthy box waits, billing, for the others; one that dies
    meanwhile is caught by that lookup and replaced.
-4. Otherwise rent into the free slots, until 60 s before `--overall-timeout`.
+4. If `--count` healthy boxes can no longer be had (those healthy or on
+   their way, plus as many as the offers and attempts left allow, are too
+   few), give up now rather than rent or wait for nothing.
+5. Otherwise rent into the free slots, until 60 s before `--overall-timeout`.
+
+A create answered with an id an earlier create already returned is treated
+like one that got no answer: it keeps its slot, and its box, if there is
+one, is found by its tag.
 
 A box fails when the provider reports a machine error or `exited`; when it
 is not reachable after `--startup-timeout` (300 s, counted from the create,
@@ -133,11 +140,13 @@ with that key, so the image must be running something else). Either fails
 that box, blamed on nobody. When two different hosts have shown it, the
 launch stops as a configuration error (exit 2): with a wrong tag that is
 about 45 s in, and one misconfigured host is simply replaced. Boxes whose
-host the offer does not name do not count as different hosts.
+host the offer does not name do not count as different hosts. Once any box
+of the launch has answered SSH with the run's key, the image is known to
+work, and what hosts say about it no longer stops the launch.
 
-**The hand-off** is the write that puts the winner into the state file.
-Before it, a failure or a signal rolls back what the launch rented; after it
-the winner is kept. The rollback aims at 10 s, which is what a cancelled CI
+**The hand-off** is the write that puts the winners into the state file, all
+in one replacement of the file. Before it, a failure or a signal rolls back
+what the launch rented; after it the winners are kept. The rollback aims at 10 s, which is what a cancelled CI
 step gets: it stops the child processes, sends every delete before waiting
 for any, and gives up at the deadline. It is an attempt, so `down` must
 always follow `up`.
@@ -206,10 +215,10 @@ The caller's own checks (`--gate-script`) run after the gate passes. They are
 the caller's code, so a failure blames nobody unless the script says, in the
 gate's own verdict format and with one of its reason codes, that it is the
 machine. That way no new reason codes reach the store, and the blame rule
-below still applies: only when another box passed the same checks.
+below still applies: only when the launch succeeded with the same checks.
 
-A machine is recorded as failed only if another candidate became healthy in
-the same launch; otherwise the cause may be ours. `observations.jsonl` then
+A machine is recorded as failed only if the launch succeeded (all `--count`
+boxes handed over); otherwise the cause may be ours. `observations.jsonl` then
 blocks it for 2 hours (GPU busy), 1 day (unreachable, no network, died,
 stalled) or 14 days (wrong hardware, CUDA or runtime errors). A later
 healthy run clears the first two, and they are let back in when too few

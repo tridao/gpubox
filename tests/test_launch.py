@@ -1016,3 +1016,85 @@ def test_a_renewal_that_reaches_only_some_boxes_relabels_none(tmp_path):
     with pytest.raises(v.VastError, match="1 box"):
         L.renew(vast, state, prober, EXPIRY + 7200)
     assert vast.names("relabel") == [] and on_disk(state).expiry == EXPIRY
+
+
+def test_a_create_answered_with_an_id_already_held_is_not_a_second_box(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "ok", 3: "ok"}, count=2, spare=1)
+    real_create = vast.create
+
+    def create(offer_id, payload):
+        iid = real_create(offer_id, payload)
+        return 1 if offer_id == 1002 else iid  # the second create repeats the first id
+
+    vast.create = create
+    result = launch.run({})
+    assert len({w.instance_id for w in result.winners}) == 2
+    assert result.attempts[1].state == "unanswered"
+    assert sorted(vast.ours()) == sorted(w.instance_id for w in result.winners)  # swept by tag
+
+
+def test_a_launch_that_can_no_longer_succeed_rents_nothing_more(tmp_path):
+    # Two of three offers, both needed: one fails, so three healthy boxes are out of reach.
+    result, vast, state = run(tmp_path, {1: "ok", 2: "bad_gpu", 3: "late"}, count=3, spare=0)
+    assert result.winners == [] and vast.ours() == []
+    t0 = time.monotonic()
+    result, vast, state = run(tmp_path / "b", {1: "ok", 2: "ok"}, count=3)
+    assert result.winners == [] and vast.creates == 0  # too few offers: nothing rented
+    assert time.monotonic() - t0 < 1
+
+
+def test_one_hosts_word_against_the_image_is_not_the_verdict_while_another_box_runs(tmp_path):
+    result, vast, state = run(tmp_path, {1: "ok", 2: "image"}, count=2, spare=0)
+    assert result.winners == []  # an infrastructure failure, not a configuration error
+    assert vast.ours() == []
+
+
+def test_a_box_that_answered_with_our_key_proves_the_image(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "hold", 2: "image", 3: "image", 4: "ok"},
+                                count=2, spare=2)  # fmt: skip
+    # Machine 1 is in its gate (it answered SSH) before the other two report image errors.
+    vast.behaviour.update({2: "stuck", 3: "stuck"})
+    polls = [0]
+
+    def gate_poll(machine):
+        polls[0] += 1
+        if polls[0] == 2:
+            vast.behaviour.update({2: "image", 3: "image"})
+        if polls[0] == 8:
+            vast.release = True
+
+    vast.hooks["gate_poll"] = gate_poll
+    result = launch.run({})
+    assert {w.machine_id for w in result.winners} == {1, 4}
+    assert {a.machine_id for a in result.attempts if "cannot be pulled" in a.detail} == {2, 3}
+
+
+def test_held_slots_with_too_few_healthy_boxes_end_the_launch_at_once(tmp_path):
+    t0 = time.monotonic()
+    result, vast, state = run(tmp_path, {1: "ok", 2: "ghost", 3: "ok"}, count=2, spare=0)
+    assert result.winners == [] and vast.ours() == []
+    assert time.monotonic() - t0 < FAST.overall_timeout / 2
+
+
+@pytest.mark.parametrize("when", ["before the rename", "after the rename"])
+def test_an_interrupt_during_the_hand_off_of_several_boxes(tmp_path, monkeypatch, when):
+    launch, vast, state = start(tmp_path, {1: "ok", 2: "ok", 3: "hold"}, count=2, spare=1)
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if '"winners": []' in open(src).read():
+            return real_replace(src, dst)
+        if when == "after the rename":
+            real_replace(src, dst)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", replace)
+    assert isinstance(outcome(launch), KeyboardInterrupt)
+    monkeypatch.undo()
+    disk = on_disk(state)
+    if when == "before the rename":
+        assert disk.winners == [] and vast.ours() == []
+    else:
+        assert sorted(vast.ours()) == sorted(w["id"] for w in disk.winners)
+        assert {vast.live[i]["machine"] for i in vast.ours()} == {1, 2}  # the loser is gone
+    assert L.down(vast, disk, FAST) == [] and vast.ours() == []

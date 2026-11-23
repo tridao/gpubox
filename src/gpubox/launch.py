@@ -389,6 +389,10 @@ class Launch:
                         if a.host_id is not None:  # two boxes of one host are one witness
                             image_errors[a.host_id] = said
             self._destroy_failed()
+            # A box that ran our start-up command shows the image works, whatever
+            # some host says about it.
+            if image_said and self._image_works():
+                image_errors, image_said = {}, None
             if len(image_errors) >= policy.image_errors:
                 # One host can be wrong about an image (a broken mirror, stale
                 # credentials). Several saying the same are not.
@@ -396,14 +400,19 @@ class Launch:
             winners = self._choose()
             if winners is not None:
                 return winners
+            healthy = sum(a.phase == "healthy" for a in self.attempts.values())
+            short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
+            if not self._possible(offers):
+                if image_said and self._only_image_evidence():
+                    raise ConfigError(image_said)
+                log(f"giving up: {policy.count} healthy boxes are no longer possible{short}")
+                return None
             out_of_time = time.monotonic() >= deadline
             if not out_of_time:
                 self._rent(offers, deadline)
             if out_of_time or not self._worth_waiting(offers, deadline):
-                if image_said:
+                if image_said and self._only_image_evidence():
                     raise ConfigError(image_said)
-                healthy = sum(a.phase == "healthy" for a in self.attempts.values())
-                short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
                 log(
                     f"giving up: not enough healthy boxes within {policy.overall_timeout:g}s{short}"
                     if out_of_time
@@ -411,6 +420,30 @@ class Launch:
                 )
                 return None
             time.sleep(policy.poll)
+
+    def _image_works(self) -> bool:
+        """Has any box of this launch answered SSH with the run's key? Only our start-up
+        command starts an sshd that takes it, so the image was pulled and runs it."""
+        return any("ssh" in a.timings for a in self.attempts.values())
+
+    def _only_image_evidence(self) -> bool:
+        """When the launch ends with one host's word against the image: is that all there
+        is? Not if some box was still on its way or healthy, which may have proved it."""
+        return not any(
+            a.state == "rented" and (a.phase in PENDING or a.phase == "healthy")
+            for a in self.attempts.values()
+        )
+
+    def _possible(self, offers: collections.deque) -> bool:
+        """Can this launch still end with `policy.count` healthy boxes: those healthy now,
+        those on their way, and as many more as the offers and attempts left allow?
+        A launch that cannot is ended at once, before it rents or waits for nothing."""
+        on_their_way = sum(
+            a.state == "rented" and (a.phase in PENDING or a.phase == "healthy")
+            for a in self.attempts.values()
+        )
+        more = min(len(offers), max(0, self.policy.attempts - self._sent()))
+        return on_their_way + more >= self.policy.count
 
     def _elapsed(self, a: Attempt) -> float:
         return round(time.monotonic() - a.t0, 1)
@@ -625,6 +658,12 @@ class Launch:
                 a.detail = f"create outcome unknown: {exc}"
                 log(f"  {a.tag_name} {a.detail}")
                 continue
+            if iid in self.held:
+                # An id we were already given cannot be this create's box. Whatever
+                # it rented, if anything, is found by its tag, as for no answer.
+                a.detail = f"create answered with instance {iid}, which an earlier create had"
+                log(f"  {a.tag_name} {a.detail}")
+                continue
             self.held.add(iid)
             a.instance_id, a.state, a.phase = iid, "rented", "booting"
             a.t0 = a.changed_at = time.monotonic()
@@ -832,9 +871,13 @@ def renew(vast, state: State, prober, expiry: int) -> None:
     for i, w in enumerate(boxes):
         r = prober.run((w["host"], w["port"]), v.set_expiry_command(expiry))
         if r != 0:
-            done = "nothing changed" if i == 0 else f"{i} box(es) have the new expiry on the box"
-            raise v.VastError(0, f"could not set the expiry on instance {w['id']} (ssh exit {r}); "
-                              f"{done}; run `gpubox renew` again")  # fmt: skip
+            # A write whose answer was lost may have happened: say what is known.
+            raise v.VastError(
+                0,
+                f"could not confirm the new expiry on instance {w['id']} (ssh exit {r}); "
+                f"{i} box(es) before it confirmed it; no tag was changed. "
+                "Run `gpubox renew` again",
+            )
     try:
         for w in boxes:
             vast.relabel(w["id"], make_tag(state.run, w["attempt"], expiry))

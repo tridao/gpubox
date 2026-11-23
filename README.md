@@ -124,9 +124,9 @@ run, and `observations.jsonl`.
 - **Lease.** `--ttl-min` after `up` started, a timer inside the box destroys
   it. `reap` destroys boxes whose lease has ended, in case the timer could
   not. `renew` moves the end.
-- **Blocklist.** A machine that failed while another succeeded in the same
-  launch is skipped for 2 hours to 14 days, depending on why
-  (`observations.jsonl`; cache it between CI runs).
+- **Blocklist.** A machine that failed in a launch that succeeded is skipped for 2 hours to 14 days, depending on why
+  (`observations.jsonl`; cache it between CI runs). A launch that failed
+  blames nobody.
 - **Defaults from measurement.** Hosts in mainland China are skipped
   (`--exclude-country`, default `CN`; `none` to skip none). A box whose
   loading status has not changed for `--stall-timeout` (300 s) is replaced.
