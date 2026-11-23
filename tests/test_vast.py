@@ -220,13 +220,39 @@ def test_a_listing_must_have_as_many_rows_as_it_says(wire):
         wire({"instances": rows, "next_token": None, "total_instances": total})
         with pytest.raises(v.VastError, match="states"):
             v.Vast("k").instances()
+    # Whichever page says it: a first page that promises three rows, and a
+    # last page that says nothing, is a listing cut short.
+    first = {"instances": rows[:1], "next_token": "t", "total_instances": 3}
+    wire(first, {"instances": rows[1:], "next_token": None})
+    with pytest.raises(v.VastError, match="states"):
+        v.Vast("k").instances()
+    wire({**first, "total_instances": 2}, {"instances": rows[1:], "next_token": None})
+    assert len(v.Vast("k").instances()) == 2
+
+
+def test_a_timeout_on_a_listing_is_for_all_its_pages_together(monkeypatch):
+    clock, seen = [100.0], []
+
+    def urlopen(req, timeout=None):
+        seen.append(round(timeout, 3))
+        clock[0] += 4  # each page takes four seconds
+        n = len(seen)
+        page = {"instances": [{"id": n, "label": None}], "next_token": f"t{n}"}
+        return io.BytesIO(json.dumps(page).encode())
+
+    monkeypatch.setattr(v.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(v.time, "monotonic", lambda: clock[0])
+    with pytest.raises(v.VastError, match="did not finish in time"):
+        v.Vast("k").instances(timeout=10, retries=0)
+    assert seen == [10, 6, 2]  # what was left each time, and no fourth page
 
 
 def test_the_account_is_the_id_the_provider_states(wire):
     w = wire({"id": 4711, "username": "ci"})
     assert v.Vast("k").account() == "4711"
     assert "/v0/users/current/" in w.requests[0][1]
-    for answer in ({}, {"id": "4711"}, {"id": 0}, {"id": True}, [], {"user": {"id": 1}}):
+    refused = {"success": False, "id": 4711, "msg": "unauthorized"}
+    for answer in ({}, {"id": "4711"}, {"id": 0}, {"id": True}, [], {"user": {"id": 1}}, refused):
         wire(answer)
         with pytest.raises(v.VastError):
             v.Vast("k").account()

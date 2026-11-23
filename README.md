@@ -18,7 +18,7 @@ gpubox reap --exclusive --max-age-min 90 --destroy  # every 30 minutes, from a s
 ```
 
 `up` prints the run id and writes it to the step outputs (`run_id`) before it
-rents anything. State lives in `--state-dir` (default `.gpubox`): `run.json`,
+rents anything, and refuses to start if it cannot write it. State lives in `--state-dir` (default `.gpubox`): `run.json`,
 a snapshot of what the run asked for and which instance ids it knows; a
 throwaway SSH key per run; and `observations.jsonl` (which machines worked).
 
@@ -78,7 +78,9 @@ API, and `up` fails before renting anything if the first two are wrong:
 
 - the listing check that `total_instances` equals the rows read, and that
   every row has a `label` field;
-- `account()`, which reads the `id` of `GET /api/v0/users/current/`;
+- `account()`, which reads the `id` of `GET /api/v0/users/current/`. Every
+  `up` and `down` calls it now, so the key needs permission to read its own
+  account;
 - the new timer in the bootstrap command (tested here by running its loop in
   bash with a stand-in for the delete).
 

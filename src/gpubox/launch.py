@@ -162,8 +162,13 @@ def destroy_confirmed(vast, ids, budget: float, policy: Policy, on_gone=None) ->
 
     D1: one delete goes to every id before any is waited for. D2: then each
     is looked up, the delete repeated for those still there, until all are
-    gone or the budget ends; no call is given more time than is left. D3: an
-    error on one id does not stop the others, and that id is not confirmed.
+    gone or the budget ends; no call is asked to take longer than what is
+    left, and none is started once nothing is left. D3: an error on one id
+    does not stop the others, and that id is not confirmed.
+
+    The first round of deletes is sent whatever the budget: it is the point.
+    The timeouts are socket timeouts, so the budget is what we ask for, not a
+    bound on the wall clock: a response that trickles in can take longer.
     """
     left = sorted(set(ids))
     if not left:
@@ -173,16 +178,23 @@ def destroy_confirmed(vast, ids, budget: float, policy: Policy, on_gone=None) ->
     def share(calls: int) -> float:
         return min(policy.call_timeout, max(0.0, deadline - time.monotonic()) / max(1, calls))
 
+    def spent() -> bool:
+        return time.monotonic() >= deadline
+
     for k, iid in enumerate(left):
         _try_destroy(vast, iid, share(len(left) - k))
     while True:
         for iid in list(left):
+            if spent():
+                return left
             if _confirm_gone(vast, iid, share(1), on_gone):
                 left.remove(iid)
-        if not left or time.monotonic() >= deadline:
+        if not left or spent():
             return left
         time.sleep(min(policy.confirm_poll, max(0.0, deadline - time.monotonic())))
         for k, iid in enumerate(left):
+            if spent():
+                return left
             _try_destroy(vast, iid, share(len(left) - k))
 
 
@@ -221,14 +233,17 @@ class Launch:
         whatever was raised; everything else the run knows is destroyed.
         """
         t0 = time.monotonic()
+        handing_over = None  # the box whose hand-off was begun, if it got that far
         try:
             winner = self._race(blocked, t0)
             if winner is not None:
+                handing_over = winner.instance_id
                 host, port = winner.endpoint
                 self.snap.publish(winner.instance_id, winner.seq, host, port)  # the hand-off
         except BaseException:
+            deadline = time.monotonic() + self.policy.rollback  # one budget for all of it
             self._kill_children()
-            self._rollback(keep=self._published())
+            self._rollback(handing_over, deadline)
             raise
         self._kill_children()
         keep = winner.instance_id if winner else None
@@ -249,28 +264,27 @@ class Launch:
             unseen=[a for a in ordered if a.state == "open"],
         )
 
-    def _published(self) -> int | None:
-        """The winner's id if the snapshot on disk has one. Also makes memory agree with
-        the disk: an interrupt can land between a rename and our noticing it."""
+    def _published(self) -> str:
+        """Is a winner in the snapshot on disk? "yes", "no", or "unknown" if the disk
+        cannot tell us. Unless unknown, memory is made to agree with the disk: an
+        interrupt can land between a rename and our noticing it."""
         try:
             loaded = Snapshot.load(self.snap.path.parent) if self.snap.path else None
         except Exception as exc:
             log(f"WARNING: cannot read the snapshot back: {exc}")
-            return None
+            return "unknown"
         if loaded is None or loaded.run != self.snap.run:
-            return None
+            return "unknown"
         self.snap.data = loaded.data
-        w = loaded.winner
-        return w["id"] if w else None
+        return "yes" if loaded.winner else "no"
 
     def _kill_children(self) -> None:
+        try:
+            self.prober.kill_all()
+        except Exception as exc:
+            log(f"WARNING: stopping child processes: {exc!r}")
         for a in self.attempts.values():
-            if a.check is not None:
-                try:
-                    a.check.kill()
-                except Exception as exc:
-                    log(f"WARNING: stopping a child process: {exc!r}")
-                a.check = None
+            a.check = None
 
     def _note_gone(self, instance_id: int) -> None:
         self.snap.gone(instance_id)
@@ -279,26 +293,40 @@ class Launch:
         ids = self.held | set(self.snap.live_ids())
         return {i for i in ids if i != keep and self.snap.status(i) != "gone"}
 
-    def _destroy_all(self, keep: int | None, budget: float) -> list[int]:
+    def _destroy_all(self, keep: int | None, budget: float, record: bool = True) -> list[int]:
         ids = self._outstanding(keep)
-        for iid in sorted(ids):  # an id the snapshot never took: try once more, for `down`
-            if self.snap.status(iid) is None:
+        for iid in sorted(ids) if record else ():
+            if self.snap.status(iid) is None:  # the snapshot never took it: once more, for `down`
                 try:
                     self.snap.know(iid)
                 except Exception as exc:
                     log(f"WARNING: instance {iid} could not be recorded: {exc}")
-        left = destroy_confirmed(self.vast, ids, budget, self.policy, self._note_gone)
+        on_gone = self._note_gone if record else None
+        left = destroy_confirmed(self.vast, ids, budget, self.policy, on_gone)
         for iid in left:
             log(f"WARNING: instance {iid} is not confirmed destroyed; `gpubox down` retries")
         return left
 
-    def _rollback(self, keep: int | None) -> None:
-        """L5: an attempt within the budget, not a promise. Never masks what was raised,
-        except by a second signal."""
-        if keep is not None:
+    def _rollback(self, handing_over: int | None, deadline: float) -> None:
+        """L4, L5. An attempt within the budget, not a promise. Never masks what was
+        raised, except by a second signal.
+
+        A box whose hand-off was begun is kept if the snapshot on disk has it,
+        and also if the disk cannot tell us: `run` may be using it already.
+        In that second case nothing is written either, since what we would
+        write could erase the hand-off. `down` settles it.
+        """
+        published = self._published()  # also makes memory agree with the disk, if it can
+        if handing_over is None:
+            published = "no"  # nothing was being handed over, whatever the disk can tell us
+        keep = handing_over if published != "no" else None
+        if published == "yes":
             log(f"keeping instance {keep}: it was handed over before the failure")
+        elif published == "unknown":
+            log(f"keeping instance {keep}: cannot tell whether it was handed over; run `down`")
         try:
-            self._destroy_all(keep, self.policy.rollback)
+            budget = max(0.0, deadline - time.monotonic())
+            self._destroy_all(keep, budget, record=published != "unknown")
         except Exception as exc:
             log(f"WARNING: rolling back: {exc!r}")
 
@@ -320,6 +348,8 @@ class Launch:
         last_listing = time.monotonic()
         strays: set[int] = set()
         while True:
+            # One listing, all its pages together, gets `call_timeout`: it either
+            # comes back within that or counts as failed.
             rows = _try_list(self.vast, policy)
             if rows is not None:
                 last_listing = time.monotonic()
@@ -368,6 +398,15 @@ class Launch:
                 continue
             iid = row["id"]
             listed.add(iid)
+            if self.snap.status(iid) == "gone":
+                # A lookup said this box did not exist, and here it is. Believe
+                # a second lookup: if it exists, it is ours to destroy again.
+                answered, inst = self._lookup(iid)
+                if answered and inst is not None:
+                    self.snap.revive(iid)
+                    strays.add(iid)
+                    log(f"  instance {iid} was recorded as gone but exists: destroying it")
+                continue
             if iid in self.held or self.snap.status(iid) is not None:
                 continue
             self.held.add(iid)
@@ -451,6 +490,9 @@ class Launch:
             # A lookup may lag a create. After that, it is the provider's word
             # that the box does not exist (S3), which blames nobody.
             if time.monotonic() - a.t0 > policy.settle:
+                # Not before a delete has been asked for: if the lookup is
+                # wrong, the box must not be left running behind a tombstone.
+                _try_destroy(self.vast, a.instance_id, policy.call_timeout)
                 self._note_gone(a.instance_id)
                 self._fail(a, None, "the instance no longer exists")
             return None
@@ -495,12 +537,6 @@ class Launch:
         """L3: the cheapest candidate whose gate passed, that this pass's listing shows and
         a lookup says is running, with enough of its lease left."""
         healthy = [a for a in self.attempts.values() if a.phase == "healthy"]
-        if not healthy:
-            return None
-        if self.snap.expiry - time.time() < self.policy.min_lease:
-            raise ConfigError(
-                f"less than {self.policy.min_lease:g}s of the lease is left; raise --ttl-min"
-            )
         for a in sorted(healthy, key=lambda a: (a.dph, a.seq)):
             answered, inst = self._lookup(a.instance_id)
             if not answered:
@@ -511,6 +547,11 @@ class Launch:
             elif str(inst.get("actual_status")) != "running":
                 self._fail(a, None, f"passed the gate, then was {inst.get('actual_status')}")
             elif a.instance_id in listed:
+                if self.snap.expiry - time.time() < self.policy.min_lease:
+                    raise ConfigError(
+                        f"less than {self.policy.min_lease:g}s of the lease is left; "
+                        "raise --ttl-min"
+                    )
                 return a
         return None
 
@@ -536,9 +577,10 @@ class Launch:
             )
             payload = v.create_payload(spec, a.tag, self.prober.pubkey, snap.expiry)
             # S1: on disk before the request. If this fails nothing is sent.
+            sent = time.time()
             snap.open_attempt(
                 seq,
-                sent=round(time.time(), 3),
+                sent=round(sent, 3),
                 tag=a.tag,
                 offer=a.offer_id,
                 machine=a.machine_id,
@@ -546,6 +588,15 @@ class Launch:
                 price=a.dph,
             )
             self.attempts[seq] = a
+            # L1: the write can be slow. If the window closed meanwhile, or the
+            # time we recorded is no longer close to the time of sending (it is
+            # what `down --abandon-unseen` counts from), nothing is sent.
+            if time.monotonic() >= deadline or time.time() - sent > self.policy.settle / 4:
+                snap.refuse(seq)
+                a.state, a.detail = "refused", "not sent: recording the attempt took too long"
+                log(f"  {a.tag_name} {a.detail}")
+                offers.appendleft(o)  # the offer was not used; a later pass may try it again
+                return
             try:
                 iid = self.vast.create(a.offer_id, payload)
             except v.CreateRefused as exc:
@@ -636,9 +687,8 @@ def down(vast, snap: Snapshot, policy: Policy, *, abandon_unseen: bool = False) 
 
     With an ephemeral snapshot this is teardown by tag alone (T4).
     """
-    if snap.closed:
-        log("nothing to destroy")
-        return 0
+    # A closed run is looked at again like any other: a box whose create gave
+    # no answer can show up after the run was closed.
     dirty = 0  # things that could not be recorded: the run cannot be closed
 
     def record(what, fn, *args) -> None:
@@ -673,6 +723,18 @@ def down(vast, snap: Snapshot, policy: Policy, *, abandon_unseen: bool = False) 
                     continue
                 iid = row["id"]
                 found.add(iid)
+                if snap.status(iid) == "gone":
+                    # Either this listing is behind, or the lookup that said
+                    # "gone" was wrong. A lookup now decides.
+                    try:
+                        exists = vast.instance(iid, timeout=policy.call_timeout, retries=0)
+                    except v.VastError:
+                        continue
+                    if exists is not None:
+                        log(f"instance {iid} was recorded as gone but exists")
+                        held.add(iid)
+                        record(f"instance {iid}", snap.revive, iid)
+                    continue
                 if iid in held or snap.status(iid) is not None:
                     continue
                 held.add(iid)  # S2: recorded before any delete is sent for it
@@ -759,6 +821,7 @@ def reap(
     now = time.time() if now is None else now
     chosen: dict[int, str] = {}
     suspects: dict[int, str] = {}
+    failed = 0
     for row in vast.instances():
         iid, label = row["id"], row.get("label")
         tag = parse_tag(label)
@@ -783,19 +846,28 @@ def reap(
         # R3: a box seconds old may not show its label yet, and deleting it
         # would break a launch in progress. Look twice.
         sleep(policy.reap_recheck)
-        again = {row["id"]: row for row in vast.instances()}
-        for iid, what in suspects.items():
+        try:
+            again = {row["id"]: row for row in vast.instances()}
+        except v.VastError as exc:
+            # R5: a failure. But what the first look chose is still destroyed.
+            log(f"ERROR: the second listing failed, so untagged instances were not judged: {exc}")
+            again, failed = None, 1
+        for iid, what in suspects.items() if again is not None else ():
             if iid not in again:
                 log(f"{what}: gone at the second look")
-            elif parse_tag(again[iid].get("label")) is None:
+                continue
+            tag = parse_tag(again[iid].get("label"))
+            if tag is None:
                 chosen[iid] = f"{what}: no valid tag in two listings"
+            elif tag.expiry + policy.expiry_margin < now:
+                chosen[iid] = f"{what}: tagged at the second look, with a lease that has ended"
             else:
                 log(f"{what}: carries a tag at the second look; left alone")
     for iid in sorted(chosen):
         log(f"{chosen[iid]} -> {'destroy' if destroy else 'would destroy (report only)'}")
     if not destroy or not chosen:
-        return 0
+        return failed
     left = destroy_confirmed(vast, chosen, policy.confirm_timeout, policy)
     for iid in left:
         log(f"ERROR: instance {iid} is not confirmed destroyed")
-    return len(left)
+    return failed + len(left)

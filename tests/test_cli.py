@@ -242,6 +242,20 @@ def test_down_with_a_key_of_another_account_is_an_error_not_a_clean_result(world
     assert run(["down"]) == 0 and vast.ours() == []
 
 
+def test_a_run_remembers_its_account_even_when_none_was_pinned(world, capsys):
+    # Otherwise a `down` with another account's key would find nothing there
+    # and call the run clean.
+    vast, run = world
+    assert run(UP) == 0
+    assert Snapshot.load(run.state_dir).account == "111"
+    vast.account_id = "222"
+    deletes = len(vast.names("destroy"))
+    assert run(["down"]) == cli.EXIT_CONFIG and "another account" in capsys.readouterr().out
+    assert len(vast.ours()) == 1 and len(vast.names("destroy")) == deletes
+    vast.account_id = "111"
+    assert run(["down"]) == 0
+
+
 def test_the_reaper_does_nothing_on_another_account(world, capsys):
     vast, run = world
     vast.live[50] = {"id": 50, "label": None, "machine": 1, "start_date": time.time() - 9e4}
@@ -267,10 +281,24 @@ def test_missing_key_is_a_configuration_error(world, monkeypatch, tmp_path):
     assert vast.creates == 0
 
 
-def test_nothing_after_the_decision_can_fail_the_launch(world, monkeypatch, tmp_path):
+def test_the_launch_does_not_start_if_the_run_id_cannot_be_published(world, monkeypatch, tmp_path):
+    # CI's teardown step is `down --run-id <this output>`. Without the output
+    # that step can do nothing, so nothing may be rented.
     vast, run = world
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "no" / "such" / "dir" / "out"))
+    assert run(UP) == cli.EXIT_CONFIG
+    assert vast.creates == 0 and vast.names("create") == []
+    assert not (tmp_path / "run.json").exists()  # and the directory is free for the next run
+
+
+def test_nothing_after_the_decision_can_fail_the_launch(world, monkeypatch, tmp_path):
+    vast, run = world
+    out = tmp_path / "out"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "no" / "such" / "dir" / "s.md"))
+    # The run id is written; after that the output file stops being writable.
+    broken = str(tmp_path / "no" / "such" / "dir" / "out")
+    vast.hooks["create"] = lambda machine: monkeypatch.setenv("GITHUB_OUTPUT", broken)
 
     def boom(*a, **k):
         raise TypeError("len() of NoneType")
@@ -278,6 +306,7 @@ def test_nothing_after_the_decision_can_fail_the_launch(world, monkeypatch, tmp_
     monkeypatch.setattr(cli, "observe", boom)
     monkeypatch.setattr(cli, "report_result", boom)
     assert run(UP) == 0 and len(vast.ours()) == 1
+    assert "run_id=" in out.read_text() and "observations_changed" not in out.read_text()
     assert run(["down"]) == 0
 
 
@@ -588,6 +617,7 @@ def test_an_exclusive_reap_destroys_what_carries_no_tag(world):
         ["reap", "--namespace", "quack-ci", "--exclusive", "--account-id", "111"],
         ["reap", "--exclusive", "--account-id", "111"],  # no maximum age
         ["reap", "--namespace", "Not A Namespace"],
+        ["reap", "--namespace", "quack-ci", "--max-age-min", "90"],  # revision 3's invocation
     ],
 )
 def test_a_reap_that_does_not_say_what_it_is_for_is_refused(world, argv):

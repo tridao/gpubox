@@ -1,10 +1,10 @@
 # gpubox design, revision 4
 
 Status: third draft (2026-11-23), implemented on the branch `rev4` and not
-yet run against the real provider (section 14). The first two drafts were
-blocked in review; section 15 lists the findings and what was done with
-each. This draft has not been reviewed: by Tri's decision the next review is
-of the implementation. Revision 3's text stays in QuACK's
+yet run against the real provider (section 14). The first two drafts and
+the first implementation were each blocked in review; section 15 lists the
+findings and what was done with each. The fixes for the third review have
+not themselves been reviewed. Revision 3's text stays in QuACK's
 `AI/gpubox_design.md`; this document replaces its sections 4, 5, 7 (phase 2),
 8 and 11 and keeps the rest by reference.
 
@@ -163,10 +163,22 @@ There is no replay. The file is read whole or not at all. Rules:
   and the command cannot end clean.
 - **S3.** An id becomes `gone` only on a lookup of that id that says it does
   not exist (a 404 or an explicit null). An error, an empty listing or an
-  accepted delete is not that.
+  accepted delete is not that. A lookup can be wrong, too: if a later
+  listing shows a box that is recorded as `gone`, a second lookup decides,
+  and a box that exists is `live` again and is destroyed. During a launch, a
+  box we did not delete ourselves is not recorded as `gone` before a delete
+  has been sent for it.
 - **S4.** `up` and `down` hold a lock on the directory while they run. `run`
   takes none, so that `down` can end a run in progress. `up` refuses to
   start while the snapshot shows a run that is not closed.
+
+The file is replaced by a rename. If the rename did not happen, nothing has
+changed, in memory or on disk. Once it has, memory follows the file; an
+error after that (the directory could not be synced, other than on a
+filesystem that cannot sync directories at all) is still reported as a
+failure. A snapshot is used only if it holds together: a closed run with no
+live id and no open attempt, a winner that is the box of its attempt. A run
+that learns of a live id is no longer closed.
 
 A kill between a create's answer and the write of its id loses the id. The
 box still carries its tag, and the attempt is still `open`, so `down` looks
@@ -186,7 +198,10 @@ and the reaper:
 - **D1.** It sends one delete to every id before it waits for any of them.
 - **D2.** It then looks each id up, repeats the delete for those still
   there, and goes on until all are gone or the budget ends. Every provider
-  call inside it is given no more time than is left of the budget.
+  call inside it is asked to take no longer than what is left of the
+  budget, and after the first round of deletes none is started once nothing
+  is left. These are socket timeouts: the budget is what is asked for, not
+  a bound on the wall clock.
 - **D3.** An error on one id (delete, lookup, or recording the result) does
   not stop the others, and that id counts as not confirmed.
 - **D4.** It returns the ids it could not confirm.
@@ -194,9 +209,10 @@ and the reaper:
 The listing is used only to choose. A listing is complete or it raises. To
 the checks `vast.py` has today (readable rows, positive ids, a cursor on
 every page, a cursor that advances) are added: no id twice,
-`total_instances` equal to the rows read where the field is present, and a
+`total_instances` equal to the rows read on whichever pages state it, and a
 `label` field in every row. A row whose label is null or empty is untagged;
-a row without the field fails the listing.
+a row without the field fails the listing. A timeout given to a listing is
+for all its pages together.
 
 ## 7. Launch
 
@@ -224,8 +240,11 @@ Rules:
 
 - **L1.** No create is sent in a pass that had no complete listing; nor
   beyond the cap; nor after the rent cut-off (60 s before the overall
-  timeout, checked just before each request); nor once any box has reported
-  an image error.
+  timeout); nor once any box has reported an image error. The cut-off is
+  checked again after the attempt has been written to the snapshot, just
+  before the request. If that write took so long that the time it recorded
+  is stale (more than 15 s), nothing is sent either: `down --abandon-unseen`
+  counts from that time.
 - **L2.** At most `1 + spare` attempts hold a slot. An attempt holds its
   slot while it is `open`, and while it is bound to an id that is not
   `gone`. So a create with no answer holds its slot until its box shows up
@@ -236,13 +255,17 @@ Rules:
   running, and with at least ten minutes of its lease left. Among several,
   the cheapest.
 - **L4.** The hand-off is the rename that puts the winner into the snapshot.
-  If `up` fails or is interrupted, it reads the snapshot back: a winner that
-  is in it is kept, whatever raised; everything else the run knows is rolled
-  back.
-- **L5.** The rollback kills the child processes, then calls
-  `destroy_confirmed` with what is left of its budget (10 s by default). It
-  is an attempt, not a promise: ids it could not confirm stay `live` in the
-  snapshot for `down`.
+  If `up` fails or is interrupted after it began a hand-off, it reads the
+  snapshot back. A winner that is in it is kept, whatever raised. If the
+  snapshot cannot be read, the box is kept too, and nothing is written, so
+  that a hand-off that did happen is not erased; `down` settles it.
+  Everything else the run knows is rolled back.
+- **L5.** The rollback has one budget (10 s by default) that starts when the
+  failure is caught. It stops the child processes, then calls
+  `destroy_confirmed` with what is left. It is an attempt, not a promise:
+  ids it could not confirm stay `live` in the snapshot for `down`. A child
+  is started and put on the list of children with signals held back, so
+  that none can be running unknown.
 - **L6.** `up` exits 0 only if a winner is in the snapshot. Losers whose
   delete is not confirmed are reported as warnings and left for `down`.
 - **L7.** The launch gives up, through the rollback, if no complete listing
@@ -267,10 +290,15 @@ gpubox reap   --exclusive --max-age-min N [--destroy]
 gpubox search [spec flags]
 ```
 
-`--account-id` (or `GPUBOX_ACCOUNT_ID`) pins the provider account. When it
-is set, `up`, `down` and `reap` ask the provider whose key they hold and
-stop, before the first create or delete, if it is another account's.
-`reap --exclusive` requires it.
+`up`, `down` and `reap` ask the provider whose key they hold. `up` records
+the account in the snapshot, pinned or not. `--account-id` (or
+`GPUBOX_ACCOUNT_ID`) pins it: the command then stops, before the first
+create or delete, if the key is another account's. `reap --exclusive`
+requires the pin.
+
+`up` writes the run id to the step outputs before it creates the snapshot
+or rents anything, and stops if that fails: it is the one output that is
+not advisory, because CI's teardown step is given nothing else.
 
 **`down`** chooses: every id in the snapshot that is not `gone`, plus every
 listed box whose tag carries the run id. Ids found in the listing are
@@ -278,7 +306,9 @@ written to the snapshot before they are deleted. Rules:
 
 - **T1.** `down` exits 0, closes the run and removes its key only if all of
   this holds: no id is left `live`; a complete listing taken after the last
-  delete shows no box with the run's tag; and no attempt is `open`.
+  delete shows no box with the run's tag; and no attempt is `open`. A run
+  that is already closed is looked at again in the same way: a box whose
+  create gave no answer can show up after the run was closed.
 - **T2.** With `--abandon-unseen`, an `open` attempt stops counting once a
   complete listing, taken at least 60 s after the attempt was sent, shows no
   box with its tag. `down` waits for that moment itself. It then reports
@@ -286,8 +316,8 @@ written to the snapshot before they are deleted. Rules:
   the same as gone. Without the flag `down` exits 75 while an attempt is
   open.
 - **T3.** `down` uses a snapshot only for the run it was asked about. If
-  the snapshot names an account and the key belongs to another, that is an
-  error, not a clean result. A snapshot that cannot be read is an error too;
+  the key belongs to another account than the one the snapshot names, that
+  is an error, not a clean result. A snapshot that cannot be read is an error too;
   with `--run-id` the boxes carrying the tag are still destroyed, and the
   exit is 75.
 - **T4.** `down --run-id` for a run this directory has no snapshot of works
@@ -331,12 +361,14 @@ declared disposable. Rules:
 - **R3.** It also chooses an instance whose label is not a valid tag, but
   only if a second complete listing, at least 30 s after the first, shows
   the same id still without one. A wrong delete of a box seconds old would
-  break a launch in progress.
+  break a launch in progress. An instance that carries a tag at the second
+  look is judged by that tag's expiry.
 - **R4.** Without `--destroy` it prints what it chose and changes nothing.
   With it, the chosen ids go to `destroy_confirmed`.
 - **R5.** It exits non-zero if a listing could not be read or a delete was
-  not confirmed. An instance with a valid, unexpired tag and no usable
-  start time is reported: the age rule cannot apply to it.
+  not confirmed. If it is the second listing that fails, what the first
+  chose is destroyed all the same. An instance with a valid, unexpired tag
+  and no usable start time is reported: the age rule cannot apply to it.
 
 `--max-age-min` must exceed the longest `--ttl-min` in use. A box whose
 lease has ended is destroyed even if a job is still using it; that is what
@@ -350,9 +382,10 @@ invisible to it.
 **What can be claimed.** No lifetime is guaranteed. On the subaccount the
 reaper destroys a box at the first pass that both sees it and finds it
 untagged, expired or too old, provided the delete takes effect. For a box
-that is listed from the start that is within one reaper period of its
-expiry, or of `--max-age-min` if it rewrote its tag and the provider's
-start time cannot be changed from the box. What is outside that:
+that is listed from the start, that pass is the first one after its expiry
+(plus the 60 s margin), or after `--max-age-min` if it rewrote its tag and
+the provider's start time cannot be changed from the box; how long after
+depends on the schedule, which can run late. What is outside that:
 
 - a box no listing shows cannot be found by anything we run;
 - a delete that does not take effect fails the reaper workflow every half
@@ -541,6 +574,24 @@ Second review (blocked), ten findings, all accepted:
 | 8. An open attempt had no clock | `sent` (section 5); T2 |
 | 9. Pseudocode and prose disagreed on reads, winner and image errors | the pseudocode is gone; L1, L3, L7 |
 | 10. Trust and timer assertions overstated | sections 4, 5, 9, 10 |
+
+Third review, of the implementation (blocked), eleven findings. The
+reviewer could not run the tests. All accepted but one part:
+
+| Finding | What was done |
+|---|---|
+| 1. A closed run was never looked at again, so a box that appeared after an abandoned create was never deleted | T1: `down` lists for a closed run too; a run that learns of a live id is no longer closed |
+| 2. A hand-off that could not be read back was treated as no hand-off | L4: kept, and nothing written |
+| 3. A run id that could not be written to the step outputs did not stop the launch | Section 8: it does now, before the snapshot exists |
+| 4. A run without a pinned account stored none, so `down` with another key could read as clean | The account is always recorded and compared (T3) |
+| 5. A wrong `gone` could never be corrected | S3: a listing that shows such a box leads to a second lookup; a delete is sent before a box is recorded as `gone` |
+| 6. The rollback budget did not cover stopping the children, and calls went on after it was spent | L5, D2. The half-second floor on a request's timeout stays: no request completes in less |
+| 7. Some damaged snapshots passed as sound; every directory-sync error was swallowed | Section 5 |
+| 8. Time checks came before the work that could invalidate them | L1 (after the write), L3 (lease checked when the box is chosen). Not done: comparing the expiry in the listed tag with the snapshot's, which differ only if a label was rewritten |
+| 9. Only the last page's total was checked; a listing could take a timeout per page | Section 6. L7 is unchanged: with the listing bounded, a gap can only come from failures |
+| 10. A failed second look spared what the first look chose; a late tag was not judged by its expiry | R3, R5 |
+| 11. A child could be running unknown after a signal; the start of a child's output was kept, not its end | L5; the last megabyte is read |
+| `--max-age-min` accepted and ignored with `--namespace` | Refused |
 
 Taken from the reviewer's answers to the open questions: `down` exits 75
 for an unseen create unless `--abandon-unseen` is given; a stopped reaper is

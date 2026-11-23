@@ -197,6 +197,36 @@ def test_a_child_that_prints_a_lot_never_blocks_on_a_pipe():
     assert done.rc == 0 and len(done.stdout) == 1 << 20  # and what we keep of it is bounded
 
 
+def test_what_is_kept_of_a_noisy_child_is_its_end_where_the_verdict_is():
+    code = (
+        "import sys; sys.stdout.write('noise\\n' * 500_000); print('{\"ok\": true, \"cpus\": 8}')"
+    )
+    ok, reason, _, report = finish(gate.Check(python(code), gate.read_gate))
+    assert (ok, reason, report["cpus"]) == (True, None, 8)
+
+
+def test_a_signal_cannot_come_between_starting_a_child_and_remembering_it(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    class Started:
+        def __init__(self, argv, **kw):
+            os.kill(os.getpid(), signal.SIGINT)  # as if Ctrl-C arrived right after the fork
+            time.sleep(0.05)
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+    monkeypatch.setattr(gate, "Child", Started)
+    p = prober(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        p.start_ready(("10.0.0.1", 22))
+    assert len(p.checks) == 1  # the signal arrived after the child was on the list
+    p.kill_all()
+    assert p.checks[0].child.killed
+
+
 def test_a_child_is_killed_at_its_deadline_and_that_is_its_result():
     child = python("import time; print('started', flush=True); time.sleep(60)", timeout=0.3)
     t0 = time.monotonic()

@@ -137,12 +137,11 @@ def pinned_account(args) -> str | None:
     return getattr(args, "account_id", None) or os.environ.get("GPUBOX_ACCOUNT_ID") or None
 
 
-def check_account(vast, expected: str | None) -> str | None:
-    """Stop, before anything is rented or destroyed, if the key is another account's."""
-    if expected is None:
-        return None
+def check_account(vast, expected: str | None) -> str:
+    """Whose key this is. Stops, before anything is rented or destroyed, if an account is
+    pinned and the key is another one's."""
     actual = vast.account()
-    if actual != expected:
+    if expected is not None and actual != expected:
         raise ConfigError(
             f"the API key belongs to account {actual}, not to the expected account {expected}"
         )
@@ -173,12 +172,18 @@ def cmd_up(args) -> int:
         # before renting one.
         vast.instances()
         run_id = new_run_id(args.namespace, args.name)
+        # Before anything else: the teardown step is given this, and must have
+        # it whenever a box may exist. So unlike every later output, a failure
+        # to write it stops the launch.
+        try:
+            github_output(run_id=run_id)
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot write the run id to GITHUB_OUTPUT ({exc}); nothing was rented"
+            ) from None
         expiry = int(time.time()) + spec.ttl_min * 60
         meta = {"image": spec.image, "gpu": spec.gpu, "num_gpus": spec.num_gpus}
         snap = Snapshot.begin(state_dir, run_id, expiry, account, meta)
-        # Before any create: the teardown step is given this, and must have it
-        # whenever a box may exist.
-        advisory("writing outputs", github_output, run_id=run_id)
         log(f"run {run_id}")
         obs = pol.Observations(observations_path(args))
         prober = Prober(key_dir(state_dir, run_id))
@@ -313,10 +318,10 @@ def cmd_down(args) -> int:
             log(f"no run in {state_dir}: nothing to destroy")
             return 0
         vast = v.Vast(api_key(args))
-        check_account(vast, pinned_account(args))
+        account = check_account(vast, pinned_account(args))
         ours = snap is not None and (run_id is None or snap.run == run_id)
         if ours:
-            if snap.account is not None and vast.account() != snap.account:
+            if snap.account is not None and account != snap.account:
                 # T3: an empty listing on another account says nothing about this run.
                 raise ConfigError(
                     f"run {snap.run} was rented on account {snap.account}; "
@@ -348,6 +353,11 @@ def cmd_reap(args) -> int:
         raise ConfigError("reap --exclusive needs --account-id (or GPUBOX_ACCOUNT_ID)")
     if args.exclusive and args.max_age_min is None:
         raise ConfigError("reap --exclusive needs --max-age-min")
+    if args.namespace is not None and args.max_age_min is not None:
+        raise ConfigError(
+            "--max-age-min has no effect with --namespace: a tagged box is reaped when the "
+            "lease in its tag has ended"
+        )
     vast = v.Vast(api_key(args))
     check_account(vast, expected)  # R1
     failed = reap(

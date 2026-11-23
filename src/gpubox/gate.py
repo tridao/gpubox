@@ -146,6 +146,7 @@ class Prober:
     def __init__(self, key_dir: Path, create: bool = True):
         """`create=False` only loads: a run that has been torn down has no key,
         and looking for it must not bring one back."""
+        self.checks: list[Check] = []  # every child process started, for kill_all
         self.key = Path(key_dir) / "id_ed25519"
         self.known_hosts = Path(key_dir) / "known_hosts"
         if not self.key.exists():
@@ -180,10 +181,26 @@ class Prober:
             argv += ["-o", f"{k}={v}"]
         return [*argv, f"root@{ep[0]}", remote]
 
+    def _start(self, argv: list[str], read, **kw) -> Check:
+        """Start a child and remember it, as one step that a signal cannot split: a child
+        that is running but that nobody knows about could not be stopped."""
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            check = Check(Child(argv, **kw), read)
+            self.checks.append(check)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)  # a pending signal arrives here
+        return check
+
+    def kill_all(self) -> None:
+        """Stop every child this prober started. Safe to call at any time, and twice."""
+        for check in self.checks:
+            check.kill()
+
     def start_ready(self, ep: tuple[str, int]) -> Check:
         """Start an SSH probe. Its result is (ok, last words of ssh)."""
-        child = Child(self.ssh(ep, "true", connect_timeout=8), timeout=READY_TIMEOUT)
-        return Check(child, read_ready)
+        argv = self.ssh(ep, "true", connect_timeout=8)
+        return self._start(argv, read_ready, timeout=READY_TIMEOUT)
 
     def start_gate(self, ep: tuple[str, int], spec) -> Check:
         """Start the health gate. Its result is (ok, reason_code, detail, report)."""
@@ -195,11 +212,12 @@ class Prober:
             "must_reach": list(spec.must_reach),
         }
         argv = self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want)))
-        return Check(Child(argv, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT), read_gate)
+        return self._start(argv, read_gate, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT)
 
 
 READY_TIMEOUT = 25
 GATE_TIMEOUT = 240
+KEEP = 1 << 20  # bytes of a child's output that are read back
 
 
 @dataclass
@@ -251,8 +269,10 @@ class Child:
                 f.close()
 
     def _read(self, f) -> str:
-        f.seek(0)
-        return f.read(1 << 20).decode("utf-8", errors="replace")  # whatever the box printed
+        """The end of what was written, bounded: the gate's verdict is its last line."""
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - KEEP))
+        return f.read(KEEP).decode("utf-8", errors="replace")  # whatever the box printed
 
     def poll(self) -> Done | None:
         """None while it runs. At its deadline it is killed, and that is its result."""
@@ -277,7 +297,7 @@ class Child:
         except (ProcessLookupError, PermissionError):
             pass
         try:
-            self.proc.wait(timeout=5)
+            self.proc.wait(timeout=1)  # SIGKILL: this returns at once, or something is very wrong
         except subprocess.TimeoutExpired:
             pass
         self.done = Done(None, self._read(self._out), self._read(self._err))

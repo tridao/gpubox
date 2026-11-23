@@ -141,7 +141,12 @@ class Vast:
     def account(self) -> str:
         """The id of the account this key belongs to."""
         data = self._call("GET", "/v0/users/current/", query={"owner": "me"})
-        if isinstance(data, dict) and type(data.get("id")) is int and data["id"] > 0:
+        if (
+            isinstance(data, dict)
+            and data.get("success", True) is True
+            and type(data.get("id")) is int
+            and data["id"] > 0
+        ):
             return str(data["id"])
         raise VastError(200, f"unexpected answer to the account lookup: {str(data)[:200]}")
 
@@ -175,12 +180,19 @@ class Vast:
         row that cannot be read fails the whole listing. So does a row
         without a `label` field (null or empty means untagged; absent means
         we were not told), an id that appears twice, and a row count that
-        differs from the `total_instances` the last page states.
+        differs from a `total_instances` that any page states.
+
+        A `timeout` given here is for the whole listing, all pages together.
         """
         rows, query = [], {"select_filters": {}, "order_by": [{"col": "id", "dir": "asc"}]}
         query["limit"] = 25
-        seen_tokens, seen_ids = set(), set()
+        seen_tokens, seen_ids, totals = set(), set(), set()
+        deadline = time.monotonic() + call["timeout"] if "timeout" in call else None
         for _ in range(MAX_PAGES):
+            if deadline is not None:
+                call["timeout"] = deadline - time.monotonic()
+                if call["timeout"] <= 0:
+                    raise VastError(0, "instance listing did not finish in time")
             data = self._call("GET", "/v1/instances/", query=query, **call)
             page = data.get("instances") if isinstance(data, dict) else None
             if not isinstance(page, list) or data.get("success", True) is not True:
@@ -199,16 +211,18 @@ class Vast:
                     raise VastError(200, f"instance {row['id']} is listed twice")
                 seen_ids.add(row["id"])
             rows.extend(page)
+            if data.get("total_instances") is not None:
+                totals.add(repr(data["total_instances"]))
             if "next_token" not in data:
                 # The last page says `"next_token": null`. A page without the
                 # field has not told us whether more follow.
                 raise VastError(200, "instance listing page has no next_token")
             token = data["next_token"]
             if token is None:
-                total = data.get("total_instances")
-                if total is not None and (type(total) is not int or total != len(rows)):
+                if totals - {repr(len(rows))}:
+                    stated = ", ".join(sorted(totals))
                     raise VastError(
-                        200, f"instance listing has {len(rows)} rows but states {total!r}"
+                        200, f"instance listing has {len(rows)} rows but states {stated}"
                     )
                 return rows
             if not isinstance(token, str) or not token or token in seen_tokens:

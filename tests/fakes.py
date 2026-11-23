@@ -82,6 +82,7 @@ class FakeVast:
         self.revealed = False
         self.hidden = set()  # ids no listing shows
         self.unlabelled = set()  # ids listed with no label
+        self.lookup_hidden = set()  # ids whose lookup says "does not exist" although they do
         self.slow_secs = slow_secs
         self.release = False  # lets "hold" boxes through the gate
         self.gate_started = set()  # machines whose gate has started
@@ -143,7 +144,7 @@ class FakeVast:
     def instance(self, iid, **kw):
         self._enter("instance", iid, kw)
         box = self.live.get(iid)
-        if box is None:
+        if box is None or iid in self.lookup_hidden:
             return None
         kind = self.behaviour.get(box["machine"], "ok")
         if kind == "api_down":
@@ -267,6 +268,11 @@ class FakeProber:
         self.vast = vast
         self.wants = []  # the spec each gate was asked to check
         self.checks = []  # every child process started
+
+    def kill_all(self):
+        self.vast._enter("kill_all")
+        for check in self.checks:
+            check.kill()
 
     def start_ready(self, ep):
         self.checks.append(FakeCheck(lambda: (True, "")))

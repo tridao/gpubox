@@ -123,6 +123,9 @@ def test_no_snapshot_is_none_and_a_damaged_one_is_an_error(tmp_path):
         lambda d: d.__setitem__("winner", {"id": 99, "attempt": 1, "host": "h", "port": 1}),
         lambda d: d.__setitem__("run", "../../etc"),
         lambda d: d.__setitem__("closed", "yes"),
+        lambda d: d.pop("account"),
+        lambda d: d.update(closed=True, closing=True),  # closed, with an attempt still open
+        lambda d: d.update(closed=True, closing=False, attempts={}),
         lambda d: d.__setitem__("expiry", "soon"),
     ],
 )
@@ -143,12 +146,70 @@ def test_a_change_that_cannot_be_written_changes_nothing(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(os, "replace", fail)
-    for change in (lambda: snap.bind(1, 41), lambda: snap.know(5), snap.set_closing, snap.close):
+    for change in (
+        lambda: snap.bind(1, 41),
+        lambda: snap.know(5),
+        snap.set_closing,
+        lambda: snap.refuse(1),
+    ):
         with pytest.raises(OSError):
             change()
     assert snap.path.read_text() == before_disk
     assert json.dumps(snap.data, sort_keys=True) == before_memory
     assert [p.name for p in tmp_path.iterdir()] == ["run.json"]  # no temporary file left behind
+
+
+def test_a_winner_must_be_the_box_of_its_attempt(tmp_path):
+    snap = opened(tmp_path, 2)
+    snap.bind(1, 41)
+    snap.bind(2, 42)
+    for args in ((42, 1), (41, 2), (41, 3)):
+        with pytest.raises(ValueError):
+            snap.publish(*args, "10.0.0.1", 2222)
+    assert Snapshot.load(tmp_path).winner is None
+    snap.publish(41, 1, "10.0.0.1", 2222)
+
+
+def test_a_run_that_may_have_a_box_is_not_closed(tmp_path):
+    snap = opened(tmp_path)
+    snap.bind(1, 41)
+    snap.gone(41)
+    snap.close()
+    assert Snapshot.load(tmp_path).closed
+    snap.know(42)  # a box that turned up after the run was closed
+    assert not Snapshot.load(tmp_path).closed and Snapshot.load(tmp_path).closing
+    snap.gone(42)
+    snap.revive(41)  # a lookup found it after all
+    assert Snapshot.load(tmp_path).live_ids() == [41]
+    with pytest.raises(StateError):
+        snap.close()  # closing says "nothing may exist", and something may
+    assert not Snapshot.load(tmp_path).closed
+
+
+def test_an_error_after_the_rename_is_raised_and_memory_follows_the_file(tmp_path, monkeypatch):
+    import errno
+
+    snap = opened(tmp_path)
+    real = os.fsync
+
+    def fsync(fd):
+        if os.path.isdir(f"/dev/fd/{fd}") or _is_dir(fd):
+            raise OSError(fsync.errno, "the directory could not be synced")
+        real(fd)
+
+    def _is_dir(fd):
+        import stat
+
+        return stat.S_ISDIR(os.fstat(fd).st_mode)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    fsync.errno = errno.EIO
+    with pytest.raises(OSError):
+        snap.bind(1, 41)  # reported as a failure: it may not survive a power cut
+    assert snap.status(41) == "live" == Snapshot.load(tmp_path).status(41)  # but it is in the file
+    fsync.errno = errno.EINVAL  # a filesystem that cannot sync a directory at all
+    snap.know(42)
+    assert Snapshot.load(tmp_path).status(42) == "live"
 
 
 def test_an_attempt_changes_state_once(tmp_path):

@@ -182,7 +182,31 @@ def test_the_window_is_checked_again_just_before_each_request(tmp_path):
     at_call(vast, "create", 1, lambda: time.sleep(0.3))
     result = launch.run({})
     assert result.winner is None and vast.creates == 1
+    assert list(states(snap)) == [1]  # the second attempt was not even begun
     nothing_left(vast, snap)
+
+
+@pytest.mark.parametrize("why", ["the window closed", "the recorded time went stale"])
+def test_nothing_is_sent_if_recording_the_attempt_took_too_long(tmp_path, monkeypatch, why):
+    # The cut-off was checked, then the write of the attempt stalled.
+    if why == "the window closed":  # and the recorded time is nowhere near stale
+        slow, kw = 0.3, {"overall_timeout": 0.2, "settle": 100}
+    else:  # stale, with the window wide open
+        slow, kw = FAST.settle / 4 + 0.05, {"overall_timeout": 5}
+    launch, vast, snap = start(tmp_path, {1: "ok"}, spare=0, **kw)
+    real = snap.open_attempt
+    stalls = [slow]
+
+    def open_attempt(*a, **kw):
+        real(*a, **kw)
+        time.sleep(stalls.pop() if stalls else 0)
+
+    monkeypatch.setattr(snap, "open_attempt", open_attempt)
+    result = launch.run({})
+    assert states(snap)[1] == "refused"  # nothing was sent for it, and the snapshot says so
+    sent = [m for n, m in vast.names("create")]
+    assert sent == ([] if why == "the window closed" else [1])  # a later pass may try again
+    assert vast.ours() == ([result.winner.instance_id] if result.winner else [])
 
 
 def test_a_pass_without_a_listing_rents_nothing(tmp_path):
@@ -270,6 +294,34 @@ def test_a_box_with_the_runs_tag_but_no_open_attempt_is_destroyed(tmp_path):
     assert result.winner is not None and 500 not in vast.live
     assert on_disk(snap).status(500) == "gone"
     only_winner_left(result, vast, snap)
+
+
+def test_a_lookup_that_wrongly_said_gone_is_corrected_by_the_listing(tmp_path):
+    # The lookup lags: it says "does not exist" for a box that does. A delete
+    # is asked for before that is believed, and when the listing still shows
+    # the box later, a second lookup decides and it is destroyed after all.
+    launch, vast, snap = start(tmp_path, {1: "hold", 2: "ok"}, spare=0, startup_timeout=5)
+    vast.sticky.add(1)
+    vast.hooks["created"] = lambda iid: iid == 1 and vast.lookup_hidden.add(1)
+
+    def correct(iid):
+        if iid == 2:  # the replacement exists: now the first box's lookup works again
+            vast.lookup_hidden.clear()
+            vast.sticky.clear()
+
+    vast.hooks["instance"] = correct
+    result = launch.run({})
+    assert result.winner.machine_id == 2
+    assert ("destroy", 1) in vast.names()[: vast.names().index(("create", 2))]  # asked first
+    assert vast.ours() == [result.winner.instance_id]  # the first box did not survive
+    assert on_disk(snap).status(1) == "gone"
+
+
+def test_down_destroys_a_box_that_was_wrongly_recorded_as_gone(tmp_path):
+    result, vast, snap = up(tmp_path, {1: "ok"}, spare=0)
+    snap.gone(result.winner.instance_id)  # as a lagging lookup would have had it
+    assert L.down(vast, snap, FAST) == 0
+    assert vast.ours() == [] and on_disk(snap).closed
 
 
 def test_a_failed_box_whose_delete_is_not_confirmed_keeps_its_slot(tmp_path):
@@ -378,6 +430,57 @@ def test_a_signal_while_both_candidates_are_in_the_gate_rolls_back(tmp_path, sig
     assert all(c.killed for c in launch.prober.checks if c.poll() is None)
     nothing_left(vast, snap)
     assert foreign_untouched(vast)
+
+
+def test_a_hand_off_that_cannot_be_read_back_keeps_the_box_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    # The interrupt lands after the rename, and then the disk cannot be read.
+    # "Cannot tell" is not "no winner": `run` may be using the box already.
+    launch, vast, snap = start(tmp_path, {1: "ok", 2: "hold"})
+    real_write, real_replace = snap._write, os.replace
+
+    def replace(src, dst):
+        real_replace(src, dst)
+        monkeypatch.setattr(L.Snapshot, "load", classmethod(lambda cls, d: 1 / 0))
+        raise KeyboardInterrupt
+
+    def write(data):
+        if data["winner"] is None:
+            return real_write(data)
+        monkeypatch.setattr(os, "replace", replace)
+        try:
+            real_write(data)
+        finally:
+            monkeypatch.setattr(os, "replace", real_replace)
+
+    monkeypatch.setattr(snap, "_write", write)
+    assert isinstance(outcome(launch), KeyboardInterrupt)
+    monkeypatch.undo()
+    disk = on_disk(snap)
+    assert vast.ours() == [disk.winner["id"]]  # the other box was destroyed, by id
+    assert len(disk.live_ids()) == 2  # and nothing was written over the hand-off
+    assert L.down(vast, disk, FAST) == 0 and vast.ours() == []
+
+
+def test_a_failure_before_any_hand_off_never_needs_the_disk(tmp_path, monkeypatch):
+    launch, vast, snap = start(tmp_path, {1: "hold", 2: "hold"})
+    at_call(vast, "instances", 6, interrupt)
+    monkeypatch.setattr(L.Snapshot, "load", classmethod(lambda cls, d: 1 / 0))
+    assert isinstance(outcome(launch), KeyboardInterrupt)
+    monkeypatch.undo()
+    nothing_left(vast, snap)
+
+
+def test_stopping_the_children_comes_out_of_the_same_budget_as_the_deletes(tmp_path):
+    launch, vast, snap = start(tmp_path, {1: "hold", 2: "hold"}, rollback=0.4, call_timeout=30)
+    vast.sticky.update({1, 2})
+    at_call(vast, "instances", 6, interrupt)
+    vast.hooks["kill_all"] = lambda _: time.sleep(0.3)
+    assert isinstance(outcome(launch), KeyboardInterrupt)
+    calls = vast.calls[[n for n, _, _ in vast.calls].index("kill_all") + 1 :]
+    timeouts = [kw["timeout"] for n, _, kw in calls if n in ("destroy", "instance")]
+    assert timeouts and max(timeouts) <= 0.1 + 0.02  # what was left, not a fresh 0.4
 
 
 def test_a_signal_during_loser_cleanup_leaves_the_winner_for_down(tmp_path):
@@ -536,6 +639,15 @@ def test_destroy_confirmed_reports_what_it_could_not_confirm():
     assert gone == [a] and vast.ours() == [b]
 
 
+def test_nothing_is_started_once_the_budget_is_spent_except_the_first_deletes():
+    vast = FakeVast({1: "ok", 2: "ok"})
+    a = vast.create(1001, {"label": "x"})
+    b = vast.create(1002, {"label": "x"})
+    vast.calls.clear()
+    assert L.destroy_confirmed(vast, [a, b], 0, FAST) == [a, b]  # sent, and not confirmed
+    assert vast.names() == [("destroy", a), ("destroy", b)]
+
+
 def test_transient_delete_failure_is_retried_until_confirmed():
     vast = FakeVast({1: "ok"})
     a = vast.create(1001, {"label": "x"})
@@ -593,8 +705,26 @@ def test_down_destroys_the_winner_and_closes_the_run(tmp_path):
     result, vast, snap = up(tmp_path, {1: "ok"}, spare=0)
     assert L.down(vast, snap, FAST) == 0
     assert vast.ours() == [] and on_disk(snap).closed and foreign_untouched(vast)
-    calls = len(vast.calls)
-    assert L.down(vast, on_disk(snap), FAST) == 0 and len(vast.calls) == calls  # a no-op
+    vast.calls.clear()
+    assert L.down(vast, on_disk(snap), FAST) == 0  # again: it looks, and finds nothing
+    assert vast.names() == [("instances", None)] and on_disk(snap).closed
+
+
+def test_a_box_that_shows_up_after_its_run_was_closed_is_still_destroyed(tmp_path):
+    # The create got no answer; 60 s later nothing was visible and the run
+    # was closed with the attempt abandoned. Then the box appears. Running
+    # `down` again must find it, in this directory as from an empty one.
+    result, vast, snap = up(tmp_path, {1: "lost_late", 2: "ok"})
+    assert L.down(vast, snap, FAST, abandon_unseen=True) == 0
+    assert on_disk(snap).closed and states(snap)[1] == "unseen"
+    (late,) = vast.ours()
+    vast.revealed = True
+    vast.sticky.add(1)
+    assert L.down(vast, on_disk(snap), FAST) >= 1
+    disk = on_disk(snap)
+    assert disk.live_ids() == [late] and not disk.closed  # a run with a live box is not closed
+    vast.sticky.clear()
+    assert L.down(vast, disk, FAST) == 0 and vast.ours() == [] and on_disk(snap).closed
 
 
 def test_down_destroys_by_id_even_if_the_box_relabelled_itself(tmp_path):
@@ -824,6 +954,30 @@ def test_the_reaper_counts_a_delete_that_is_not_confirmed():
     vast = reaper_world()
     vast.sticky.add(2)
     assert L.reap(vast, FAST, namespace="quack-ci", destroy=True) == 1  # R5
+
+
+def test_a_failed_second_look_does_not_spare_what_the_first_look_chose():
+    vast = reaper_world()
+    for iid in [i for i in vast.live if i >= 9000]:
+        vast.live.pop(iid)
+
+    def second_look_fails(seconds):
+        vast.list_fails = 1
+
+    assert L.reap(vast, FAST, max_age_min=90, destroy=True, sleep=second_look_fails) == 1  # R5
+    assert vast.ours() == [1, 3, 5]  # the expired and the too old went; the untagged was not judged
+
+
+def test_an_instance_tagged_at_the_second_look_is_still_judged_by_its_lease():
+    vast = FakeVast({})
+    vast.live.clear()
+    box(vast, 1, make_tag(RUN_ID, 1, int(time.time()) - 600))
+    vast.unlabelled.add(1)
+    assert (
+        L.reap(vast, FAST, max_age_min=90, destroy=True, sleep=lambda s: vast.unlabelled.clear())
+        == 0
+    )
+    assert vast.ours() == []
 
 
 def test_the_reaper_fails_on_a_listing_it_cannot_read():

@@ -14,6 +14,7 @@ destroyed by id). Rules S1 to S4 of the design are about this file.
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import json
 import os
@@ -104,7 +105,7 @@ def _check(data) -> None:
         raise ValueError("bad run id")
     if type(data.get("expiry")) is not int or not 0 < data["expiry"] < 10**10:
         raise ValueError("bad expiry")
-    if data.get("account") is not None and not isinstance(data["account"], str):
+    if "account" not in data or not (data["account"] is None or isinstance(data["account"], str)):
         raise ValueError("bad account")
     if not isinstance(data.get("meta"), dict):
         raise ValueError("bad meta")
@@ -144,6 +145,17 @@ def _check(data) -> None:
         )
         if not ok:
             raise ValueError("bad winner")
+        a = attempts.get(str(w["attempt"]))
+        if a is None or a["state"] != "bound" or a.get("id") != w["id"]:
+            raise ValueError("the winner is not the box of its attempt")
+    if data["closed"] and (not data["closing"] or _may_have_a_box(data)):
+        raise ValueError("closed, but a box may exist")
+
+
+def _may_have_a_box(data: dict) -> bool:
+    return any(s == "live" for s in data["ids"].values()) or any(
+        a["state"] == "open" for a in data["attempts"].values()
+    )
 
 
 class Snapshot:
@@ -190,6 +202,7 @@ class Snapshot:
         snap = cls(Path(state_dir) / SNAPSHOT, {})
         snap._write(data)
         snap.data = data
+        snap._sync_dir()
         return snap
 
     @classmethod
@@ -243,7 +256,7 @@ class Snapshot:
         )
 
     def is_live(self) -> bool:
-        return bool(self.live_ids() or self.open_attempts())
+        return _may_have_a_box(self.data)
 
     # ------------------------------------------------------------ changing
 
@@ -264,21 +277,35 @@ class Snapshot:
             except OSError:
                 pass
             raise
-        try:  # make the rename itself durable; not every filesystem lets us
+
+    def _sync_dir(self) -> None:
+        """Make the rename itself durable. A filesystem that cannot sync a directory is
+        tolerated; a real I/O error is not."""
+        if self.path is None:
+            return
+        try:
             dfd = os.open(self.path.parent, os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
 
     def _change(self, fn) -> None:
+        """Apply a change. If the file could not be replaced, raises OSError with nothing
+        changed, in memory or on disk. Once it is replaced, memory follows the file; an
+        error after that (the directory could not be synced) is still raised, and means
+        the change is in the file but may not survive a power cut."""
         new = copy.deepcopy(self.data)
         fn(new)
+        # A run that may have a box is not closed, whatever it was before.
+        new["closed"] = new["closed"] and not _may_have_a_box(new)
         _check(new)
         self._write(new)
         self.data = new
+        self._sync_dir()
 
     def open_attempt(self, n: int, *, sent: float, **fields) -> None:
         """Rule S1: called, and on disk, before the create request is sent."""
@@ -328,6 +355,12 @@ class Snapshot:
         if self.status(instance_id) != "gone":
             self._change(lambda d: d["ids"].__setitem__(str(instance_id), "gone"))
 
+    def revive(self, instance_id: int) -> None:
+        """A lookup found an instance we had recorded as gone: the earlier answer was wrong,
+        and the box is ours to destroy again."""
+        if self.status(instance_id) != "live":
+            self._change(lambda d: d["ids"].__setitem__(str(instance_id), "live"))
+
     def publish(self, instance_id: int, attempt: int, host: str, port: int) -> None:
         """The hand-off (rule L4): once this is on disk the winner is kept."""
 
@@ -341,6 +374,10 @@ class Snapshot:
             self._change(lambda d: d.__setitem__("closing", True))
 
     def close(self) -> None:
+        """Only for a run of which nothing can exist any more (rule T1)."""
+        if _may_have_a_box(self.data):
+            raise StateError(f"run {self.run} cannot be closed: a box may exist")
+
         def fn(d):
             d["closing"] = d["closed"] = True
 
