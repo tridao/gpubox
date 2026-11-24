@@ -1,10 +1,10 @@
 # gpubox design
 
 gpubox rents a GPU box on Vast.ai for a CI job or for development, checks
-that it works, and makes sure it is destroyed afterwards. It can also take
-its boxes from a Slurm cluster (section 12). This document says how, what it
-assumes, and what was decided against. Where it says Vast, read "the
-provider" unless section 12 says otherwise.
+that it works, and makes sure it is destroyed afterwards. It can also rent
+from RunPod or take boxes from a Slurm cluster (sections 12 to 14). This
+document says how, what it assumes, and what was decided against. Where it
+says Vast, read "the provider" unless those sections say otherwise.
 
 ## 1. The problem
 
@@ -411,12 +411,35 @@ again its job was reported lost and the saved environment was there.
   session; `srun --overlap` through the login host needs none of that, and
   is how a cluster's users already reach their jobs.
 
-## 12. A Slurm cluster
+## 12. Providers
 
-The launcher talks to a provider through a small interface (`provider.py`):
-candidates to rent, a create sent once, lookups and a listing read
-strictly, a delete, a relabel that is also how a lease moves, and a way to
-read a row. `vast.VastProvider` and `slurm.Slurm` implement it.
+The launcher, `down`, `renew` and the reaper talk to a provider through a
+small interface (`provider.py`): candidates to rent, a create sent once,
+lookups and a listing read strictly, a delete, a relabel that is also how a
+lease moves, and a way to read a row (`View`: queued, loading, running or
+exited; what the provider says; where SSH reaches it). What differs between
+providers and is not a call is declared by each, as class attributes, and
+read through one table (`providers.py`): its API key's variable; how a box
+is reached (our sshd with the run's key, or a Slurm step); how a job is
+started; whether its machine ids mean the same machine from run to run, so
+that observations, the blocklist and the store apply; its default spare;
+and which parts of a Spec it can honour (an image, a price cap,
+interruptible boxes, a registry login, countries to skip, an SSH
+configuration entry, any GPU model). `up` and the command line refuse what a
+provider cannot do, and insist on what it needs, before anything is rented.
+
+A run's state file names its provider and that provider's options (never a
+secret), so the commands that act on a run need neither. A box's id is a
+number or a short token (RunPod's pods).
+
+What the others were seen to do (dstack, gpuhunt, SkyPilot, November 2026):
+offers come from a catalog of typed items, the lifecycle is a few calls per
+provider, and optional abilities are mixins or flags. gpubox keeps that
+shape. Where it differs is in what it promises about a create with no
+answer and a listing that cannot be read, which none of them treat as more
+than an error.
+
+## 13. A Slurm cluster
 
 On a cluster a box is one batch job holding an allocation: `sbatch` with
 the tag as the job name, `squeue` for a lookup (`--jobs ID --states=all`)
@@ -482,3 +505,38 @@ is healthy 21 to 25 s after `up` starts when a GPU is free; a cancel
 mid-queue rolls back in 2 s; a job killed controller-side carries on and
 is followed to its exit code from another process; `--destroy-after` and a
 renewal to one minute end the job by its own script, on time.
+
+## 14. RunPod
+
+A pod is a container, as on Vast, so a box is the same: our start-up
+command is the pod's entrypoint, with the lease timer first and then an
+sshd that takes only the run's key on the pod's published 22/tcp. RunPod
+puts `runpodctl` and a key confined to the pod in every pod (seen on a
+plain ubuntu image), so the timer deletes the pod by itself
+(`runpodctl remove pod $RUNPOD_POD_ID`), as Vast's does with its container
+key.
+
+There are no machines to choose. The catalog lists GPU types with a list
+price and, per data center, a stock level; an offer is a GPU type in a data
+center that has it, offered once per slot of the race, since one data
+center can hold several boxes. A data center that turns out full answers
+400 ("no longer any instances available"): the explicit no of a stale
+offer, which costs no attempt. A MIG slice is offered only to whoever names
+it.
+
+A pod says RUNNING before its container is up; it is running for gpubox
+once it has an SSH address. The v2 API names no machine and gives no
+status message, so machines are not recorded, and an image that cannot be
+pulled is given up on by the stall and start-up rules rather than
+recognised. A deleted pod is 404, also to a second delete. A rename does
+not restart the container (a job ran on through one).
+
+**Measured**, November 2026, secure cloud, `python:3.12-slim`: healthy 45
+to 73 s after the create, once 233 s (a slow pull); a pod deleted itself
+within 30 s of `--destroy-after` and 85 s after a renewal to one minute; an
+interrupt mid-launch rolled back in 2.5 s; `down --run-id` from an empty
+directory found the run's pods by name.
+
+Not yet: interruptible pods (v2 does not create them; its GraphQL API
+does), private images (a registry credential per run, deleted with it), and
+countries to skip (v2 places by data center).

@@ -88,6 +88,7 @@ def test_the_state_reads_back_what_was_written(tmp_path):
 
 
 def test_no_state_is_none_and_an_unusable_one_is_an_error(tmp_path):
+    # (A token id is usable: {"ids": ["abc123"]} loads; see test_runpod.)
     assert State.load(tmp_path) is None
     good = begin(tmp_path).path.read_text()
     bad = [
@@ -98,7 +99,9 @@ def test_no_state_is_none_and_an_unusable_one_is_an_error(tmp_path):
         good.replace('"version": 3', '"version": 1'),
     ]
     bad.append(good.replace(RUN_ID, "../../etc"))
-    bad.append(json.dumps({**json.loads(good), "ids": ["41"]}))
+    # An id is a positive number or a short token (RunPod's pods), nothing else.
+    for wrong in ("../41", "", 0, True, 4.1, "x" * 65):
+        bad.append(json.dumps({**json.loads(good), "ids": [wrong]}))
     bad.append(json.dumps({**json.loads(good), "winners": [{"id": 41}]}))
     bad.append(json.dumps({**json.loads(good), "winners": None}))
     for text in bad:

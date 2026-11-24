@@ -1,8 +1,8 @@
 # gpubox
 
-Rent a GPU box from [Vast.ai](https://vast.ai), or take one from a Slurm
-cluster, check that it works, and make sure it is destroyed afterwards. For CI
-jobs and dev boxes.
+Rent a GPU box from [Vast.ai](https://vast.ai) or [RunPod](https://runpod.io),
+or take one from a Slurm cluster, check that it works, and make sure it is
+destroyed afterwards. For CI jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
 come up with a GPU that is already busy. gpubox rents two at once, keeps the
@@ -21,6 +21,9 @@ export VASTAI_API_KEY=...
 ```
 
 In CI, pin a commit: the job that runs gpubox holds your Vast key.
+
+Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`), else
+from lines `NAME=value` in `~/.config/gpu-cloud-query/keys.env`.
 
 ## A dev box
 
@@ -117,6 +120,28 @@ All or nothing: `up` races `count + --spare` hosts and returns 0 only with
 `--count` healthy boxes; otherwise it destroys the ones it had. A run of one
 box is called `NAME`; a run of several, `NAME-0`, `NAME-1`, ...
 
+## RunPod
+
+```bash
+gpubox search --provider runpod --gpu "RTX 4090" --max-dph-per-gpu 0.80
+gpubox up --provider runpod --gpu "RTX 4090" --max-dph-per-gpu 0.80 --image my/image:tag \
+    --namespace dev --name mybox --ttl-min 240 --ssh-config
+```
+
+The same as on Vast, with RunPod's pods: the race, the gate, jobs, `ssh`,
+`renew` and the lease all work as they do there. RunPod chooses the machine:
+an offer is a GPU type in a data center that has it in stock, at RunPod's
+list price, and `--gpu` matches its names ("RTX 4090" matches "NVIDIA GeForce
+RTX 4090"; without `--gpu`, any model under the price cap). A pod deletes
+itself when its lease ends, with the key RunPod gives each pod.
+`--runpod-cloud community` rents community hosts instead of RunPod's own
+data centers.
+
+Not yet on RunPod: `--interruptible`, `--registry-user` (private images) and
+`--exclude-country`; and machines are not recorded (RunPod's API does not
+name them), so the blocklist does not apply. An image that cannot be pulled
+is not recognised as such: each pod is given up on after `--stall-timeout`.
+
 ## A Slurm cluster
 
 ```bash
@@ -203,15 +228,15 @@ the command line); `run.boxes[i]` has `ssh_argv`, `sh`, `start`, `job`,
 `TeardownIncomplete`, `BoxLost`, `JobLost`) for the provider's or a box's.
 `gpubox.set_log(fn)` sends what it says somewhere other than stdout, for the
 whole process. The command line is a thin layer over this (`gpubox/api.py`).
-On a Slurm cluster, pass `provider="slurm", slurm={"login": "mycluster", ...}`
-to `up` (and to `down(run_id=...)` and `reap`); a run remembers where its
-boxes came from.
+Elsewhere than Vast, pass `provider="runpod"`, or `provider="slurm",
+options={"login": "mycluster", ...}`, to `up` (and to `down(run_id=...)`,
+`reap` and `search`); a run remembers where its boxes came from.
 
 ## Commands
 
 | | |
 |---|---|
-| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider slurm` for a cluster |
+| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider runpod` or `slurm` for those |
 | `status` | show the run's boxes: names, addresses, lease |
 | `run` | start a local script on a box, detached, and stream its output |
 | `logs` | a job's output (`-f`: until it ends) |

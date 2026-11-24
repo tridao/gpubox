@@ -25,12 +25,14 @@ The API key is `api_key`, else VASTAI_API_KEY, else the line `VASTAI_API_KEY=...
 `keys_file`. `account_id` (else GPUBOX_ACCOUNT_ID) pins the account: a key of another
 one is refused before anything is rented or destroyed.
 
-A Slurm cluster instead of Vast: `provider="slurm"` and `slurm={"login": HOST, ...}`
-(`slurm.Slurm`'s settings: partition, account, qos, constraint, sbatch_args). A run
-remembers where its boxes came from, so later calls on it need neither.
+Other providers (providers.py): `provider="runpod"` (its key RUNPOD_API_KEY, as for
+Vast), or `provider="slurm"` with `options={"login": HOST, ...}` (`slurm.Slurm`'s
+settings: partition, account, qos, constraint, sbatch_args). `options` are a
+provider's own settings (RunPod: {"cloud": "COMMUNITY"}). A run remembers where its
+boxes came from, so later calls on it need neither.
 
     with gpubox.up(gpubox.Spec(image="", gpus=(), max_dph_per_gpu=0), namespace="dev",
-                   name="x", provider="slurm", slurm={"login": "mycluster"}) as run:
+                   name="x", provider="slurm", options={"login": "mycluster"}) as run:
         ...
 """
 
@@ -47,6 +49,7 @@ from pathlib import Path
 from . import job as jobs
 from . import launch as L
 from . import policy as pol
+from . import providers
 from . import slurm as sl
 from . import sshconfig
 from . import store as st
@@ -83,17 +86,16 @@ class Settings:
     observations: Path | None = None  # None: <state_dir>/observations.jsonl
     # Told, as it happens, that a machine was recorded as died (the CLI writes a step output).
     on_observation: object = field(default=None, repr=False)
-    # Where `up`, `reap`, and `down` of a run this directory does not have, get boxes:
-    # "vast", or "slurm" with `slurm` its settings (slurm.Slurm.settings). A run's own
+    # Where `up`, `reap`, and `down` of a run this directory does not have, get boxes
+    # (providers.KINDS), with that provider's own `options` (never a secret). A run's own
     # provider is in its state file.
     provider: str = "vast"
-    slurm: dict | None = None
+    options: dict | None = None
     _vast: object = field(default=None, repr=False)
 
     def __post_init__(self):
         self.state_dir = Path(self.state_dir)
-        if self.provider not in ("vast", "slurm"):
-            raise ConfigError(f"no such provider: {self.provider!r} (vast or slurm)")
+        providers.kind(self.provider)  # ConfigError for one we do not know
 
     @property
     def observations_path(self) -> Path:
@@ -101,40 +103,49 @@ class Settings:
             Path(self.observations) if self.observations else self.state_dir / "observations.jsonl"
         )
 
-    def key(self) -> str:
-        key = self.api_key or os.environ.get("VASTAI_API_KEY")
+    def credential(self, name: str) -> str:
+        """An API key: `api_key` (for this settings' provider), else the environment
+        variable `name`, else the line `name=...` in `keys_file`."""
+        key = self.api_key if name == providers.kind(self.provider).credential else None
+        key = key or os.environ.get(name)
         path = Path(os.path.expanduser(self.keys_file))
         if not key and path.exists():  # local use; CI passes the secret through the environment
             for line in path.read_text().splitlines():
-                name, _, value = line.partition("=")
-                if name.strip() == "VASTAI_API_KEY":
+                var, _, value = line.removeprefix("export ").partition("=")
+                if var.strip() == name:
                     key = value.strip().strip("'\"")
         if not key:
-            raise ConfigError("VASTAI_API_KEY is not set")
+            raise ConfigError(f"{name} is not set")
         return key
+
+    def key(self) -> str:
+        return self.credential("VASTAI_API_KEY")
 
     def vast(self):
         if self._vast is None:
             self._vast = v.Vast(self.key())
         return self._vast
 
+    def _make(self, kind, options: dict):
+        if kind is v.VastProvider:
+            return v.VastProvider(self.vast())  # one client for these settings
+        if kind is sl.Slurm and not options.get("login"):
+            raise ConfigError(
+                "a Slurm cluster needs its login host (--login HOST): as `ssh HOST` "
+                "reaches it without a password prompt"
+            )
+        return kind.from_options(
+            options, self.credential(kind.credential) if kind.credential else None
+        )
+
     def named_provider(self):
         """The provider these settings name (provider.py)."""
-        if self.provider == "slurm":
-            if not (self.slurm or {}).get("login"):
-                raise ConfigError(
-                    "a Slurm cluster needs its login host (--login HOST): as `ssh HOST` "
-                    "reaches it without a password prompt"
-                )
-            return sl.Slurm.from_settings(self.slurm)
-        return v.VastProvider(self.vast())
+        return self._make(providers.kind(self.provider), dict(self.options or {}))
 
     def provider_of(self, meta: dict):
         """The provider a run's boxes came from, as its state file's `meta` says (Vast if
         it does not say)."""
-        if is_slurm(meta):
-            return sl.Slurm.from_settings(meta.get("slurm"))
-        return v.VastProvider(self.vast())
+        return self._make(providers.kind_of(meta), providers.options_of(meta))
 
     @property
     def pinned_account(self) -> str | None:
@@ -222,14 +233,14 @@ def advisory(what: str, fn, *a, **kw) -> None:
 
 def is_slurm(meta: dict) -> bool:
     """Is this run (its state file's `meta`) on a Slurm cluster?"""
-    return meta.get("provider") == "slurm"
+    return providers.kind_of(meta) is sl.Slurm
 
 
 def prober_for(state_dir: Path, run_id: str, meta: dict):
-    """What reaches a run's boxes: SSH with the run's key (Vast), or a step of the job
-    through the cluster's login host (Slurm, where a box's host is the login host and
-    its port the job id)."""
-    if is_slurm(meta):
+    """What reaches a run's boxes: SSH with the run's key (Vast, RunPod), or a step of the
+    job through the cluster's login host (Slurm, where a box's host is the login host
+    and its port the job id). Needs no API key."""
+    if providers.kind_of(meta).access == "srun":
         return sl.SlurmProber()
     try:
         return Prober(key_dir(state_dir, run_id), create=False)
@@ -281,10 +292,8 @@ def up(
     either, the exception carries a note with the run id to retry with.
     """
     s = _settings(state_dir, **settings)
-    slurm = s.provider == "slurm"
-    # A spare on a cluster holds a share of it that others could use, for a race against
-    # nodes that are rarely bad: none unless asked for.
-    policy = policy or (Policy(spare=0) if slurm else Policy())
+    kind = providers.kind(s.provider)
+    policy = policy or Policy(spare=kind.default_spare)
     if count is None:
         count = policy.count
     elif count != policy.count and policy.count != 1:
@@ -302,18 +311,9 @@ def up(
             f"a lease of {spec.ttl_min} min (--ttl-min) leaves nothing after a launch of up to "
             f"{policy.overall_timeout:g}s; it must cover that plus {policy.min_lease:g}s"
         )
-    if slurm:
-        given = [what for what, value in (
-            ("an image", spec.image), ("an interruptible box", spec.interruptible),
-            ("a registry login", spec.registry_user), ("an SSH configuration entry", ssh_config),
-        ) if value]  # fmt: skip
-        if given:
-            raise ConfigError(
-                f"not on a Slurm cluster: {', '.join(given)} (boxes run in the nodes' own "
-                "environment; reach one with `gpubox ssh`)"
-            )
-    elif not spec.gpus:
-        raise ConfigError("Vast needs at least one GPU model (--gpu)")
+    countries_given = tuple(spec.exclude_countries) != Spec.__dataclass_fields__[
+        "exclude_countries"].default  # fmt: skip
+    providers.check_spec(kind, spec, ssh_config=ssh_config, countries_given=countries_given)
     provider = s.named_provider()
     begun: list[str] = []  # the run id, once its state is begun: from then on, it is ours
     try:
@@ -332,7 +332,6 @@ def up(
 
 
 def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_result, begun):
-    slurm = provider.name == "slurm"
     with state_lock(s.state_dir):
         old = State.load(s.state_dir)  # StateError if it cannot be read
         if old is not None and not old.closed:
@@ -351,19 +350,22 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
             "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
             "count": policy.count, "interruptible": spec.interruptible,
         }  # fmt: skip
-        if slurm:
-            meta.update(provider="slurm", slurm=provider.settings())
+        if provider.name != "vast":
+            meta.update(provider=provider.name, options=provider.options())
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
         begun.append(run_id)
         log(f"run {run_id}")
-        if slurm:
-            # Observations and the store are about Vast's machines (slurm.py).
-            obs, shared, blocked, prober = None, None, {}, sl.SlurmProber()
-        else:
+        if provider.observes_machines:
             obs = pol.Observations(s.observations_path)
             shared = s.shared()
             share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
             blocked = pol.blocklist(known_rows(obs, shared), time.time())
+        else:
+            # Its machine ids, if any, are not comparable from run to run (providers.py).
+            obs, shared, blocked = None, None, {}
+        if provider.access == "srun":
+            prober = sl.SlurmProber()
+        else:
             prober = Prober(key_dir(s.state_dir, run_id))
         launch = L.Launch(provider, spec, policy, state, prober)
         result = launch.run(blocked)
@@ -454,8 +456,12 @@ def reap(namespace: str, *, destroy: bool = False, policy: Policy | None = None,
 def search(spec: Spec, *, want: int = 2, state_dir=None, **settings):
     """(offers `up` would try, in order; the blocked machines). Rents nothing."""
     s = _settings(state_dir, **settings)
-    if s.provider != "vast":
-        raise ConfigError("there are no offers to search on a Slurm cluster (try `sinfo`)")
+    kind = providers.kind(s.provider)
+    if not kind.searchable:
+        raise ConfigError(f"there are no offers to search on {kind.name}")
+    if kind is not v.VastProvider:
+        offers, _ = s.named_provider().candidates(spec, {}, Policy(spare=0))  # each once
+        return offers[:want] if want > 2 else offers, {}
     obs = pol.Observations(s.observations_path)
     shared = s.shared()
     share(shared, "search")
@@ -486,7 +492,8 @@ class Run:
     id = property(lambda self: self._id)
     meta = property(lambda self: dict(self._meta))  # what was asked for
     interruptible = property(lambda self: bool(self._meta.get("interruptible")))
-    on_slurm = property(lambda self: is_slurm(self._meta))
+    kind = property(lambda self: providers.kind_of(self._meta))  # its provider's class
+    on_slurm = property(lambda self: self.kind is sl.Slurm)
 
     @property
     def provider(self):
@@ -592,8 +599,10 @@ class Run:
 
     def write_ssh_config(self) -> Path:
         """`Host` entries in ~/.ssh/gpubox_config for each box (see sshconfig)."""
-        if self.on_slurm:
-            raise ConfigError("a Slurm box has no SSH configuration entry: `gpubox ssh` reaches it")
+        if "ssh_config" not in self.kind.features:
+            raise ConfigError(
+                f"a box on {self.kind.name} has no SSH configuration entry: `gpubox ssh` reaches it"
+            )
         boxes = self.boxes
         keys = key_dir(self.settings.state_dir, self.id)
         hosts = [(b.name, b.host, b.port) for b in boxes]
@@ -634,7 +643,7 @@ class Box:
         self.gpu, self.machine = w.get("gpu"), w.get("machine")
 
     def __repr__(self) -> str:
-        if self.run.on_slurm:  # its host is the login host and its port the job id
+        if self.run.kind.access == "srun":  # its host is the login host and its port the job id
             return f"Box({self.name}, job {self.instance_id} on {self.machine}, via {self.host})"
         return f"Box({self.name}, instance {self.instance_id}, root@{self.host}:{self.port})"
 
@@ -664,7 +673,7 @@ class Box:
         try:
             remote, stdin = jobs.start_command(
                 job_id, script, env, timeout_s=timeout_s, destroy_after=destroy_after,
-                spawn="runner" if self.run.on_slurm else "setsid",
+                spawn=self.run.kind.spawn,
             )  # fmt: skip
         except jobs.JobError as exc:
             raise ConfigError(str(exc)) from None
@@ -772,7 +781,9 @@ class Box:
         was destroyed by someone (a teardown elsewhere, its own timer, the reaper), which
         says nothing about the machine. A missing or transitional status, or an API error,
         is not evidence either."""
-        if status not in DEAD_STATUSES or not self.run.live() or self.run.on_slurm:
+        if not self.run.kind.observes_machines:  # its machine ids mean nothing across runs
+            return
+        if status not in DEAD_STATUSES or not self.run.live():
             return
         if self.run.interruptible:  # stopped by the market, most likely: not the machine
             return

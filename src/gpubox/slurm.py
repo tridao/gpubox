@@ -240,7 +240,14 @@ class Slurm:
 
     name = "slurm"
     noun = "job"
+    credential = None  # the user's own SSH access to the login host
+    access = "srun"
+    spawn = "runner"  # Slurm ends what a step started: the batch script starts jobs
     own_sshd = False  # the user's own SSH and srun: nothing of ours answers SSH
+    observes_machines = False  # node names are not Vast's machine ids (module docstring)
+    default_spare = 0  # a spare holds a share of the cluster that others could use
+    features = frozenset({"any_gpu"})
+    searchable = False  # Slurm chooses the node: there is nothing to show
 
     def __init__(
         self,
@@ -278,6 +285,13 @@ class Slurm:
             "login": self.login, "partition": self.partition, "account": self.slurm_account,
             "qos": self.qos, "constraint": self.constraint, "sbatch_args": list(self.sbatch_args),
         }  # fmt: skip
+
+    def options(self) -> dict:
+        return self.settings()
+
+    @classmethod
+    def from_options(cls, options: dict, key=None) -> Slurm:
+        return cls.from_settings(options)
 
     @classmethod
     def from_settings(cls, settings: dict, **kw) -> Slurm:

@@ -175,6 +175,7 @@ class Attempt:
     # monotonic; what the start-up timeout counts from: t0, or the last time the box was
     # seen waiting in a queue (a queue's wait is nobody's fault)
     ready_from: float = 0.0
+    noun: str = "instance"  # what the provider calls a box, for messages
     failed_at: float = 0.0  # monotonic
     changed_at: float = 0.0  # monotonic; when its status or status message last changed
     check: object = None  # the child process it is waiting for, if any
@@ -187,7 +188,7 @@ class Attempt:
     def tag_name(self) -> str:
         where = f"m{self.machine_id}" if isinstance(self.machine_id, int) else self.machine_id
         if not where and self.instance_id is not None:
-            where = f"job {self.instance_id}"  # Slurm, before the job has a node
+            where = f"{self.noun} {self.instance_id}"  # no machine known (Slurm, RunPod)
         return f"[{where} a{self.seq}]" if where else f"[a{self.seq}]"
 
     @property
@@ -765,6 +766,7 @@ class Launch:
                 gpu=o.get("gpu_name") if isinstance(o.get("gpu_name"), str) else None,
                 bid=o.get("_bid"),
             )
+            a.noun = self.provider.noun
             self.attempts[seq] = a  # as unanswered: if the request is interrupted, it stays so
             try:
                 iid = self.provider.create(

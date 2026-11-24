@@ -112,7 +112,7 @@ New problems they bring, and the answer to each:
 A task fleet could also run on a cluster. First a general provider, then what the fleet needs.
 - [x] `--provider slurm --login HOST`: a box is one batch job holding an allocation, reached
   with `srun --jobid --overlap` through the login host; the batch script keeps the lease and
-  starts detached jobs; the gate looks only at the allocation's GPUs (DESIGN.md, section 12).
+  starts detached jobs; the gate looks only at the allocation's GPUs (DESIGN.md, section 13).
   Checked live on an H100 Slurm cluster.
 - [ ] The image. A fleet runs a private image's entrypoint unattended. On a cluster the box
   would run it in a container: pyxis/enroot (`srun --container-image`), Apptainer, or a
@@ -122,3 +122,20 @@ A task fleet could also run on a cluster. First a general provider, then what th
   its jobs. Read it as task 10 reads an outbid box (exit 75, the box was preempted).
 - [ ] Machine records for clusters: a node that keeps failing the gate, remembered across
   runs per cluster (not in the shared store, whose machine ids are Vast's).
+
+## 12. More providers
+
+Providers to add, in this order.
+- [x] The groundwork: each provider declares what it can do (`providers.py`); keys from the
+  environment or that file; ids that are tokens.
+- [x] RunPod (REST API v2): pods as boxes, the same bootstrap as Vast, self-deletion with the
+  pod's own key. Checked live (DESIGN.md, section 14).
+- [ ] RunPod: private images (a registry credential per run), interruptible pods (GraphQL),
+  the machine id (GraphQL) for the blocklist.
+- [ ] Shadeform: an aggregator of VM clouds (Hyperstack, Massed Compute, ...), with a lease it
+  enforces itself (`auto_delete.date_threshold`), tags, and a docker launch configuration.
+- [ ] The VM clouds directly: Hyperstack, Lyceum, Radiant (Ori), Massed Compute, on one shared
+  base. A VM is reached as `ubuntu`
+  or `root` with an SSH key registered through the API; the box runs the image with docker
+  or runs in the VM; the lease is the provider's own expiry where it has one, else `down` and
+  a scheduled `reap` (no account key on a box).

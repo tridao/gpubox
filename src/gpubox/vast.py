@@ -325,9 +325,12 @@ DESTROY_SELF_SCRIPT = (
 )
 
 
-def bootstrap_script(pubkey: str, expiry: int) -> str:
+def bootstrap_script(pubkey: str, expiry: int, destroy: str | None = None) -> str:
     """The container's command, as one line of bash: a self-destruct timer, then the
     container's environment saved, the self-destroy helper installed, and sshd for our key.
+
+    `destroy` is the shell command with which the box deletes itself, with a key the
+    provider gives that one container: Vast's (the default) or RunPod's (runpod.py).
 
     The timer is a dead-man switch that needs neither the launcher nor our API
     key. It has to destroy the instance: merely exiting does not stop the
@@ -348,13 +351,14 @@ def bootstrap_script(pubkey: str, expiry: int) -> str:
     ENTRYPOINT does not run first; a job that wants it runs it itself.
     """
     check_expiry(expiry)
+    destroy = destroy or f"python3 -c {shlex.quote(SELF_DESTROY)}"
     watchdog = (
         f"[ -f {EXPIRY_FILE} ] || echo {expiry} > {EXPIRY_FILE}; "
         f"(while :; do e=$(cat {EXPIRY_FILE} 2>/dev/null); "
         # Empty, not a number, or longer than a time: bash could not compare it.
         f'case "$e" in ""|*[!0-9]*|???????????*) e={expiry};; esac; '
         f'if [ "$(date +%s)" -ge "$e" ]; then'
-        f" python3 -c {shlex.quote(SELF_DESTROY)}; fi; sleep 30; done) >/dev/null 2>&1 &"
+        f" {destroy}; fi; sleep 30; done) >/dev/null 2>&1 &"
     )
     script = (
         watchdog
@@ -469,12 +473,28 @@ class VastProvider:
 
     name = "vast"
     noun = "instance"
+    credential = "VASTAI_API_KEY"
+    access = "ssh"
+    spawn = "setsid"
     # A box runs an sshd that gpubox starts with the run's key: one that refuses the key
     # shows that the image did not run our start-up command.
     own_sshd = True
+    observes_machines = True
+    default_spare = 1
+    features = frozenset(
+        {"image", "price_cap", "interruptible", "registry_login", "exclude_country", "ssh_config"}
+    )
+    searchable = True
 
     def __init__(self, client):
         self.client = client
+
+    @classmethod
+    def from_options(cls, options: dict, key: str) -> VastProvider:
+        return cls(Vast(key))
+
+    def options(self) -> dict:
+        return {}
 
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
         from .launch import candidates  # the launcher's, which `search` shows too

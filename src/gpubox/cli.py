@@ -24,10 +24,12 @@ The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
 
-`--provider slurm --login HOST` rents from a Slurm cluster instead: a box is a
-batch job holding an allocation, reached with `ssh HOST srun --jobid ...`
-(slurm.py). `up`, `down --run-id` and `reap` take these options; the other
-commands read them from the run's state file. Its account is `user@cluster`.
+`--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, runpod.py), and
+`--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
+holding an allocation, reached with `ssh HOST srun --jobid ...` (slurm.py), whose
+account is `user@cluster`. `up`, `search`, `down --run-id` and `reap` take these
+options; the other commands read them from the run's state file. Keys are read from
+the environment, else from ~/.config/gpu-cloud-query/keys.env.
 
 If GPUBOX_STORE_URL and GPUBOX_STORE_TOKEN are set, observations of machines
 are shared through that reputation store (`store/`). It is advisory: it costs
@@ -48,6 +50,7 @@ from pathlib import Path
 
 from . import api
 from . import job
+from . import providers
 from . import vast as v
 from .api import LOCAL_KEYS_FILE, Prefixed, advisory, key_dir  # noqa: F401 (part of the CLI's surface)
 from .errors import ConfigError, GpuboxError, InfraError, NoBoxes, TeardownIncomplete
@@ -63,12 +66,14 @@ DEFAULTS = Policy()
 
 def settings(args) -> api.Settings:
     check_provider_args(args)
-    slurm = None
+    options = None
     if is_slurm(args):
-        slurm = {
+        options = {
             "login": args.login, "partition": args.partition, "account": args.slurm_account,
             "qos": args.qos, "constraint": args.constraint, "sbatch_args": list(args.sbatch_arg),
         }  # fmt: skip
+    elif getattr(args, "provider", None) == "runpod":
+        options = {"cloud": (args.runpod_cloud or "secure").upper()}
     return api.Settings(
         state_dir=Path(getattr(args, "state_dir", ".gpubox")),
         account_id=getattr(args, "account_id", None),
@@ -77,7 +82,7 @@ def settings(args) -> api.Settings:
         # Said at once, not when the command ends: a CI step may be cancelled first.
         on_observation=lambda: github_output(observations_changed="true"),
         provider=getattr(args, "provider", "vast"),
-        slurm=slurm,
+        options=options,
     )
 
 
@@ -85,51 +90,50 @@ def is_slurm(args) -> bool:
     return getattr(args, "provider", None) == "slurm"
 
 
+# The flags of features not every provider has (providers.FEATURES), as argparse names them.
+FEATURE_FLAGS = {
+    "image": ("--image", "image"),
+    "price_cap": ("--max-dph-per-gpu", "max_dph_per_gpu"),
+    "interruptible": ("--interruptible", "interruptible"),
+    "registry_login": ("--registry-user", "registry_user"),
+    "exclude_country": ("--exclude-country", "exclude_country"),
+    "ssh_config": ("--ssh-config", "ssh_config"),
+}
+# Options of one provider only: (flag, argparse name, provider).
+OWN_FLAGS = [
+    ("--login", "login", "slurm"), ("--partition", "partition", "slurm"),
+    ("--slurm-account", "slurm_account", "slurm"), ("--qos", "qos", "slurm"),
+    ("--constraint", "constraint", "slurm"), ("--sbatch-arg", "sbatch_arg", "slurm"),
+    ("--runpod-cloud", "runpod_cloud", "runpod"),
+]  # fmt: skip
+
+
 def check_provider_args(args) -> None:
-    """Options that one provider has and the other has not."""
-    if is_slurm(args):
-        given = [
-            flag for flag, value in (
-                ("--image", getattr(args, "image", None)),
-                ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", None)),
-                ("--registry-user", getattr(args, "registry_user", None)),
-                ("--exclude-country", getattr(args, "exclude_country", None)),
-                ("--ssh-config", getattr(args, "ssh_config", None) or None),
-                ("--interruptible", getattr(args, "interruptible", None) or None),
-            ) if value is not None
-        ]  # fmt: skip
-        if given:
-            raise ConfigError(
-                f"{', '.join(given)}: not for a Slurm cluster (boxes run in the nodes' own "
-                "environment; reach one with `gpubox ssh`)"
-            )
-        if not getattr(args, "login", None):
-            raise ConfigError(
-                "--provider slurm needs --login HOST: the cluster's login host, as `ssh HOST` "
-                "reaches it without a password prompt"
-            )
+    """Options that the chosen provider does not have, and those it needs."""
+    kind = providers.kind(getattr(args, "provider", None) or "vast")
+    given = lambda name: getattr(args, name, None) not in (None, False, [])
+    others = [f for f, name, owner in OWN_FLAGS if owner != kind.name and given(name)]
+    if others:
+        raise ConfigError(f"{', '.join(others)}: not for {kind.name}")
+    if not hasattr(args, "num_gpus"):  # not a command that rents (down, reap)
         return
-    slurm_only = [
-        flag for flag, value in (
-            ("--login", getattr(args, "login", None)),
-            ("--partition", getattr(args, "partition", None)),
-            ("--slurm-account", getattr(args, "slurm_account", None)),
-            ("--qos", getattr(args, "qos", None)),
-            ("--constraint", getattr(args, "constraint", None)),
-            ("--sbatch-arg", getattr(args, "sbatch_arg", None) or None),
-        ) if value is not None
-    ]  # fmt: skip
-    if slurm_only:
-        raise ConfigError(f"{', '.join(slurm_only)}: only with --provider slurm")
+    refused = [f for feat, (f, name) in FEATURE_FLAGS.items() if feat not in kind.features and given(name)]  # fmt: skip
+    if refused:
+        raise ConfigError(f"{', '.join(refused)}: not on {kind.name}")
     needed = [
-        flag for flag, value in (
-            ("--gpu", getattr(args, "gpu", True)),
-            ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", True)),
-            ("--image", getattr(args, "image", True)),
-        ) if not value
+        f for feat, (f, name) in FEATURE_FLAGS.items()
+        if feat in ("image", "price_cap") and feat in kind.features and hasattr(args, name)
+        and not given(name)
     ]  # fmt: skip
+    if not args.gpu and "any_gpu" not in kind.features:
+        needed.insert(0, "--gpu")
     if needed:
-        raise ConfigError(f"Vast needs {', '.join(needed)}")
+        raise ConfigError(f"{kind.name} needs {', '.join(needed)}")
+    if is_slurm(args) and not args.login:
+        raise ConfigError(
+            "--provider slurm needs --login HOST: the cluster's login host, as `ssh HOST` "
+            "reaches it without a password prompt"
+        )
 
 
 def github_output(**values) -> None:
@@ -138,7 +142,7 @@ def github_output(**values) -> None:
             f.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def write_summary(spec: Spec, result: Result, slurm: bool = False) -> None:
+def write_summary(spec: Spec, result: Result, kind=None) -> None:
     if not (path := os.environ.get("GITHUB_STEP_SUMMARY")):
         return
     ws = result.winners
@@ -149,7 +153,7 @@ def write_summary(spec: Spec, result: Result, slurm: bool = False) -> None:
         else f"no healthy box after {result.seconds:.0f}s"
     )
     lines = [
-        f"### {'Slurm' if slurm else 'Vast'} launch: {spec.gpu_text}",
+        f"### {(kind.name if kind else 'vast').capitalize()} launch: {spec.gpu_text}",
         "",
         head,
         "",
@@ -247,8 +251,8 @@ def countries(args) -> tuple[str, ...]:
 def cmd_up(args) -> int:
     check_provider_args(args)
     spec = spec_from(args, args.image or "")
-    # A spare on a cluster holds a share of it that others could use: none by default.
-    spare = args.spare if args.spare is not None else (0 if is_slurm(args) else DEFAULTS.spare)
+    kind = providers.kind(args.provider)
+    spare = args.spare if args.spare is not None else kind.default_spare
     policy = Policy(
         count=args.count,
         spare=spare,
@@ -271,8 +275,8 @@ def cmd_up(args) -> int:
     def reported(result: Result, run: api.Run) -> None:
         changed = str(run.observations_changed).lower()
         advisory("writing outputs", github_output, observations_changed=changed)
-        advisory("writing the summary", write_summary, spec, result, run.on_slurm)
-        advisory("reporting", report_result, spec, result, run.id, run.expiry, run.on_slurm)
+        advisory("writing the summary", write_summary, spec, result, run.kind)
+        advisory("reporting", report_result, spec, result, run.id, run.expiry, run.kind)
 
     try:
         api.up(
@@ -286,10 +290,8 @@ def cmd_up(args) -> int:
     return 0
 
 
-def report_result(
-    spec: Spec, result: Result, run_id: str, expiry: int, slurm: bool = False
-) -> None:
-    noun = "job" if slurm else "instance"
+def report_result(spec: Spec, result: Result, run_id: str, expiry: int, kind=None) -> None:
+    noun = kind.noun if kind else "instance"
     for iid in result.left:
         log(f"::warning::{noun} {iid} is not confirmed destroyed; `gpubox down` retries")
     for a in result.unanswered:
@@ -304,11 +306,12 @@ def report_result(
     n = len(result.winners)
     for i, w in enumerate(result.winners):
         r = w.report
-        where = (
-            f"job {w.instance_id} on node {w.machine_id}"
-            if slurm
-            else f"instance {w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo})"
-        )
+        if kind is not None and kind.access == "srun":
+            where = f"job {w.instance_id} on node {w.machine_id}"
+        elif kind is not None and not kind.observes_machines:
+            where = f"{noun} {w.instance_id} (${w.dph:.2f}/hr, {w.geo})"
+        else:
+            where = f"instance {w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo})"
         gpus = r.get("gpus") or []
         model = w.gpu or (gpus[0] if gpus and len(set(gpus)) == 1 else "GPU")
         log(
@@ -443,7 +446,7 @@ def cmd_renew(args) -> int:
     expiry = run.renew(args.ttl_min)
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry))
     ids = ", ".join(str(b.instance_id) for b in run.boxes)
-    log(f"{'job' if run.on_slurm else 'instance'}(s) {ids}: lease now ends at {until}")
+    log(f"{run.kind.noun}(s) {ids}: lease now ends at {until}")
     return 0
 
 
@@ -468,7 +471,8 @@ def cmd_status(args) -> int:
             node = f" on {w['machine']}" if w.get("machine") else ""
             where = f"job {w['id']:<10}{node}  (ssh {w['host']}; `gpubox ssh --box {i}`)"
         else:
-            where = f"instance {w['id']:<10} root@{w['host']} -p {w['port']}"
+            noun = providers.kind_of(state.meta).noun
+            where = f"{noun} {w['id']:<10} root@{w['host']} -p {w['port']}"
         print(f"  {i}  {name:<20} {where}{gpu}")
     return 0
 
@@ -490,6 +494,13 @@ def cmd_reap(args) -> int:
 
 def cmd_search(args) -> int:
     offers, blocked = api.search(spec_from(args), settings=settings(args))
+    if args.provider != "vast":
+        print(f"{len(offers)} offer(s)")
+        for o in offers:
+            print(
+                f"  ${o['dph_total']:6.2f}/hr  {o.get('gpu_name') or '?':<40} {o.get('geolocation')}"
+            )
+        return 0
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
         note = blocked.get(o.get("machine_id"), {}).get("reason", "")
@@ -540,9 +551,14 @@ def main(argv=None) -> int:
     def provider_args(s):
         s.add_argument(
             "--provider",
-            choices=("vast", "slurm"),
+            choices=tuple(providers.KINDS),
             default="vast",
-            help="where boxes come from: Vast.ai (default), or a Slurm cluster over SSH",
+            help="where boxes come from: vast (default), runpod, or slurm (a cluster over SSH)",
+        )
+        s.add_argument(
+            "--runpod-cloud",
+            choices=("secure", "community"),
+            help="RunPod's tier: its own data centers (secure, the default) or community hosts",
         )
         g = s.add_argument_group("Slurm (with --provider slurm)")
         g.add_argument(
@@ -772,6 +788,7 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("search")
     spec_args(s)
+    provider_args(s)
     s.set_defaults(fn=cmd_search)
 
     args = p.parse_args(argv)

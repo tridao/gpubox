@@ -44,6 +44,15 @@ def positive_int(value) -> bool:
     return type(value) is int and value > 0
 
 
+# A box's id at its provider: a number (Vast's instances, Slurm's jobs) or a short token
+# (RunPod's pods).
+_INSTANCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def instance_id_ok(value) -> bool:
+    return positive_int(value) or (isinstance(value, str) and bool(_INSTANCE_ID.fullmatch(value)))
+
+
 def new_run_id(namespace: str, name: str) -> str:
     if not NAMESPACE.fullmatch(namespace):
         raise StateError(f"namespace must match {NAMESPACE.pattern}: {namespace!r}")
@@ -111,7 +120,7 @@ def state_lock(state_dir: Path):
 def _box(w) -> bool:
     return (
         isinstance(w, dict)
-        and positive_int(w.get("id"))
+        and instance_id_ok(w.get("id"))
         and positive_int(w.get("attempt"))
         and isinstance(w.get("host"), str)
         and positive_int(w.get("port"))
@@ -139,7 +148,7 @@ def _usable(data) -> bool:
         and RUN_ID.fullmatch(data["run"]) is not None
         and type(data.get("expiry")) is int
         and isinstance(data.get("ids"), list)
-        and all(positive_int(i) for i in data["ids"])
+        and all(instance_id_ok(i) for i in data["ids"])
         and isinstance(data.get("meta"), dict)
         and (data.get("account") is None or isinstance(data["account"], str))
         and isinstance(winners, list)

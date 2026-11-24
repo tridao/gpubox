@@ -643,7 +643,7 @@ def test_up_run_renew_down_on_a_cluster(tmp_path, local_cluster, capsys):
     state = State.load(tmp_path / "state")
     (w,) = state.winners
     jid = w["id"]
-    assert state.meta["provider"] == "slurm" and state.meta["slurm"]["login"] == "login.example"
+    assert state.meta["provider"] == "slurm" and state.meta["options"]["login"] == "login.example"
     assert (w["host"], w["port"], w["machine"]) == ("login.example", jid, "node1")
     box = Path(f"/tmp/gpubox-{jid}")
     assert wait_until(lambda: (box / "expiry").exists())
@@ -689,7 +689,7 @@ def test_slurm_refuses_what_only_vast_has(tmp_path, local_cluster, capsys):
     for extra in (["--image", "x"], ["--max-dph-per-gpu", "1"], ["--ssh-config"],
                   ["--exclude-country", "US"]):  # fmt: skip
         assert gpubox(tmp_path, *UP, *extra) == cli.EXIT_CONFIG
-        assert "not for a Slurm cluster" in capsys.readouterr().out
+        assert "not on slurm" in capsys.readouterr().out
     assert local_cluster.calls == []
 
 
@@ -698,9 +698,9 @@ def test_vast_refuses_what_only_slurm_has_and_still_needs_its_own(tmp_path, monk
     vast = ["up", "--gpu", "RTX 5090", "--max-dph-per-gpu", "1", "--image", "i",
             "--namespace", "dev", "--name", "box"]  # fmt: skip
     assert gpubox(tmp_path, *vast, "--partition", "gpu") == cli.EXIT_CONFIG
-    assert "only with --provider slurm" in capsys.readouterr().out
+    assert "--partition: not for vast" in capsys.readouterr().out
     assert gpubox(tmp_path, *vast[:1], *vast[3:]) == cli.EXIT_CONFIG  # no --gpu
-    assert "Vast needs --gpu" in capsys.readouterr().out
+    assert "vast needs --gpu" in capsys.readouterr().out
 
 
 def test_slurm_needs_a_login_host(tmp_path, local_cluster, capsys):
@@ -732,7 +732,7 @@ def test_reap_cancels_jobs_whose_lease_has_ended(tmp_path, local_cluster):
 def test_the_library_rents_from_a_cluster_and_tears_down_at_the_end(tmp_path, local_cluster):
     import gpubox
 
-    where = {"provider": "slurm", "slurm": {"login": "login.example"}}
+    where = {"provider": "slurm", "options": {"login": "login.example"}}
     spec = L.Spec(image="", gpus=(), max_dph_per_gpu=0, ttl_min=30)
     fast = L.Policy(**{**FAST.__dict__, "spare": 0})
     with gpubox.up(
@@ -745,7 +745,7 @@ def test_the_library_rents_from_a_cluster_and_tears_down_at_the_end(tmp_path, lo
         assert j.wait(quiet=True) == 4
         jid = box.instance_id
     assert local_cluster.jobs[jid]["state"] == "CANCELLED"
-    with pytest.raises(ConfigError, match="not on a Slurm cluster"):
+    with pytest.raises(ConfigError, match="not on slurm: an image"):
         gpubox.up(L.Spec(image="img", gpus=(), max_dph_per_gpu=0, ttl_min=30), namespace="dev",
                   name="lib", state_dir=tmp_path / "t", **where)  # fmt: skip
     with pytest.raises(ConfigError, match="login host"):
