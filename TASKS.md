@@ -142,8 +142,11 @@ Providers to add, in this order.
 - [x] Massed Compute (MCP), on the VM box. Checked live. No rename, so no `renew`.
 - [x] Lyceum, on the VM box; the first probe sends the setup (it runs nothing at boot).
   Checked live.
-- [ ] Radiant (Ori): its API has no prices (the price cap could not be kept) and plain OS
-  images. Needs a decision. On one shared
+- [ ] Radiant (Ori): decided to keep a table of Ori's list prices (Oct 2026, per GPU-hour:
+  H200 3.50, H100 SXM/PCIe 2.90, A100 2.74, L40S 1.55, V100S 0.95, L4 0.93, V100 0.83), since its
+  API has none. Blocked: every create answers HTTP 500 with no message, so its VM fields,
+  statuses and login user are unknown. On
+  one shared
   base. A VM is reached as `ubuntu`
   or `root` with an SSH key registered through the API; the box runs the image with docker
   or runs in the VM; the lease is the provider's own expiry where it has one, else `down` and
