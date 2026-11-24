@@ -169,6 +169,17 @@ which `renew` moves. A VM cannot delete itself, so `run --destroy-after` is
 refused. Not yet: `--ssh-config`, `--registry-user`, `--interruptible`,
 `--exclude-country`, `--account-id`.
 
+## Hyperstack
+
+`--provider hyperstack` (`HYPERSTACK_API_KEY`) rents Hyperstack's VMs
+directly, as boxes like Shadeform's: the image as a container on the VM,
+reached with SSH and `docker exec`, booted with Hyperstack's image "with
+Docker" of the newest CUDA in the region. Hyperstack keeps no expiry and a
+VM cannot delete itself, so `up` warns: only `gpubox down`, or a scheduled
+`gpubox reap --provider hyperstack --namespace NS --destroy`, ends a VM left
+behind. Hyperstack needs a key pair at the create: if the environment has
+none, the run's public key is imported once as `gpubox`.
+
 ## A Slurm cluster
 
 ```bash

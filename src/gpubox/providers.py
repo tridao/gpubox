@@ -32,10 +32,15 @@ passes the same contract as the others (tests/test_providers.py).
 
 from __future__ import annotations
 
-from . import runpod, shadeform, slurm, vast
+from . import hyperstack, runpod, shadeform, slurm, vast
 from .errors import ConfigError
 
-KINDS = {k.name: k for k in (vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform)}
+KINDS = {
+    k.name: k
+    for k in (
+        vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform, hyperstack.Hyperstack,
+    )
+}  # fmt: skip
 
 # What a Spec can ask for that not every provider can give.
 FEATURES = {

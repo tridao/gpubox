@@ -581,7 +581,14 @@ was healthy 204 s after the create (`python:3.12-slim`); jobs, `ssh` and
 `renew` worked as on Vast; a renewal to one minute was deleted by
 Shadeform about 50 s after the lease ended.
 
-The direct VM clouds (Hyperstack, Lyceum, Radiant, Massed Compute) are to
-use the same box; what differs is their API, how their key gets on the VM
+Hyperstack, rented directly, uses the same box: its cloud-init user data is
+the startup script, its image "with Docker" of the newest CUDA in the region
+is booted, port 22 is opened without port randomization, and the tag is a
+label. It keeps no expiry, so its lease is `down` and the reaper, and `up`
+says so. It requires a key pair at the create, though the run's key goes in
+with the script: one is imported, once per environment, if there is none.
+
+The other VM clouds (Lyceum, Radiant, Massed Compute) are to use the same
+box; what differs is their API, how their key gets on the VM
 (an API key pair, or the startup script), and whether they have an expiry
 of their own. Without one, `down` and a scheduled `reap` end their VMs.
