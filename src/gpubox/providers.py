@@ -21,13 +21,15 @@ Each provider class (provider.py describes the calls) also says, as class attrib
                       blocklist and the reputation store apply
     default_spare     boxes raced beyond the count unless asked otherwise
     features          what of a Spec beyond the hardware it honours (FEATURES)
+    requires          which of those it cannot do without ("image", "price_cap")
     searchable        `search` can show what `up` would try
 
 and `from_options(options, key)` builds one from the options a run keeps in its state
 file (`options()`; never a secret) and its API key.
 
-Adding a provider: a module with such a class, listed in KINDS; tests that its fake
-passes the same contract as the others (tests/test_providers.py).
+Adding a provider: a module with such a class, listed in KINDS, and a fake of its API
+that its tests drive (tests/test_runpod.py is the model); tests/test_providers.py checks
+that every class declares the above.
 """
 
 from __future__ import annotations
@@ -86,7 +88,7 @@ def check_spec(k, spec, *, ssh_config: bool = False, countries_given: bool = Fal
     refused = [FEATURES[f] for f, on in asked.items() if on and f not in k.features]
     if refused:
         raise ConfigError(f"not on {k.name}: {', '.join(refused)}")
-    needed = [FEATURES[f] for f in ("image", "price_cap") if f in k.features and not asked[f]]
+    needed = [FEATURES[f] for f in sorted(k.requires) if not asked.get(f)]
     if not spec.gpus and "any_gpu" not in k.features:
         needed.append("at least one GPU model (--gpu)")
     if needed:

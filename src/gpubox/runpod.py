@@ -80,6 +80,7 @@ class RunPod:
     lease = "box"
     observes_machines = False  # v2 names no machine
     default_spare = 1
+    requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})
     searchable = True
 
@@ -99,12 +100,11 @@ class RunPod:
 
     def _placement(self, spec) -> dict:
         """Per-GPU host minimums, as the catalog and pod creation both take them."""
-        n, out = spec.num_gpus, {}
-        if spec.min_cpus is not None:
-            out["minVcpuCountPerGpu"] = math.ceil(spec.min_cpus / n)
-        if spec.min_ram_gb is not None:
-            out["minRamPerGpu"] = math.ceil(spec.min_ram_gb / n)
-        return out
+        n = spec.num_gpus
+        return {
+            "minVcpuCountPerGpu": math.ceil(spec.box_cpus / n),
+            "minRamPerGpu": math.ceil(spec.box_ram_gb / n),
+        }
 
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
         """GPU types in stock, in each data center that has them, cheapest first, within
@@ -197,8 +197,9 @@ class RunPod:
             and isinstance(data.get("id"), str)
             and _POD_ID.fullmatch(data["id"])
         ):
-            if data.get("name") not in (None, label):
-                raise prov.CreateUnknown(201, f"pod {data['id']} was created with another name")
+            # The pod itself, with the name we gave it: nothing else is taken for its id.
+            if data.get("name") != label:
+                raise prov.CreateUnknown(201, f"create answered {data['id']} without our name")
             return data["id"]
         raise prov.CreateUnknown(200, f"create on {offer['id']}: unusable answer {str(data)[:300]}")
 

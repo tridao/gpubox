@@ -139,6 +139,9 @@ itself when its lease ends, with the key RunPod gives each pod.
 `--runpod-cloud community` rents community hosts instead of RunPod's own
 data centers.
 
+As everywhere, `--min-cpus` and `--min-ram-gb` default to max(16, 8 per GPU)
+CPUs and 32 GB per GPU: pass smaller ones to admit RunPod's smaller pods.
+
 Not yet on RunPod: `--interruptible`, `--registry-user` (private images) and
 `--exclude-country`; and machines are not recorded (RunPod's API does not
 name them), so the blocklist does not apply. An image that cannot be pulled

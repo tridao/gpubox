@@ -459,3 +459,9 @@ def test_the_remote_side_runs_the_script_by_its_interpreter_with_no_stdin(script
                        text=True, timeout=30)  # fmt: skip
     assert (r.returncode, r.stdout.splitlines()[0]) == expect
     assert "stdin was readable" not in r.stdout
+
+
+def test_the_model_is_matched_as_the_searches_match_it(tmp_path):
+    want = {**WANT, "gpus": ["rtx5090"]}  # "NVIDIA GeForce RTX 5090" in the stand-in
+    ok, reason, detail, _ = real_gate(tmp_path, want=want)
+    assert (ok, reason) == (True, None), detail

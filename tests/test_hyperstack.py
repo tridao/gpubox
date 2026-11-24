@@ -254,3 +254,13 @@ def test_a_launch_rents_a_vm_hands_it_over_and_down_deletes_it_by_tag(tmp_path):
     offer = p.candidates(SPEC, {}, L.Policy())[0][0]
     stray = p.create(offer, SPEC, make_tag(RUN_ID, 9, EXPIRY), "ssh-ed25519 K", EXPIRY)
     assert L.down(p, state, FAST) == [] and stray not in api.vms and api.vms == {}
+
+
+def test_a_flavor_that_does_not_state_a_size_does_not_meet_a_minimum():
+    p, _ = make()
+    spec = L.Spec(image="i", gpus=(), max_dph_per_gpu=1.0)
+    assert p._fits(
+        spec, flavor("x", "A4000", "CANADA-1")
+    )  # 28 CPUs, 58 GB: the defaults are 16, 32
+    assert not p._fits(spec, {**flavor("x", "A4000", "CANADA-1"), "ram": None})
+    assert not p._fits(spec, flavor("x", "A4000", "CANADA-1", cpu=8))

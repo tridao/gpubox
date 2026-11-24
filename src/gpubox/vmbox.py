@@ -56,7 +56,7 @@ def startup_script(pubkey: str, image: str) -> str:
     key, img = shlex.quote(pubkey), shlex.quote(image)
     run = (
         f"docker run -d --name {CONTAINER} --restart unless-stopped --gpus all --network host "
-        f"--ipc host --entrypoint bash {img} -c {shlex.quote(CONTAINER_INIT)}"
+        f"--ipc host --user 0:0 --entrypoint bash {img} -c {shlex.quote(CONTAINER_INIT)}"
     )
     return f"""#!/bin/bash
 # gpubox: this VM is a box. The run's key, then the image as the container `{CONTAINER}`.
@@ -68,13 +68,17 @@ for h in /root /home/*; do
 done
 mkdir -p "$(dirname {PULL_ERROR})"; rm -f {PULL_ERROR}
 for i in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 2; done
+pulled=
 for i in 1 2 3 4 5; do
-    if out=$(docker pull {img} 2>&1); then rm -f {PULL_ERROR}; break; fi
-    printf '%s\\n' "$out" | tail -n 3 > {PULL_ERROR}
+    if out=$(docker pull {img} 2>&1); then pulled=1; break; fi
     sleep 10
 done
+if [ -z "$pulled" ]; then  # the verdict, once it is final: the probe reports it
+    printf '%s\\n' "$out" | tail -n 3 > {PULL_ERROR}.tmp && mv {PULL_ERROR}.tmp {PULL_ERROR}
+    exit 1
+fi
 docker rm -f {CONTAINER} >/dev/null 2>&1
-{run} || docker logs {CONTAINER} 2>&1 | tail -n 3 >> {PULL_ERROR}
+{run}
 """
 
 
@@ -85,10 +89,10 @@ class VmProber(Prober):
     def ssh(self, ep, remote, *, connect_timeout: int = 10, tty=None) -> list[str]:
         host, port, user = ep
         if remote is None:
-            inner = f"sudo -n docker exec -it {CONTAINER} bash -l || sudo -n docker exec -it {CONTAINER} sh -l"
+            inner = f"sudo -n docker exec -u 0 -it {CONTAINER} bash -l || sudo -n docker exec -u 0 -it {CONTAINER} sh -l"
         else:
             flags = "-it" if tty else "-i"
-            inner = f"sudo -n docker exec {flags} {CONTAINER} sh -c {shlex.quote(remote)}"
+            inner = f"sudo -n docker exec -u 0 {flags} {CONTAINER} sh -c {shlex.quote(remote)}"
         argv = super().ssh((host, port), inner, connect_timeout=connect_timeout, tty=tty)
         return [f"{user}@{host}" if a == f"root@{host}" else a for a in argv]
 
@@ -97,7 +101,7 @@ class VmProber(Prober):
         said."""
         host, port, user = ep
         check = (
-            f"sudo -n docker exec {CONTAINER} true 2>/dev/null || "
+            f"sudo -n docker exec -u 0 {CONTAINER} true 2>/dev/null || "
             f"{{ sudo -n cat {PULL_ERROR} >&2 2>/dev/null; echo 'the box is not up yet' >&2; exit 1; }}"
         )
         argv = Prober.ssh(self, (host, port), check, connect_timeout=8)

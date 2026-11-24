@@ -269,13 +269,13 @@ def test_a_vm_box_is_reached_as_its_user_then_inside_its_container(tmp_path):
     p = vmbox.VmProber(tmp_path)
     argv = p.ssh(("1.2.3.4", 2200, "shadeform"), "echo hi")
     assert "shadeform@1.2.3.4" in argv and "root@1.2.3.4" not in argv and "2200" in argv
-    assert argv[-1] == "sudo -n docker exec -i gpubox sh -c 'echo hi'"
+    assert argv[-1] == "sudo -n docker exec -u 0 -i gpubox sh -c 'echo hi'"  # root, whatever USER
     assert "-F" in argv  # the user's own ssh_config does not apply, as on Vast
     assert "-it gpubox" in p.ssh(("1.2.3.4", 22, "u"), None, tty=True)[-1]
     started = []
     p._start = lambda argv, read, **kw: started.append(argv)
     p.start_ready(("1.2.3.4", 22, "u"))
-    assert "docker exec gpubox true" in started[0][-1] and vmbox.PULL_ERROR in started[0][-1]
+    assert "docker exec -u 0 gpubox true" in started[0][-1] and vmbox.PULL_ERROR in started[0][-1]
 
 
 class VmProber:
@@ -361,9 +361,9 @@ def test_renew_moves_the_auto_delete_and_touches_nothing_on_the_box(tmp_path):
     run, p, api_, state = launch(tmp_path, spare=0)
     run.run({})
     later = EXPIRY + 7200
+    run.prober.run = lambda *a, **k: 255  # the box cannot be reached: no matter, here
     L.renew(p, state, run.prober, later)
-    ((ep, remote),) = run.prober.ran
-    assert remote == "true" and len(ep) == 3  # reached as its user; nothing to rewrite
+    assert run.prober.ran == []  # the lease is Shadeform's: nothing on the box to move
     (row,) = api_.instances.values()
     assert parse_tag(row["tags"][0]).expiry == later
 
@@ -379,3 +379,27 @@ def test_a_vm_box_cannot_destroy_itself_so_destroy_after_is_refused(tmp_path):
     with pytest.raises(ConfigError, match="no account lookup"):
         sf.Shadeform(FakeApi()).account()
     assert gate.read_ready  # (the probe's reading is gate's, shared with every provider)
+
+
+def test_unreadable_tags_make_an_unreadable_row_not_an_untagged_one():
+    assert sf._row({"id": "i1", "status": "active", "tags": None})["label"] is None
+    for raw in ({"id": "i1", "status": "active"}, {"id": "i1", "status": "active", "tags": [1]}):
+        assert sf._row(raw) is None
+
+
+def test_a_renewal_is_confirmed_only_at_the_same_instant_whatever_the_offset():
+    t = 1795502400  # 2026-11-24T06:40:00Z
+    assert sf._same_time("2026-11-24T06:40:00Z", t)
+    assert sf._same_time("2026-11-24T08:40:00+02:00", t)
+    assert not sf._same_time("2026-11-24T06:40:00+02:00", t)
+    assert not sf._same_time("2026-11-24T06:40:00", t)  # no offset: not an instant
+
+
+def test_the_pull_verdict_is_written_only_once_the_retries_are_spent():
+    script = vmbox.startup_script("ssh-ed25519 K", "img:1")
+    loop = script[
+        script.index("for i in 1 2 3 4 5") : script.index(
+            "done", script.index("for i in 1 2 3 4 5")
+        )
+    ]
+    assert vmbox.PULL_ERROR not in loop and "--user 0:0" in script

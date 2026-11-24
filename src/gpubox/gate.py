@@ -24,7 +24,8 @@ from pathlib import Path
 from .policy import REASONS
 from .vast import LOAD_ENV
 
-GATE_VERSION = 3  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old
+GATE_VERSION = 4  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old;
+# 4: the model compared without case or punctuation, as the providers' searches compare it
 
 # Verdicts the gate gives that are about the caller's choice, not the machine: the box
 # fails, nobody is blamed. driver_too_old: the host's driver supports an older CUDA major
@@ -70,6 +71,10 @@ def driver_cuda():
     except Exception:
         return None
 
+def compact(name):
+    # As the providers' searches compare names: "rtx4090" is "NVIDIA GeForce RTX 4090".
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
 rows = smi()
 out["gpus"] = [r[1] for r in rows]
 out["driver"] = rows[0][6] if rows else None
@@ -79,7 +84,7 @@ out["disk_free_gb"] = shutil.disk_usage("/").free >> 30
 if len(rows) != want["num_gpus"]:
     done("wrong_hardware", "expected %d GPUs, nvidia-smi lists %d" % (want["num_gpus"], len(rows)))
 for r in rows:
-    if want["gpus"] and not any(model in r[1] for model in want["gpus"]):
+    if want["gpus"] and not any(compact(model) in compact(r[1]) for model in want["gpus"]):
         done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], " or ".join(want["gpus"])))
     if int(r[2]) < want["min_vram_mib"]:
         done("wrong_hardware", "GPU %s has %s MiB, need %d" % (r[0], r[2], want["min_vram_mib"]))

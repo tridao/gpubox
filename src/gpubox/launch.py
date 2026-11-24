@@ -109,6 +109,16 @@ class Spec:
                 raise ValueError("a registry user or token cannot be empty or contain spaces")
 
     @property
+    def box_cpus(self) -> int:
+        """CPUs for the whole box: `min_cpus`, else max(16, 8 per GPU)."""
+        return max(16, 8 * self.num_gpus) if self.min_cpus is None else self.min_cpus
+
+    @property
+    def box_ram_gb(self) -> int:
+        """GB of RAM for the whole box: `min_ram_gb`, else 32 per GPU."""
+        return 32 * self.num_gpus if self.min_ram_gb is None else self.min_ram_gb
+
+    @property
     def gpu_text(self) -> str:
         """What was asked for, for people: "2x RTX 5090 or RTX 4090"."""
         return f"{self.num_gpus}x {' or '.join(self.gpus) or 'any GPU'}"
@@ -604,7 +614,7 @@ class Launch:
                 return None
             a.check = None
             ok, a.ssh_err = result
-            if not ok and v.classify_status(a.ssh_err) == "image":
+            if not ok and self.provider.access == "vm" and v.classify_status(a.ssh_err) == "image":
                 # The box said its image could not be pulled (a VM box's probe reports
                 # its docker pull, vmbox.py): as a host's word on Vast, two settle it.
                 said = f"image {spec.image!r} cannot be pulled: {a.ssh_err[-200:]}"
@@ -1013,7 +1023,9 @@ def renew(provider, state: State, prober, expiry: int) -> None:
     if not boxes:
         raise ConfigError("this run has no box to renew")
     v.check_expiry(expiry)
-    for i, w in enumerate(boxes):
+    # Only a timer in the box reads the file; a lease the provider keeps moves with the tag.
+    on_box = getattr(provider, "lease", "box") == "box"
+    for i, w in enumerate(boxes if on_box else []):
         ep = (w["host"], w["port"], w["user"]) if w.get("user") else (w["host"], w["port"])
         r = prober.run(ep, provider.expiry_command(expiry))
         if r != 0:

@@ -31,7 +31,7 @@ registry's token would sit in the startup script, which Shadeform keeps), countr
 from __future__ import annotations
 
 import base64
-import calendar
+import datetime
 import re
 import time
 
@@ -97,6 +97,7 @@ class Shadeform:
     lease = "provider"  # auto_delete
     observes_machines = False
     default_spare = 1
+    requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True
 
@@ -173,13 +174,13 @@ class Shadeform:
     @staticmethod
     def _fits(spec, c: dict) -> bool:
         need = [
-            ("vcpus", spec.min_cpus),
-            ("memory_in_gb", spec.min_ram_gb),
+            ("vcpus", spec.box_cpus),
+            ("memory_in_gb", spec.box_ram_gb),
             ("storage_in_gb", spec.disk_gb),
         ]
-        for field, least in need:
+        for field, least in need:  # a size that is not stated does not meet a minimum
             have = c.get(field)
-            if least is not None and type(have) in (int, float) and have < least:
+            if type(have) not in (int, float) or have < least:
                 return False
         vram = c.get("vram_per_gpu_in_gb")
         return not (
@@ -329,13 +330,16 @@ class Shadeform:
 
 
 def _same_time(shown, expiry: int) -> bool:
+    """Does an RFC 3339 time, with whatever offset it states, name this instant?"""
     if not isinstance(shown, str):
         return False
     try:
-        t = time.strptime(shown.replace("Z", "+0000")[:19] + "+0000", "%Y-%m-%dT%H:%M:%S%z")
+        t = datetime.datetime.fromisoformat(shown.strip().replace("Z", "+00:00"))
     except ValueError:
         return False
-    return abs(calendar.timegm(t) - expiry) <= 1
+    if t.tzinfo is None:
+        return False
+    return abs(t.timestamp() - expiry) <= 1
 
 
 def _row(raw) -> dict | None:
@@ -347,8 +351,12 @@ def _row(raw) -> dict | None:
         or not _ID.fullmatch(raw["id"])
     ):
         return None
-    status, tags = raw.get("status"), raw.get("tags")
+    if "tags" not in raw:  # not told: not the same as no tags
+        return None
+    status, tags = raw.get("status"), raw["tags"]
     if not isinstance(status, str) or not status or not (tags is None or isinstance(tags, list)):
+        return None
+    if not all(isinstance(t, str) for t in tags or []):
         return None
     ours = [t for t in tags or [] if parse_tag(t) is not None]
     if len(ours) > 1:

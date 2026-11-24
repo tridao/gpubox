@@ -12,7 +12,6 @@ from fakes import FAST, FakeCheck
 from gpubox import cli
 from gpubox import launch as L
 from gpubox import provider as prov
-from gpubox import providers
 from gpubox import runpod as rp
 from gpubox.errors import ConfigError
 from gpubox.state import State, make_tag, parse_tag
@@ -146,7 +145,13 @@ def test_a_pod_is_created_once_with_our_start_up_command_and_its_tag_as_name():
     method, path, body, _, retries = api.calls[-1]
     assert (method, path, retries) == ("POST", "pods", 0)
     assert body["name"] == tag and body["image"] == "img:1" and body["ports"] == ["22/tcp"]
-    assert body["gpu"] == {"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "13.0"}
+    assert body["gpu"] == {
+        "id": "NVIDIA GeForce RTX 4090",
+        "count": 1,
+        "minCudaVersion": "13.0",
+        "minVcpuCountPerGpu": 16,
+        "minRamPerGpu": 32,
+    }  # the Spec's defaults
     assert body["dataCenterIds"] == ["EU-RO-1"] and body["entrypoint"] == ["bash"]
     assert rp.DESTROY in body["cmd"][1] and "ssh-ed25519 AAAA gpubox" in body["cmd"][1]
     assert pid in api.pods
@@ -164,6 +169,7 @@ def test_a_pod_is_created_once_with_our_start_up_command_and_its_tag_as_name():
         ({"id": "UPPER_not_a_pod"}, prov.CreateUnknown),
         (None, prov.CreateUnknown),
         ({"id": "abc123def", "name": "someone-else"}, prov.CreateUnknown),
+        ({"id": "abc123def"}, prov.CreateUnknown),  # not the pod we asked for, as far as we know
         ({"id": "abc123def", "name": make_tag(RUN_ID, 1, EXPIRY)}, "abc123def"),
     ],
 )
@@ -344,16 +350,3 @@ def test_the_key_comes_from_the_environment_or_the_keys_file(tmp_path, monkeypat
     monkeypatch.delenv("RUNPOD_API_KEY")
     with pytest.raises(ConfigError, match="RUNPOD_API_KEY"):
         s.named_provider()
-
-
-def test_every_provider_says_what_it_can_do():
-    for kind in providers.KINDS.values():
-        assert kind.access in ("ssh", "srun", "vm") and kind.spawn in ("setsid", "runner")
-        assert type(kind.self_destroy) is bool and type(kind.observes_machines) is bool
-        assert kind.lease in ("box", "provider", "reaper")
-        assert kind.lease != "box" or kind.self_destroy  # a timer in the box must be able to
-        assert kind.features <= set(providers.FEATURES)
-        assert type(kind.default_spare) is int and isinstance(kind.noun, str)
-    with pytest.raises(ConfigError, match="not on runpod: an interruptible box"):
-        providers.check_spec(rp.RunPod, L.Spec(image="i", gpus=(), max_dph_per_gpu=1,
-                                               interruptible=True))  # fmt: skip

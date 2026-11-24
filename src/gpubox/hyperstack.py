@@ -74,6 +74,7 @@ class Hyperstack:
     lease = "reaper"
     observes_machines = False
     default_spare = 1
+    requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True
 
@@ -190,13 +191,10 @@ class Hyperstack:
 
     @staticmethod
     def _fits(spec, f: dict) -> bool:
-        for field, least in (
-            ("cpu", spec.min_cpus),
-            ("ram", spec.min_ram_gb),
-            ("disk", spec.disk_gb),
-        ):
+        need = (("cpu", spec.box_cpus), ("ram", spec.box_ram_gb), ("disk", spec.disk_gb))
+        for field, least in need:  # a size that is not stated does not meet a minimum
             have = f.get(field)
-            if least is not None and type(have) in (int, float) and have < least:
+            if type(have) not in (int, float) or have < least:
                 return False
         return True
 
@@ -371,12 +369,16 @@ def _row(raw) -> dict | None:
     `actual_status`; None if it cannot be read or carries two of our tags."""
     if not isinstance(raw, dict) or type(raw.get("id")) is not int or raw["id"] <= 0:
         return None
-    status, labels = raw.get("status"), raw.get("labels")
+    if "labels" not in raw:  # not told: not the same as no labels
+        return None
+    status, labels = raw.get("status"), raw["labels"]
     if (
         not isinstance(status, str)
         or not status
         or not (labels is None or isinstance(labels, list))
     ):
+        return None
+    if not all(isinstance(t, str) for t in labels or []):
         return None
     ours = [t for t in labels or [] if parse_tag(t) is not None]
     if len(ours) > 1:

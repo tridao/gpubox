@@ -572,8 +572,10 @@ key, which never goes on a box; Shadeform instead deletes a VM at its
 `auto_delete` time, set at the create and moved by `renew`, with the tag,
 in one update that is believed once read back. So there is no timer in the
 box, and `run --destroy-after` is refused. The tag is in `tags`: a name is
-at most 50 letters, digits, `_` and `-`. A deleted VM is `deleting` (no
-longer billed) and then `deleted`, or 404; both are gone. Shadeform names
+at most 50 letters, digits, `_` and `-`. A deleted VM is `deleting` and
+then `deleted`, or 404. `deleting` counts as gone, as Slurm's COMPLETING
+does: Shadeform no longer bills it, and it cannot come back; waiting for
+`deleted` would only make `down` slower. Shadeform names
 no machine and has no account lookup.
 
 **Measured**, November 2026: an A6000 on Massed Compute through Shadeform

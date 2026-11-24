@@ -92,10 +92,15 @@ class Settings:
     # provider is in its state file.
     provider: str = "vast"
     options: dict | None = None
+    slurm: dict | None = None  # the earlier name of `options`, for a Slurm cluster
     _vast: object = field(default=None, repr=False)
 
     def __post_init__(self):
         self.state_dir = Path(self.state_dir)
+        if self.slurm is not None:
+            if self.options is not None and self.options != self.slurm:
+                raise ConfigError("pass options= or slurm= (its earlier name), not both")
+            self.options = self.slurm
         providers.kind(self.provider)  # ConfigError for one we do not know
 
     @property
