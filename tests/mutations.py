@@ -1404,6 +1404,11 @@ MUTATIONS = [
      '                or (count is not None and count != len(batch))',
      '                or False',
      'says_otherwise_than_it_shows'),
+    ('a quote in a saved variable is not escaped',
+     'onbox.py',
+     '"${{v//\\\\\\\'/$q}}"',
+     '"$v"',
+     'saves_the_containers_environment'),
 ]
 # fmt: on
 

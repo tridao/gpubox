@@ -12,6 +12,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+import shutil
 
 from gpubox import onbox
 from gpubox.providers import container
@@ -645,12 +646,20 @@ def test_the_bootstrap_saves_the_containers_environment_for_ssh(tmp_path):
     out = tmp_path / "env.sh"
     save = onbox.SAVE_ENV.replace(onbox.ENV_FILE, str(out))
     assert save in v.bootstrap_script("KEY", 1795400000).replace(onbox.ENV_FILE, str(out))
-    env = {"PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/root", "TRICKY": 'a\'b "c" $d\ne'}
+    tricky = 'a\'b "c" $d `x` & \\ e\n\nf\n'
+    env = {"PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/root", "TRICKY": tricky, "EMPTY": ""}
     assert subprocess.run(["bash", "-c", save], env=env).returncode == 0
     assert oct(out.stat().st_mode & 0o777) == "0o600"
-    r = subprocess.run(["sh", "-c", f'. {out}; printf "%s|%s|%s" "$PATH" "$TRICKY" "${{HOME-x}}"'],
-                       capture_output=True, text=True, env={})  # fmt: skip
-    assert r.stdout == '/opt/venv/bin:/usr/bin:/bin|a\'b "c" $d\ne|x'  # HOME is ssh's to set
+    # Whatever sh the box has: dash (Debian, Ubuntu), bash, busybox (Alpine).
+    shells = [[s] for s in ("sh", "dash", "bash") if shutil.which(s)]
+    shells += [["busybox", "sh"]] if shutil.which("busybox") else []
+    for sh in shells:
+        read = f'. {out}; printf "%s|%s|%s|%s" "$PATH" "$TRICKY" "${{EMPTY-x}}" "${{HOME-x}}"'
+        r = subprocess.run([*sh, "-c", read], capture_output=True, text=True, env={})
+        assert r.stdout == f"/opt/venv/bin:/usr/bin:/bin|{tricky}||x", (
+            sh,
+            r.stderr,
+        )  # HOME is ssh's
 
 
 def test_the_destroy_self_helper_moves_the_lease_into_the_past(tmp_path):

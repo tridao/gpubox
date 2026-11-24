@@ -24,9 +24,14 @@ def set_expiry_command(expiry: int) -> str:
 # command gpubox runs on the box (job.LOAD_ENV). POSIX syntax, so sh can read it.
 ENV_FILE = "/etc/gpubox/env.sh"
 # Written afresh and renamed into place, so it is 0600 whatever the image had there.
+# Each value in single quotes (a quote in it as '\''), which every POSIX shell reads:
+# not bash's `export -p`, whose $'...' for a value with a newline (bash 5.2) dash cannot
+# read. Run by bash, for `compgen -e` (the exported names) and `${!n}`.
 SAVE_ENV = (
-    "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; set -o posix; "
-    f"umask 077; rm -f {ENV_FILE}.tmp; export -p > {ENV_FILE}.tmp && mv {ENV_FILE}.tmp {ENV_FILE})"
+    "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; umask 077; "
+    f"rm -f {ENV_FILE}.tmp; q=\"'\\''\"; "
+    f'for n in $(compgen -e); do v=${{!n}}; printf "export %s=\'%s\'\\n" "$n" "${{v//\\\'/$q}}"; '
+    f"done > {ENV_FILE}.tmp && mv {ENV_FILE}.tmp {ENV_FILE})"
 )
 # Loads it into a shell on the box. POSIX sh: root's login shell, which runs what ssh
 # is asked to run, need not be bash.

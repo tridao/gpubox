@@ -444,7 +444,7 @@ def test_the_script_a_probe_sends_is_the_one_that_runs(tmp_path, monkeypatch):
     p.start_ready(("h", 22, "u"))
     remote, stdin = started[0]
     shim = pathlib.Path(__file__).parent / "bin"  # setsid, where the system has none
-    env = {"PATH": f"{tmp_path}:{shim}:/usr/bin:/bin"}  # no docker here: the box is not up
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin:{shim}"}  # no docker here: the box is not up
     for _ in range(2):
         r = sp.run(["bash", "-c", remote], input=stdin, capture_output=True, text=True, env=env)
         assert r.returncode == 1
