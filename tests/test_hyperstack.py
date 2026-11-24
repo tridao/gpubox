@@ -73,6 +73,7 @@ class FakeApi:
         if path == "core/keypairs" and method == "GET":
             return {**ok, "keypairs": self.keypairs}
         if path == "core/keypairs":
+            assert "gpubox-placeholder" in body["public_key"]  # not the run's key
             self.keypairs.append(
                 {"name": body["name"], "environment": {"name": body["environment_name"]}}
             )
@@ -143,7 +144,11 @@ def test_a_vm_is_created_once_with_our_tag_the_box_script_and_ssh_on_22():
     assert base64.b64decode(body["user_data"]).decode() == vmbox.startup_script(
         "ssh-ed25519 AAAA gpubox", "img:1"
     )
-    assert api.keypairs == [{"name": "gpubox", "environment": {"name": "default-CANADA-1"}}]
+    # A placeholder whose private half is gone: never the run's key, nor an earlier run's.
+    (pair,) = api.keypairs
+    assert pair["name"] == "gpubox-placeholder" and pair["environment"] == {
+        "name": "default-CANADA-1"
+    }
     p.create(offer, SPEC, make_tag(RUN_ID, 2, EXPIRY), "ssh-ed25519 BBBB other", EXPIRY)
     assert len(api.keypairs) == 1  # one is enough: the run's key goes in with the script
 
@@ -160,6 +165,10 @@ def test_a_vm_is_created_once_with_our_tag_the_box_script_and_ssh_on_22():
         ({"status": True, "instances": [{"id": 1}, {"id": 2}]}, prov.CreateUnknown),
         ({"status": False, "instances": [{"id": 1}]}, prov.CreateUnknown),
         ({"status": True, "instances": [{"id": 77}]}, 77),
+        (
+            {"status": True, "instances": [{"id": 77, "labels": ["someone-else"]}]},
+            prov.CreateUnknown,
+        ),
     ],
 )
 def test_a_vm_id_only_from_an_explicit_yes(answer, outcome):
@@ -189,9 +198,10 @@ def test_a_vm_on_its_way_out_is_gone_and_an_error_never_is():
     assert p.instance(5) is None
     api.vms[5] = {"id": 5, "status": "ACTIVE", "labels": []}
     assert p.instance(5)["label"] is None
-    for status in hs.GONE:
-        api.vms[5]["status"] = status
-        assert p.instance(5) is None
+    api.vms[5]["status"] = "DELETED"
+    assert p.instance(5) is None
+    api.vms[5]["status"] = "DELETING"  # still there, and not known to have stopped billing
+    assert p.instance(5) is not None
     api.vms[5]["status"] = "ACTIVE"
     for answer in (
         hs.HyperstackError(500, "x"),
@@ -264,3 +274,23 @@ def test_a_flavor_that_does_not_state_a_size_does_not_meet_a_minimum():
     )  # 28 CPUs, 58 GB: the defaults are 16, 32
     assert not p._fits(spec, {**flavor("x", "A4000", "CANADA-1"), "ram": None})
     assert not p._fits(spec, flavor("x", "A4000", "CANADA-1", cpu=8))
+
+
+def test_a_listing_page_that_says_otherwise_than_it_shows_is_an_error():
+    p, api = make()
+    api.fail["GET core/virtual-machines"] = [
+        {"status": True, "page": 1, "count": 2, "instances": []}
+    ]
+    with pytest.raises(hs.HyperstackError):
+        p.instances()
+
+
+def test_a_teardown_that_did_not_finish_says_how_to_finish_it_on_this_provider(capsys):
+    p, _ = make()
+    state = State.ephemeral(RUN_ID)
+    state.data.update(expiry=EXPIRY)
+    L.explain_leftovers(p, state, [5])
+    out = capsys.readouterr().out
+    assert "gpubox down --provider hyperstack --run-id" in out
+    assert "gpubox reap --provider hyperstack --namespace dev --destroy" in out
+    assert "destroys itself" not in out and "Nothing else ends them" in out

@@ -137,7 +137,7 @@ class VmProber(Prober):
         said. With `boot`, start the box's script if no probe has yet."""
         check = (
             f"{AS_ROOT}$S docker exec -u 0 {CONTAINER} true 2>/dev/null && exit 0; "
-            f"$S cat {PULL_ERROR} >&2 2>/dev/null; "
+            f"$S test -e {PULL_ERROR} && {{ $S cat {PULL_ERROR} >&2; exit 1; }}; "
         )
         if self.boot is not None:
             check += (

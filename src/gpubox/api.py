@@ -364,8 +364,8 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
         if provider.lease == "reaper":
             log(
                 f"NOTE: a box on {provider.name} cannot end itself and {provider.name} keeps no "
-                "expiry: only `gpubox down`, or a scheduled `gpubox reap --namespace "
-                f"{namespace} --destroy`, ends it if this run is left behind"
+                f"expiry: only `gpubox down`, or a scheduled `gpubox reap{L.provider_flags(provider)} "
+                f"--namespace {namespace} --destroy`, ends it if this run is left behind"
             )
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
         begun.append(run_id)
@@ -606,7 +606,8 @@ class Run:
             provider = s.provider_of(state.meta)
             account = s.check_account(provider)
             s.same_account(state, account, provider)  # before anything on the box is changed
-            prober = prober_for(s.state_dir, state.run, state.meta)
+            on_box = provider.lease == "box"  # else nothing on the box to move, no SSH needed
+            prober = prober_for(s.state_dir, state.run, state.meta) if on_box else None
             expiry = int(time.time()) + ttl_min * 60
             L.renew(provider, state, prober, expiry)
         self._expiry = expiry

@@ -24,12 +24,14 @@ images, countries.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import re
 import time
 import urllib.error
 import urllib.request
 
+from . import httpapi
 from . import provider as prov
 from . import vmbox
 from .errors import ConfigError
@@ -41,11 +43,14 @@ AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
 )
 IMAGE = "Ubuntu Server 22.04 w/ drivers"
-GONE = ("terminated", "terminating", "deleted")
+GONE = ("terminated", "deleted")  # terminating is still under way
 # The login user is the instance's `username` ("Ubuntu", capital U, on Massed's images:
 # root and `ubuntu` are refused). A Linux user name; capitals allowed.
 _USER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 BOOT_S = 600
+# What a launch's tool error says when nothing was launched.
+REFUSALS = ("capacity", "not available", "unavailable", "insufficient", "invalid", "not found",
+            "no inventory", "out of stock", "billing")  # fmt: skip
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _COUNT = re.compile(r"gpu_(\d+)x_", re.I)
 
@@ -73,7 +78,7 @@ class Client:
         for attempt in range(retries + 1):
             req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with httpapi.OPENER.open(req, timeout=timeout) as resp:
                     answer = _parse(resp.read().decode("utf-8", errors="replace"))
                 break
             except urllib.error.HTTPError as exc:
@@ -81,15 +86,19 @@ class Client:
                     time.sleep(2**attempt)
                     continue
                 raise MassedError(exc.code, f"{name}: HTTP {exc.code}") from None
-            except (urllib.error.URLError, OSError, ValueError) as exc:
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 if attempt < retries:
                     time.sleep(2**attempt)
                     continue
                 raise MassedError(0, f"{name}: {exc}") from None
-        if not isinstance(answer, dict):
+        if not isinstance(answer, dict) or answer.get("id") != 1:
             raise MassedError(0, f"{name}: unreadable answer")
         if isinstance(answer.get("error"), dict):
-            raise MassedError(400, f"{name}: {answer['error'].get('message', 'refused')}")
+            # A request refused as it stood (invalid, unknown method or parameters) is a
+            # definite no; any other error is not known to be one.
+            code = answer["error"].get("code")
+            status = 400 if code in (-32600, -32601, -32602) else 0
+            raise MassedError(status, f"{name}: {answer['error'].get('message', 'error')}")
         result = answer.get("result")
         if not isinstance(result, dict):
             raise MassedError(0, f"{name}: no result in {str(answer)[:200]}")
@@ -218,7 +227,11 @@ class Massed:
         except MassedError as exc:
             if exc.status in (401, 403):
                 raise ConfigError(f"Massed refused the API key: {exc}") from None
-            refused = exc.status in (400, 422) or (400 <= exc.status < 500 and exc.status != 408)
+            # A tool's error is a refusal only when it says so; anything else may have
+            # launched a VM.
+            refused = exc.status == 400 or (
+                exc.status == 422 and any(w in str(exc).lower() for w in REFUSALS)
+            )
             raise (prov.CreateRefused if refused else prov.CreateUnknown)(
                 exc.status, str(exc)
             ) from None

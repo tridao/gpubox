@@ -115,6 +115,7 @@ def test_a_vm_is_created_once_with_the_runs_key_and_our_tag_as_its_name():
         (ly.LyceumError(0, "timed out"), prov.CreateUnknown),
         ({"vm_id": "not-a-uuid"}, prov.CreateUnknown),
         ({"vm_id": VM % 9}, VM % 9),
+        ({"vm_id": VM % 9, "display_name": "someone-else"}, prov.CreateUnknown),
     ],
 )
 def test_a_vm_id_only_from_an_explicit_yes(answer, outcome):
@@ -197,3 +198,9 @@ def test_up_gives_the_probe_the_script_where_the_cloud_cannot_run_it(tmp_path, m
     keys = gapi.key_dir(tmp_path, gapi.State.load(tmp_path).run)
     pub = (keys / "id_ed25519.pub").read_text().strip()
     assert seen["boot"] == vmbox.startup_script(pub, "img:1")
+
+
+def test_cpu_and_ram_minimums_are_refused_since_lyceum_does_not_state_them():
+    p, _ = make()
+    with pytest.raises(ConfigError, match="CPUs or how much RAM"):
+        p.candidates(L.Spec(image="i", gpus=(), max_dph_per_gpu=3.0, min_cpus=8), {}, L.Policy())

@@ -2,7 +2,8 @@
 
 A box is the caller's image run as a container on the VM (vmbox.py), as on Shadeform:
 the VM's cloud-init user data is our startup script, which adds the run's key and
-starts the image; gpubox reaches it as `ubuntu` with SSH and `docker exec`.
+starts the image; gpubox reaches it as `ubuntu` with SSH and `docker exec`. Prices are the pricebook's GPU rate: Hyperstack's
+disk and public IP are not in them, so the price cap does not cover those.
 
 What it maps to:
   offers     /core/flavors (GPU, count, CPUs, RAM, disk, stock) priced by /pricebook
@@ -41,8 +42,10 @@ from .state import parse_tag
 API_BASE = "https://infrahub-api.nexgencloud.com/v1"
 PAGE = 100
 MAX_PAGES = 100
-GONE = ("DELETING", "DELETED")
-KEYPAIR = "gpubox"
+GONE = ("DELETED",)  # DELETING still shows, and is not known to have stopped billing
+# The key pair Hyperstack requires at the create: a public key whose private half was
+# thrown away when it was made, so it lets nobody in. The run's key goes in with the script.
+KEYPAIR = "gpubox-placeholder"
 USER = "ubuntu"
 BOOT_S = 600  # Hyperstack gives no figure; VMs were seen up in 3 to 5 minutes
 _CUDA = re.compile(r"CUDA (\d+)\.(\d+)")
@@ -54,6 +57,19 @@ class HyperstackError(prov.ProviderError):
 
 def Client(key: str, base: str = API_BASE, timeout: float = 30):
     return httpapi.Client(base, {"api_key": key}, HyperstackError, timeout)
+
+
+def placeholder_key() -> str:
+    """A fresh public key whose private half is deleted at once."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        key = Path(d) / "k"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpubox-placeholder",
+                        "-f", str(key)], check=True)  # fmt: skip
+        return key.with_suffix(".pub").read_text().strip()
 
 
 def image_cuda(name: str) -> float | None:
@@ -205,8 +221,9 @@ class Hyperstack:
         data = self._ok(self.client.call("GET", "core/keypairs"), "the key pair listing")
         for k in data.get("keypairs") or []:
             if isinstance(k, dict) and (k.get("environment") or {}).get("name") == env:
-                return str(k["name"])
-        body = {"name": KEYPAIR, "environment_name": env, "public_key": pubkey}
+                if k.get("name") == KEYPAIR:
+                    return KEYPAIR
+        body = {"name": KEYPAIR, "environment_name": env, "public_key": placeholder_key()}
         self._ok(
             self.client.call("POST", "core/keypairs", body=body, retries=0), "the key pair import"
         )
@@ -254,7 +271,9 @@ class Hyperstack:
             data.get("instances") if isinstance(data, dict) and data.get("status") is True else None
         )
         if isinstance(vms, list) and len(vms) == 1 and isinstance(vms[0], dict):
-            vid = vms[0].get("id")
+            vid, labels = vms[0].get("id"), vms[0].get("labels")
+            if isinstance(labels, list) and labels and label not in labels:
+                raise prov.CreateUnknown(200, f"create answered VM {vid} with other labels")
             if type(vid) is int and vid > 0:
                 return vid
         raise prov.CreateUnknown(200, f"create on {offer['id']}: unusable answer {str(data)[:300]}")
@@ -296,7 +315,12 @@ class Hyperstack:
                 if isinstance(data, dict) and data.get("status") is True
                 else None
             )
-            if not isinstance(batch, list) or data.get("page") not in (page, None):
+            count = data.get("count") if isinstance(data, dict) else None
+            if (
+                not isinstance(batch, list)
+                or data.get("page") not in (page, None)
+                or (count is not None and count != len(batch))
+            ):
                 raise HyperstackError(
                     200, f"unexpected answer to the VM listing: {str(data)[:200]}"
                 )

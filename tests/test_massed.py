@@ -119,6 +119,7 @@ def test_a_vm_is_launched_once_with_our_tag_as_its_name_and_the_box_script_at_bo
     "answer, outcome",
     [
         (ms.MassedError(422, "instances_launch: out of capacity"), prov.CreateRefused),
+        (ms.MassedError(422, "instances_launch: upstream timed out"), prov.CreateUnknown),
         (ms.MassedError(400, "instances_launch: invalid"), prov.CreateRefused),
         (ms.MassedError(401, "instances_launch: HTTP 401"), ConfigError),
         (ms.MassedError(502, "instances_launch: HTTP 502"), prov.CreateUnknown),
@@ -146,6 +147,8 @@ def test_an_instance_no_longer_listed_is_gone_and_an_error_never_is():
     assert p.instance(UUID % 1) is None
     c.vms[UUID % 1] = {"uuid": UUID % 1, "name": None, "status": "Running", "username": "Ubuntu"}
     assert p.instance(UUID % 1)["label"] is None
+    c.vms[UUID % 1]["status"] = "Terminating"  # under way: not yet gone
+    assert p.instance(UUID % 1) is not None
     c.vms[UUID % 1]["status"] = "Terminated"
     assert p.instance(UUID % 1) is None
     c.vms[UUID % 1]["status"] = "Running"
@@ -198,3 +201,27 @@ def test_a_launch_rents_a_vm_down_terminates_it_and_renew_is_refused(tmp_path):
     with pytest.raises(ConfigError, match="cannot be moved"):
         api.attach(state_dir=tmp_path).renew(60)
     assert L.down(p, state, FAST) == [] and c.vms == {}
+
+
+def test_only_a_request_refused_as_it_stood_is_a_definite_no(monkeypatch):
+    import io
+
+    answers = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(ms.httpapi.OPENER, "open", lambda req, timeout=None: Resp(answers.pop(0)))
+    client = ms.Client("k")
+    for code, status in ((-32602, 400), (-32603, 0)):
+        answers.append(b'{"jsonrpc": "2.0", "id": 1, "error": {"code": %d, "message": "x"}}' % code)
+        with pytest.raises(ms.MassedError) as exc:
+            client.tool("instances_launch", {}, retries=0)
+        assert exc.value.status == status
+    answers.append(b'{"jsonrpc": "2.0", "id": 7, "result": {"structuredContent": {}}}')  # not ours
+    with pytest.raises(ms.MassedError):
+        client.tool("instances_list", {}, retries=0)

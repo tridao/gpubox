@@ -210,9 +210,12 @@ def test_the_listing_is_every_instance_or_an_error():
     assert [r["id"] for r in rows] == ["i0", "i1", "i2", "i3", "i4"]
     assert [r["label"] for r in rows if r["label"]] == [tag]
     bad = [
-        {"instances": [{"id": "i0", "status": "active"}], "total": 2},  # fewer than stated
-        {"instances": [{"id": "i0"}], "total": 1},  # no status
-        {"instances": [{"id": "i0", "status": "active"}] * 2, "total": 2},  # twice
+        {
+            "instances": [{"id": "i0", "status": "active", "tags": None}],
+            "total": 2,
+        },  # total changes
+        {"instances": [{"id": "i0", "tags": None}], "total": 1},  # no status
+        {"instances": [{"id": "i0", "status": "active", "tags": None}] * 2, "total": 2},  # twice
         {"instances": []},  # no total
     ]
     for answer in bad:
@@ -450,3 +453,15 @@ def test_the_script_a_probe_sends_is_the_one_that_runs(tmp_path, monkeypatch):
             break
         t.sleep(0.1)
     assert (tmp_path / "ran").read_text() == "ran\n"  # once, though probed twice
+
+
+def test_a_pull_verdict_is_the_probes_last_word(tmp_path):
+    (tmp_path / "id_ed25519").write_text("")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA gpubox\n")
+    p = vmbox.VmProber(tmp_path)
+    started = []
+    p._start = lambda argv, read, **kw: started.append(argv[-1])
+    p.start_ready(("h", 22, "u"))
+    remote = started[0]
+    assert remote.index(vmbox.PULL_ERROR) < remote.index(vmbox.BOOT_LOG)
+    assert f"$S cat {vmbox.PULL_ERROR} >&2; exit 1" in remote

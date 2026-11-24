@@ -75,6 +75,8 @@ class Lyceum:
         return {}
 
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
+        if spec.min_cpus is not None or spec.min_ram_gb is not None:
+            raise ConfigError("Lyceum does not say how many CPUs or how much RAM its VMs have")
         credits = self.client.call("GET", "billing/credits")
         left = credits.get("available_credits") if isinstance(credits, dict) else None
         if type(left) in (int, float) and left <= 0:
@@ -137,6 +139,8 @@ class Lyceum:
                 exc.status, str(exc)
             ) from None
         vid = data.get("vm_id") if isinstance(data, dict) else None
+        if isinstance(data, dict) and data.get("display_name") not in (None, label):
+            raise prov.CreateUnknown(200, f"create answered VM {vid} with another name")
         if isinstance(vid, str) and _ID.fullmatch(vid):
             return vid
         raise prov.CreateUnknown(200, f"create on {offer['id']}: unusable answer {str(data)[:300]}")

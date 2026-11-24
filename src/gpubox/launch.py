@@ -957,17 +957,36 @@ def explain_leftovers(provider, state: State, left: list[int] | None) -> None:
         log(f"::error::not confirmed destroyed: {provider.noun}(s) {', '.join(map(str, left))}")
     else:
         log("::error::the provider could not be listed, so boxes of this run may remain")
-    log(f"  Run this again:   gpubox down --run-id {state.run}")
+    flags = provider_flags(provider)
+    ns = state.run.split(".")[0]
+    reap_cmd = f"gpubox reap{flags} --namespace {ns} --destroy"
+    log(f"  Run this again:   gpubox down{flags} --run-id {state.run}")
     log(f"  {provider.manual_hint(state.run, left or [])}")
-    if when:
-        log(
-            f"  If nothing is done, each running box destroys itself when its lease ends, at {when}."
+    lease = getattr(provider, "lease", "box")
+    if lease == "reaper":
+        log(f"  Nothing else ends them: {provider.name} keeps no expiry and a box cannot end")
+        log(f"  itself. Once their lease has ended, `{reap_cmd}` does.")
+    elif when:
+        who = (
+            "each running box destroys itself"
+            if lease == "box"
+            else f"{provider.name} deletes each box"
         )
-        ns = state.run.split(".")[0]
+        log(f"  If nothing is done, {who} when its lease ends, at {when}.")
         stopped = "an interruptible box that was outbid" if state.meta.get("interruptible") else (
             "one stuck before it ran")  # fmt: skip
         log(f"  A box that is not running ({stopped}) cannot: after the lease, run")
-        log(f"  `gpubox reap --namespace {ns} --destroy`, as a scheduled job should anyway.")
+        log(f"  `{reap_cmd}`, as a scheduled job should anyway.")
+
+
+def provider_flags(provider) -> str:
+    """The command-line options that name this provider again, for advice to people."""
+    name = getattr(provider, "name", "vast")
+    if name == "vast":
+        return ""
+    if name == "slurm":
+        return f" --provider slurm --login {provider.login}"
+    return f" --provider {name}"
 
 
 # ---------------------------------------------------------------------- reaper

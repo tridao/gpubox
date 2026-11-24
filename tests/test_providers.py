@@ -42,3 +42,30 @@ def test_the_earlier_name_of_the_options_still_works(tmp_path):
         api.Settings(
             state_dir=tmp_path, provider="slurm", slurm={"login": "x"}, options={"login": "y"}
         )
+
+
+def test_an_authenticated_call_is_not_redirected():
+    import http.server
+    import threading
+
+    from gpubox import httpapi
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", "http://example.invalid/steal")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        client = httpapi.Client(base, {"X-Key": "k"}, rp.RunpodError)
+        with pytest.raises(rp.RunpodError) as exc:
+            client.call("GET", "pods/x", retries=0)
+        assert exc.value.status == 302  # never read as anything, least of all a 404
+    finally:
+        server.shutdown()

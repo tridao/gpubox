@@ -39,6 +39,16 @@ def describe_error(text: str) -> str:
     return " ".join(text.split())[:300] or "no details"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the credential elsewhere, and its answer is not the API's."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class Client:
     def __init__(self, base: str, headers: dict, error, timeout: float = 30):
         self.base, self.headers, self.error, self.timeout = (
@@ -62,7 +72,7 @@ class Client:
         for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with OPENER.open(req, timeout=timeout) as resp:
                     raw = resp.read()
                     return json.loads(raw) if raw.strip() else None
             except urllib.error.HTTPError as exc:

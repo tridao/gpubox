@@ -588,7 +588,20 @@ the startup script, its image "with Docker" of the newest CUDA in the region
 is booted, port 22 is opened without port randomization, and the tag is a
 label. It keeps no expiry, so its lease is `down` and the reaper, and `up`
 says so. It requires a key pair at the create, though the run's key goes in
-with the script: one is imported, once per environment, if there is none.
+with the script: a placeholder is imported, once per environment, whose
+private half was deleted when it was made, so it lets nobody in (an earlier
+run's key would let that run's holder into later VMs). Its prices are the
+GPU rate of its pricebook; its disk and public IP are not in them, so the
+price cap does not cover those. A VM that is DELETING still counts, as does
+a Massed instance that is `terminating`: neither is known to have stopped
+billing.
+
+On every VM cloud, gpubox gives advice with the provider named (`down
+--provider hyperstack ...`), and where nothing but the reaper ends a box it
+says so instead of promising that the box will end itself. Calls with a
+credential never follow a redirect. Known gap: where the first probe starts
+the setup (Lyceum), a VM that reboots during it is not set up again; the
+start-up limit then fails it and another is rented.
 
 Massed Compute uses it too, through its MCP server: the startup script is
 the instance's boot command, and the tag its name. It cannot rename an
