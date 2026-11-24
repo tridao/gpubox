@@ -24,8 +24,9 @@ The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
 
-`--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, runpod.py), and
-`--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
+`--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, runpod.py),
+`--provider shadeform` VMs on Shadeform's clouds (SHADEFORM_API_KEY, shadeform.py,
+vmbox.py), and `--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
 holding an allocation, reached with `ssh HOST srun --jobid ...` (slurm.py), whose
 account is `user@cluster`. `up`, `search`, `down --run-id` and `reap` take these
 options; the other commands read them from the run's state file. Keys are read from
@@ -472,7 +473,8 @@ def cmd_status(args) -> int:
             where = f"job {w['id']:<10}{node}  (ssh {w['host']}; `gpubox ssh --box {i}`)"
         else:
             noun = providers.kind_of(state.meta).noun
-            where = f"{noun} {w['id']:<10} root@{w['host']} -p {w['port']}"
+            user = w.get("user") or "root"
+            where = f"{noun} {w['id']:<10} {user}@{w['host']} -p {w['port']}"
         print(f"  {i}  {name:<20} {where}{gpu}")
     return 0
 
@@ -497,9 +499,8 @@ def cmd_search(args) -> int:
     if args.provider != "vast":
         print(f"{len(offers)} offer(s)")
         for o in offers:
-            print(
-                f"  ${o['dph_total']:6.2f}/hr  {o.get('gpu_name') or '?':<40} {o.get('geolocation')}"
-            )
+            what = str(o.get("id", "")).split("#")[0]  # the offer, once per race slot
+            print(f"  ${o['dph_total']:6.2f}/hr  {o.get('gpu_name') or '?':<28} {what}")
         return 0
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:

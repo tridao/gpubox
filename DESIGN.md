@@ -2,7 +2,8 @@
 
 gpubox rents a GPU box on Vast.ai for a CI job or for development, checks
 that it works, and makes sure it is destroyed afterwards. It can also rent
-from RunPod or take boxes from a Slurm cluster (sections 12 to 14). This
+from RunPod or Shadeform, or take boxes from a Slurm cluster (sections 12
+to 15). This
 document says how, what it assumes, and what was decided against. Where it
 says Vast, read "the provider" unless those sections say otherwise.
 
@@ -540,3 +541,47 @@ directory found the run's pods by name.
 Not yet: interruptible pods (v2 does not create them; its GraphQL API
 does), private images (a registry credential per run, deleted with it), and
 countries to skip (v2 places by data center).
+
+## 15. Shadeform, and boxes on VMs
+
+Shadeform rents VMs on many clouds through one API. A VM is not a
+container: it boots an OS of the cloud's, with no image of ours. A box on
+a VM (`vmbox.py`) is still the caller's image: the VM's startup script,
+run as root once the VM is up, adds the run's key for every login user and
+starts the image as a container named `gpubox`, with the VM's GPUs,
+network and IPC, under a command of ours that saves its environment and
+waits. Everything gpubox runs on the box (the probe, the gate, jobs, `ssh`)
+is SSH to the VM as the user the cloud names, with the run's key, then
+`sudo docker exec` into that container. No port is opened and the image
+needs no sshd; jobs, started with `setsid` in the container, outlive the
+exec that started them. While the container is not up the probe fails,
+and if the pull failed it says what docker said, which the launcher reads
+as it reads a Vast host's status message: two VMs in different regions
+saying the image cannot be pulled make it a configuration error.
+
+An offer is an instance type in a region that has it, booted with
+Shadeform's own OS image (it has docker and NVIDIA's container toolkit)
+with the newest CUDA in its name, which must be at least `--min-cuda`; that
+CUDA is the offer's driver version for the launcher's driver-too-old rule.
+Shadeform says how long a type takes to boot (5 to 8 minutes, against a
+start-up limit of 5): the launcher adds that to the start-up and stall
+limits of the attempt, which are about what comes after.
+
+The lease is the cloud's. A VM could delete itself only with the account's
+key, which never goes on a box; Shadeform instead deletes a VM at its
+`auto_delete` time, set at the create and moved by `renew`, with the tag,
+in one update that is believed once read back. So there is no timer in the
+box, and `run --destroy-after` is refused. The tag is in `tags`: a name is
+at most 50 letters, digits, `_` and `-`. A deleted VM is `deleting` (no
+longer billed) and then `deleted`, or 404; both are gone. Shadeform names
+no machine and has no account lookup.
+
+**Measured**, November 2026: an A6000 on Massed Compute through Shadeform
+was healthy 204 s after the create (`python:3.12-slim`); jobs, `ssh` and
+`renew` worked as on Vast; a renewal to one minute was deleted by
+Shadeform about 50 s after the lease ended.
+
+The direct VM clouds (Hyperstack, Lyceum, Radiant, Massed Compute) are to
+use the same box; what differs is their API, how their key gets on the VM
+(an API key pair, or the startup script), and whether they have an expiry
+of their own. Without one, `down` and a scheduled `reap` end their VMs.

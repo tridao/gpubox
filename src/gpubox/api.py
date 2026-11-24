@@ -52,6 +52,7 @@ from . import policy as pol
 from . import providers
 from . import slurm as sl
 from . import sshconfig
+from . import vmbox
 from . import store as st
 from . import vast as v
 from .errors import BoxLost, ConfigError, GpuboxError, InfraError, JobLost, NoBoxes, NoSuchJob
@@ -240,9 +241,12 @@ def prober_for(state_dir: Path, run_id: str, meta: dict):
     """What reaches a run's boxes: SSH with the run's key (Vast, RunPod), or a step of the
     job through the cluster's login host (Slurm, where a box's host is the login host
     and its port the job id). Needs no API key."""
-    if providers.kind_of(meta).access == "srun":
+    access = providers.kind_of(meta).access
+    if access == "srun":
         return sl.SlurmProber()
     try:
+        if access == "vm":
+            return vmbox.VmProber(key_dir(state_dir, run_id), create=False)
         return Prober(key_dir(state_dir, run_id), create=False)
     except FileNotFoundError:
         raise StateError(f"run {run_id} has no SSH key in {state_dir} (torn down?)") from None
@@ -365,6 +369,8 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
             obs, shared, blocked = None, None, {}
         if provider.access == "srun":
             prober = sl.SlurmProber()
+        elif provider.access == "vm":
+            prober = vmbox.VmProber(key_dir(s.state_dir, run_id))
         else:
             prober = Prober(key_dir(s.state_dir, run_id))
         launch = L.Launch(provider, spec, policy, state, prober)
@@ -640,6 +646,7 @@ class Box:
     def __init__(self, run: Run, index: int, name: str, w: dict):
         self.run, self.index, self.name, self._w = run, index, name, w
         self.instance_id, self.host, self.port = w["id"], w["host"], w["port"]
+        self.user = w.get("user")  # the login user, on a VM box
         self.gpu, self.machine = w.get("gpu"), w.get("machine")
 
     def __repr__(self) -> str:
@@ -651,7 +658,12 @@ class Box:
         """ssh's argv for `remote` on the box (None: a login shell): with the run's key, or
         on a Slurm cluster as a step of the box's job."""
         prober = prober_for(self.run.settings.state_dir, self.run.id, self.run.meta)
-        return prober.ssh((self.host, self.port), remote, tty=tty)
+        return prober.ssh(self.endpoint, remote, tty=tty)
+
+    @property
+    def endpoint(self) -> tuple:
+        """(host, port), or on a VM box (host, port, user)."""
+        return (self.host, self.port, self.user) if self.user else (self.host, self.port)
 
     def sh(self, command: str, stdin: str | None = None, timeout: float = 60):
         """Run a shell command on the box, with the image's environment, and wait for it:
@@ -664,6 +676,11 @@ class Box:
         `InfraError` if the box did not start it."""
         job_id = job_id or jobs.new_job_id()
         run = self.run
+        if destroy_after and not run.kind.self_destroy:
+            raise ConfigError(
+                f"a box on {run.kind.name} cannot destroy itself (no --destroy-after); "
+                "`gpubox down` ends it, and its lease"
+            )
         env = {
             **(env or {}), "GPUBOX_RUN_ID": run.id, "GPUBOX_JOB": job_id,
             "GPUBOX_BOX_INDEX": str(self.index), "GPUBOX_BOX_COUNT": str(len(run.boxes)),
@@ -828,7 +845,7 @@ class BoxWatch:
         view = provider.view(inst)
         self.status = inst.get("actual_status")
         if view.state == "running" and view.endpoint is not None:
-            self.box._moved(*view.endpoint)
+            self.box._moved(*view.endpoint[:2])
         return False if view.state == "exited" or self.status in DEAD_STATUSES else None
 
 

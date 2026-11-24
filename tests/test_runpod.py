@@ -347,7 +347,8 @@ def test_the_key_comes_from_the_environment_or_the_keys_file(tmp_path, monkeypat
 
 def test_every_provider_says_what_it_can_do():
     for kind in providers.KINDS.values():
-        assert kind.access in ("ssh", "srun") and kind.spawn in ("setsid", "runner")
+        assert kind.access in ("ssh", "srun", "vm") and kind.spawn in ("setsid", "runner")
+        assert type(kind.self_destroy) is bool and type(kind.observes_machines) is bool
         assert kind.features <= set(providers.FEATURES)
         assert type(kind.default_spare) is int and isinstance(kind.noun, str)
     with pytest.raises(ConfigError, match="not on runpod: an interruptible box"):

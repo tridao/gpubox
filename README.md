@@ -1,8 +1,9 @@
 # gpubox
 
-Rent a GPU box from [Vast.ai](https://vast.ai) or [RunPod](https://runpod.io),
-or take one from a Slurm cluster, check that it works, and make sure it is
-destroyed afterwards. For CI jobs and dev boxes.
+Rent a GPU box from [Vast.ai](https://vast.ai), [RunPod](https://runpod.io) or
+the VM clouds behind [Shadeform](https://shadeform.ai), or take one from a
+Slurm cluster, check that it works, and make sure it is destroyed afterwards.
+For CI jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
 come up with a GPU that is already busy. gpubox rents two at once, keeps the
@@ -22,8 +23,9 @@ export VASTAI_API_KEY=...
 
 In CI, pin a commit: the job that runs gpubox holds your Vast key.
 
-Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`), else
-from lines `NAME=value` in `~/.config/gpu-cloud-query/keys.env`.
+Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`,
+`SHADEFORM_API_KEY`), else from lines `NAME=value` in
+`~/.config/gpu-cloud-query/keys.env`.
 
 ## A dev box
 
@@ -142,6 +144,31 @@ Not yet on RunPod: `--interruptible`, `--registry-user` (private images) and
 name them), so the blocklist does not apply. An image that cannot be pulled
 is not recognised as such: each pod is given up on after `--stall-timeout`.
 
+## Shadeform (VM clouds)
+
+```bash
+gpubox search --provider shadeform --gpu A6000 --max-dph-per-gpu 0.80
+gpubox up --provider shadeform --gpu A6000 --max-dph-per-gpu 0.80 --image my/image:tag \
+    --namespace dev --name mybox --ttl-min 120 --overall-timeout 1500
+gpubox ssh                     # a shell in the box's container
+```
+
+Shadeform rents VMs on Hyperstack, Massed Compute, Lambda, Crusoe, Nebius
+and others with one key. A box there is your image run as a container on
+the VM: gpubox gives the VM a startup script that adds the run's key and
+starts the image, and reaches the box with SSH to the VM and `docker exec`,
+so the image needs no sshd (but, as everywhere, bash and python3). An offer
+is an instance type in a region, booted with Shadeform's own OS image with
+the newest CUDA, which must be at least `--min-cuda` (13.0 by default: pass
+`--min-cuda 12.8` for an image built for CUDA 12). VMs take 5 to 8 minutes
+to boot; the start-up and stall limits count from when Shadeform expects
+the boot to end, but `--overall-timeout` should allow for it.
+
+The lease is Shadeform's own: the VM is created with an auto-delete time,
+which `renew` moves. A VM cannot delete itself, so `run --destroy-after` is
+refused. Not yet: `--ssh-config`, `--registry-user`, `--interruptible`,
+`--exclude-country`, `--account-id`.
+
 ## A Slurm cluster
 
 ```bash
@@ -236,7 +263,7 @@ options={"login": "mycluster", ...}`, to `up` (and to `down(run_id=...)`,
 
 | | |
 |---|---|
-| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider runpod` or `slurm` for those |
+| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider runpod`, `shadeform` or `slurm` for those |
 | `status` | show the run's boxes: names, addresses, lease |
 | `run` | start a local script on a box, detached, and stream its output |
 | `logs` | a job's output (`-f`: until it ends) |

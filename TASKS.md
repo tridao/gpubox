@@ -132,8 +132,11 @@ Providers to add, in this order.
   pod's own key. Checked live (DESIGN.md, section 14).
 - [ ] RunPod: private images (a registry credential per run), interruptible pods (GraphQL),
   the machine id (GraphQL) for the blocklist.
-- [ ] Shadeform: an aggregator of VM clouds (Hyperstack, Massed Compute, ...), with a lease it
-  enforces itself (`auto_delete.date_threshold`), tags, and a docker launch configuration.
+- [x] Shadeform: an aggregator of VM clouds (Hyperstack, Massed Compute, ...), with a lease it
+  enforces itself (`auto_delete.date_threshold`) and tags. The box is the image as a container
+  on the VM, reached with SSH and `docker exec` (vmbox.py). Checked live (DESIGN.md, 15).
+- [ ] Shadeform: spot instances, private images (a token the startup script does not keep),
+  `--ssh-config` (a ProxyCommand into the container).
 - [ ] The VM clouds directly: Hyperstack, Lyceum, Radiant (Ori), Massed Compute, on one shared
   base. A VM is reached as `ubuntu`
   or `root` with an SSH key registered through the API; the box runs the image with docker

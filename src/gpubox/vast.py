@@ -479,6 +479,7 @@ class VastProvider:
     # A box runs an sshd that gpubox starts with the run's key: one that refuses the key
     # shows that the image did not run our start-up command.
     own_sshd = True
+    self_destroy = True  # with the container's own key (bootstrap_script)
     observes_machines = True
     default_spare = 1
     features = frozenset(

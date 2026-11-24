@@ -176,6 +176,9 @@ class Attempt:
     # seen waiting in a queue (a queue's wait is nobody's fault)
     ready_from: float = 0.0
     noun: str = "instance"  # what the provider calls a box, for messages
+    # Seconds the provider says a box of this offer takes to boot (a VM's 5 to 8 minutes):
+    # added to the start-up and stall limits, which are about what comes after.
+    boot_s: float = 0.0
     failed_at: float = 0.0  # monotonic
     changed_at: float = 0.0  # monotonic; when its status or status message last changed
     check: object = None  # the child process it is waiting for, if any
@@ -361,6 +364,8 @@ class Launch:
                     "id": w.instance_id, "attempt": w.seq,
                     "host": w.endpoint[0], "port": w.endpoint[1],
                     "machine": w.machine_id, "host_id": w.host_id, "gpu": w.gpu,
+                    # A login user, where the provider names one (a VM's): (host, port, user)
+                    **({"user": w.endpoint[2]} if len(w.endpoint) > 2 else {}),
                 } for w in winners])  # fmt: skip
         except BaseException:
             deadline = time.monotonic() + self.policy.rollback  # one budget for all of it
@@ -599,6 +604,12 @@ class Launch:
                 return None
             a.check = None
             ok, a.ssh_err = result
+            if not ok and v.classify_status(a.ssh_err) == "image":
+                # The box said its image could not be pulled (a VM box's probe reports
+                # its docker pull, vmbox.py): as a host's word on Vast, two settle it.
+                said = f"image {spec.image!r} cannot be pulled: {a.ssh_err[-200:]}"
+                self._fail(a, None, said)
+                return said
             if not ok and self.provider.own_sshd and "Permission denied" in a.ssh_err:
                 # An sshd answered and refused the run's key. Ours would not:
                 # it is started with that key. So the image runs something
@@ -619,7 +630,7 @@ class Launch:
                 a.phase = "gating"
                 return None
             a.phase = "booting"  # look at the box again before the next probe
-        if time.monotonic() - a.ready_from > policy.startup_timeout:
+        if time.monotonic() - a.ready_from > policy.startup_timeout + a.boot_s:
             extra = a.ssh_err or a.msg[:120] or "no status message"
             # Only the provider's own account of the box is evidence against
             # the machine; our failure to reach the API is not.
@@ -679,7 +690,7 @@ class Launch:
             return None
         if view.state != "running":
             quiet = time.monotonic() - a.changed_at
-            if quiet > policy.stall_timeout:
+            if quiet > policy.stall_timeout + a.boot_s:
                 # Still loading, and the provider has reported nothing new for a
                 # long while: a pull that is stuck, or too slow to wait for.
                 self._fail(
@@ -765,6 +776,7 @@ class Launch:
                 geo=str(o.get("geolocation") or ""),
                 gpu=o.get("gpu_name") if isinstance(o.get("gpu_name"), str) else None,
                 bid=o.get("_bid"),
+                boot_s=float(o.get("boot_s") or 0),
             )
             a.noun = self.provider.noun
             self.attempts[seq] = a  # as unanswered: if the request is interrupted, it stays so
@@ -1002,7 +1014,8 @@ def renew(provider, state: State, prober, expiry: int) -> None:
         raise ConfigError("this run has no box to renew")
     v.check_expiry(expiry)
     for i, w in enumerate(boxes):
-        r = prober.run((w["host"], w["port"]), provider.expiry_command(expiry))
+        ep = (w["host"], w["port"], w["user"]) if w.get("user") else (w["host"], w["port"])
+        r = prober.run(ep, provider.expiry_command(expiry))
         if r != 0:
             # A write whose answer was lost may have happened: say what is known.
             raise prov.ProviderError(

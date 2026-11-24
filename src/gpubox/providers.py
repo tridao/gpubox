@@ -5,12 +5,15 @@ Each provider class (provider.py describes the calls) also says, as class attrib
     name, noun        "runpod", "pod"
     credential        the environment variable with its API key (None: it needs none),
                       also read from the keys file (api.Settings.keys_file)
-    access            how a box is reached: "ssh" (our sshd and the run's key) or
-                      "srun" (a step of a Slurm job)
+    access            how a box is reached: "ssh" (our sshd and the run's key), "srun"
+                      (a step of a Slurm job), or "vm" (SSH to a VM, then docker exec
+                      into the box's container; vmbox.py)
     spawn             how a job is started on a box: "setsid", or "runner" (the box's
                       own long-lived process starts it; job.start_command)
     own_sshd          a box runs an sshd we start: one that refuses the run's key shows
                       that the image did not run our start-up command
+    self_destroy      a box can end itself (its lease timer, `run --destroy-after`)
+                      without an account-wide key on it
     observes_machines its machine ids mean the same machine from run to run, so the
                       blocklist and the reputation store apply
     default_spare     boxes raced beyond the count unless asked otherwise
@@ -26,10 +29,10 @@ passes the same contract as the others (tests/test_providers.py).
 
 from __future__ import annotations
 
-from . import runpod, slurm, vast
+from . import runpod, shadeform, slurm, vast
 from .errors import ConfigError
 
-KINDS = {k.name: k for k in (vast.VastProvider, slurm.Slurm, runpod.RunPod)}
+KINDS = {k.name: k for k in (vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform)}
 
 # What a Spec can ask for that not every provider can give.
 FEATURES = {

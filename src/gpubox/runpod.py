@@ -135,6 +135,7 @@ class RunPod:
     access = "ssh"
     spawn = "setsid"
     own_sshd = True
+    self_destroy = True  # with the pod's own key (DESTROY)
     observes_machines = False  # v2 names no machine
     default_spare = 1
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})

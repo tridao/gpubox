@@ -244,6 +244,7 @@ class Slurm:
     access = "srun"
     spawn = "runner"  # Slurm ends what a step started: the batch script starts jobs
     own_sshd = False  # the user's own SSH and srun: nothing of ours answers SSH
+    self_destroy = True  # the batch script exits
     observes_machines = False  # node names are not Vast's machine ids (module docstring)
     default_spare = 0  # a spare holds a share of the cluster that others could use
     features = frozenset({"any_gpu"})
