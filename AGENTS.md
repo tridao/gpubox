@@ -18,14 +18,14 @@ dash cannot parse. Write each value single-quoted instead, and read
 the file back with every sh present in the test.
 ```
 
-The `commit-msg` hook (`scripts/check_commit_msg.py`) refuses a message
-out of that shape. Install it once per clone: `pre-commit install`. Do not
-copy the shape of older commits in the log: many predate this rule.
+Do not copy the shape of older commits in the log: many predate this
+rule.
 
 ## Before committing
 
-- `ruff format src tests scripts`, then commit: the hooks run ruff check and
-  ruff format and fail on any change they make.
+- `ruff format src tests`, then commit: the pre-commit hooks (install them
+  once per clone with `pre-commit install`) run ruff check and ruff format
+  and fail on any change they make.
 - `python3 -m pytest -q`: fake providers and fake SSH, no network, no keys.
   It takes a few minutes.
 - A new guard or behaviour gets a test, and a mutation in
