@@ -376,7 +376,7 @@ advisory: it costs a command a few seconds at most and never fails it.
 
 ```bash
 python3 -m pip install pytest pre-commit
-pre-commit install         # lint and format staged Python files with Ruff
+pre-commit install         # Ruff on staged Python files; commit-message format
 pre-commit run --all-files
 (cd store && npm ci && npm test)  # Node 24 LTS; also enables the Python/Worker integration test
 python3 -m pytest          # fake provider and fake SSH; rents nothing
