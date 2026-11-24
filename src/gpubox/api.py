@@ -382,6 +382,8 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
             prober = sl.SlurmProber()
         elif provider.access == "vm":
             prober = vmbox.VmProber(key_dir(s.state_dir, run_id))
+            if not getattr(provider, "startup_script", True):  # the first probe sends it
+                prober.boot = vmbox.startup_script(prober.pubkey, spec.image)
         else:
             prober = Prober(key_dir(s.state_dir, run_id))
         launch = L.Launch(provider, spec, policy, state, prober)

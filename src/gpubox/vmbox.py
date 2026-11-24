@@ -30,6 +30,7 @@ from .gate import READY_TIMEOUT, Prober, read_ready
 
 CONTAINER = "gpubox"
 PULL_ERROR = "/var/lib/gpubox/pull-error"
+BOOT_LOG = "/var/lib/gpubox/boot.log"  # what the startup script said; the probe shows its end
 # The container's command: its environment saved for what `docker exec` runs (which gets
 # the image's ENV anyway, but not what the entrypoint would have set), the variables of a
 # job cut short by a restart removed, then nothing. Run by bash (SAVE_ENV needs it, and so
@@ -60,6 +61,8 @@ def startup_script(pubkey: str, image: str) -> str:
     )
     return f"""#!/bin/bash
 # gpubox: this VM is a box. The run's key, then the image as the container `{CONTAINER}`.
+mkdir -p "$(dirname {BOOT_LOG})" && exec >>{BOOT_LOG} 2>&1
+echo "gpubox: setting up the box"
 for h in /root /home/*; do
     [ -d "$h" ] || continue
     u=$(stat -c %U "$h")
@@ -67,6 +70,10 @@ for h in /root /home/*; do
     chown -R "$u": "$h/.ssh"; chmod 700 "$h/.ssh"; chmod 600 "$h/.ssh/authorized_keys"
 done
 mkdir -p "$(dirname {PULL_ERROR})"; rm -f {PULL_ERROR}
+if ! command -v docker >/dev/null && command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io && systemctl start docker
+fi
 for i in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 2; done
 # An image that has docker but not NVIDIA's container toolkit gets it, from NVIDIA's apt
 # repository (Ubuntu), so that `--gpus all` works.
@@ -91,32 +98,58 @@ if [ -z "$pulled" ]; then  # the verdict, once it is final: the probe reports it
     exit 1
 fi
 docker rm -f {CONTAINER} >/dev/null 2>&1
-{run}
+{run} && echo "gpubox: the box is up"
 """
+
+
+# Root's commands on the VM: as the login user through sudo, or as root without it.
+AS_ROOT = 'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+STARTED = "/var/lib/gpubox/boot-started"
 
 
 class VmProber(Prober):
     """SSH to a VM box with the run's key, as the user its cloud names, and into the box's
-    container with `docker exec`. An endpoint is (host, port, user)."""
+    container with `docker exec`. An endpoint is (host, port, user).
+
+    `boot`: the startup script, for a cloud that cannot run one at boot (Lyceum). The
+    first probe that gets in sends it and starts it in a session of its own, once."""
+
+    boot: str | None = None
+
+    def _argv(self, ep, inner: str, **kw) -> list[str]:
+        host, port, user = ep
+        argv = super().ssh((host, port), inner, **kw)
+        return [f"{user}@{host}" if a == f"root@{host}" else a for a in argv]
 
     def ssh(self, ep, remote, *, connect_timeout: int = 10, tty=None) -> list[str]:
-        host, port, user = ep
         if remote is None:
-            inner = f"sudo -n docker exec -u 0 -it {CONTAINER} bash -l || sudo -n docker exec -u 0 -it {CONTAINER} sh -l"
+            inner = (
+                f"{AS_ROOT}$S docker exec -u 0 -it {CONTAINER} bash -l || "
+                f"$S docker exec -u 0 -it {CONTAINER} sh -l"
+            )
         else:
             flags = "-it" if tty else "-i"
-            inner = f"sudo -n docker exec -u 0 {flags} {CONTAINER} sh -c {shlex.quote(remote)}"
-        argv = super().ssh((host, port), inner, connect_timeout=connect_timeout, tty=tty)
-        return [f"{user}@{host}" if a == f"root@{host}" else a for a in argv]
+            inner = f"{AS_ROOT}$S docker exec -u 0 {flags} {CONTAINER} sh -c {shlex.quote(remote)}"
+        return self._argv(ep, inner, connect_timeout=connect_timeout, tty=tty)
 
     def start_ready(self, ep):
         """Probe the container, not just the VM; if it is not up, say why when the pull
-        said."""
-        host, port, user = ep
+        said. With `boot`, start the box's script if no probe has yet."""
         check = (
-            f"sudo -n docker exec -u 0 {CONTAINER} true 2>/dev/null || "
-            f"{{ sudo -n cat {PULL_ERROR} >&2 2>/dev/null; echo 'the box is not up yet' >&2; exit 1; }}"
+            f"{AS_ROOT}$S docker exec -u 0 {CONTAINER} true 2>/dev/null && exit 0; "
+            f"$S cat {PULL_ERROR} >&2 2>/dev/null; "
         )
-        argv = Prober.ssh(self, (host, port), check, connect_timeout=8)
-        argv = [f"{user}@{host}" if a == f"root@{host}" else a for a in argv]
-        return self._start(argv, read_ready, timeout=READY_TIMEOUT)
+        if self.boot is not None:
+            check += (
+                # The script is read in the foreground: a job sent to the background
+                # reads its stdin from /dev/null. Only its run goes there.
+                f"if ! $S test -e {STARTED}; then $S mkdir -p $(dirname {STARTED}) && "
+                f'f=$(mktemp) && cat > "$f" && $S touch {STARTED} && '
+                f'{{ $S setsid nohup bash "$f" </dev/null >/dev/null 2>&1 & }}; '
+                "echo 'the box is being set up' >&2; exit 1; fi; "
+            )
+        check += (
+            f"$S tail -n 2 {BOOT_LOG} >&2 2>/dev/null; echo 'the box is not up yet' >&2; exit 1"
+        )
+        argv = self._argv(ep, check, connect_timeout=8)
+        return self._start(argv, read_ready, stdin=self.boot, timeout=READY_TIMEOUT)

@@ -8,6 +8,8 @@ Each provider class (provider.py describes the calls) also says, as class attrib
     access            how a box is reached: "ssh" (our sshd and the run's key), "srun"
                       (a step of a Slurm job), or "vm" (SSH to a VM, then docker exec
                       into the box's container; vmbox.py)
+    startup_script    ("vm") the cloud runs our script at boot; if False, the first
+                      probe sends it (vmbox.VmProber.boot)
     spawn             how a job is started on a box: "setsid", or "runner" (the box's
                       own long-lived process starts it; job.start_command)
     own_sshd          a box runs an sshd we start: one that refuses the run's key shows
@@ -35,14 +37,14 @@ that every class declares the above.
 
 from __future__ import annotations
 
-from . import hyperstack, massed, runpod, shadeform, slurm, vast
+from . import hyperstack, lyceum, massed, runpod, shadeform, slurm, vast
 from .errors import ConfigError
 
 KINDS = {
     k.name: k
     for k in (
         vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform, hyperstack.Hyperstack,
-        massed.Massed,
+        massed.Massed, lyceum.Lyceum,
     )
 }  # fmt: skip
 

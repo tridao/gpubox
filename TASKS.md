@@ -140,7 +140,10 @@ Providers to add, in this order.
 - [x] Hyperstack, on the VM box; the lease is `down` and the reaper (it keeps no expiry). Not
   checked live yet.
 - [x] Massed Compute (MCP), on the VM box. Checked live. No rename, so no `renew`.
-- [ ] The other VM clouds directly: Lyceum, Radiant (Ori), on one shared
+- [x] Lyceum, on the VM box; the first probe sends the setup (it runs nothing at boot).
+  Checked live.
+- [ ] Radiant (Ori): its API has no prices (the price cap could not be kept) and plain OS
+  images. Needs a decision. On one shared
   base. A VM is reached as `ubuntu`
   or `root` with an SSH key registered through the API; the box runs the image with docker
   or runs in the VM; the lease is the provider's own expiry where it has one, else `down` and

@@ -5,6 +5,7 @@ API does, from a dict of instances; `fail` makes chosen calls answer otherwise f
 """
 
 import base64
+import pathlib
 import subprocess
 import time
 
@@ -269,13 +270,31 @@ def test_a_vm_box_is_reached_as_its_user_then_inside_its_container(tmp_path):
     p = vmbox.VmProber(tmp_path)
     argv = p.ssh(("1.2.3.4", 2200, "shadeform"), "echo hi")
     assert "shadeform@1.2.3.4" in argv and "root@1.2.3.4" not in argv and "2200" in argv
-    assert argv[-1] == "sudo -n docker exec -u 0 -i gpubox sh -c 'echo hi'"  # root, whatever USER
+    assert argv[-1] == vmbox.AS_ROOT + "$S docker exec -u 0 -i gpubox sh -c 'echo hi'"  # root
     assert "-F" in argv  # the user's own ssh_config does not apply, as on Vast
     assert "-it gpubox" in p.ssh(("1.2.3.4", 22, "u"), None, tty=True)[-1]
     started = []
     p._start = lambda argv, read, **kw: started.append(argv)
     p.start_ready(("1.2.3.4", 22, "u"))
     assert "docker exec -u 0 gpubox true" in started[0][-1] and vmbox.PULL_ERROR in started[0][-1]
+    assert vmbox.STARTED not in started[0][-1]  # the cloud runs the script itself here
+
+
+def test_where_the_cloud_cannot_run_the_script_the_first_probe_starts_it_once(tmp_path):
+    import subprocess as sp
+
+    (tmp_path / "id_ed25519").write_text("")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA gpubox\n")
+    p = vmbox.VmProber(tmp_path)
+    p.boot = "echo booted\n"
+    started = []
+    p._start = lambda argv, read, **kw: started.append((argv, kw))
+    p.start_ready(("1.2.3.4", 22, "root"))
+    (_, kw), remote = started[0], started[0][0][-1]
+    assert (
+        kw["stdin"] == "echo booted\n" and vmbox.STARTED in remote and "setsid nohup bash" in remote
+    )
+    assert sp.run(["bash", "-n", "-c", remote]).returncode == 0
 
 
 class VmProber:
@@ -403,3 +422,31 @@ def test_the_pull_verdict_is_written_only_once_the_retries_are_spent():
         )
     ]
     assert vmbox.PULL_ERROR not in loop and "--user 0:0" in script
+
+
+def test_the_script_a_probe_sends_is_the_one_that_runs(tmp_path, monkeypatch):
+    """The probe's own shell, run here: the script must arrive whole (read in the
+    foreground), run once, and run detached."""
+    import subprocess as sp
+    import time as t
+
+    (tmp_path / "id_ed25519").write_text("")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA gpubox\n")
+    monkeypatch.setattr(vmbox, "AS_ROOT", "S=; ")  # as root, here: no sudo
+    monkeypatch.setattr(vmbox, "STARTED", str(tmp_path / "started"))
+    p = vmbox.VmProber(tmp_path)
+    p.boot = f"echo ran >> {tmp_path / 'ran'}\n"
+    started = []
+    p._start = lambda argv, read, **kw: started.append((argv[-1], kw["stdin"]))
+    p.start_ready(("h", 22, "u"))
+    remote, stdin = started[0]
+    shim = pathlib.Path(__file__).parent / "bin"  # setsid, where the system has none
+    env = {"PATH": f"{tmp_path}:{shim}:/usr/bin:/bin"}  # no docker here: the box is not up
+    for _ in range(2):
+        r = sp.run(["bash", "-c", remote], input=stdin, capture_output=True, text=True, env=env)
+        assert r.returncode == 1
+    for _ in range(50):
+        if (tmp_path / "ran").exists():
+            break
+        t.sleep(0.1)
+    assert (tmp_path / "ran").read_text() == "ran\n"  # once, though probed twice

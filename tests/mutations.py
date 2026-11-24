@@ -1347,6 +1347,27 @@ MUTATIONS = [
      '        if not (isinstance(user, str) and _USER.fullmatch(user)):',
      '        if False:',
      'its_login_user'),
+    # --- Lyceum, and a box whose cloud runs nothing at boot
+    ('a Lyceum create is retried',
+     'lyceum.py',
+     'data = self.client.call("POST", "vms/create", body=body, retries=0)',
+     'data = self.client.call("POST", "vms/create", body=body, retries=2)',
+     'created_once_with_the_runs_key'),
+    ('the Lyceum listing leaves out VMs still being provisioned',
+     'lyceum.py',
+     '            "include_provisioning": "true", "include_ready": "true",',
+     '            "include_ready": "true",',
+     'asks_for_every_state'),
+    ('the script is not sent where the cloud cannot run it',
+     'api.py',
+     '                prober.boot = vmbox.startup_script(prober.pubkey, spec.image)',
+     '                pass',
+     'gives_the_probe_the_script'),
+    ('the sent script is read in the background, from /dev/null',
+     'vmbox.py',
+     '''f'{{ $S setsid nohup bash "$f" </dev/null >/dev/null 2>&1 & }}; \'''',
+     '''f'$S setsid nohup bash "$f" </dev/null >/dev/null 2>&1 & \'''',
+     'sends_is_the_one_that_runs'),
 ]
 # fmt: on
 

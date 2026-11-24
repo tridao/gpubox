@@ -193,6 +193,14 @@ instance, so the lease set by `up --ttl-min` cannot be moved (`renew` is
 refused), and as on Hyperstack only `down` or a scheduled `reap` ends a VM
 left behind.
 
+## Lyceum
+
+`--provider lyceum` (`LYCEUM_API_KEY`) rents Lyceum's VMs, as boxes like
+Shadeform's. Lyceum runs nothing of ours at boot, so the first probe that
+gets in sends the box's setup and starts it. Its region and disk (500 GB)
+are its own choice; as on Hyperstack only `down` or a scheduled `reap` ends
+a VM left behind.
+
 ## A Slurm cluster
 
 ```bash

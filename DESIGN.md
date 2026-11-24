@@ -597,6 +597,20 @@ instance, so a lease cannot be moved: providers say whether they can
 instance's own (`Ubuntu`, capital U, on its images); a VM's user is never
 assumed. Measured, November 2026: an A6000 healthy 127 s after the launch.
 
-The other VM clouds (Lyceum, Radiant) are to use the same box; what differs is their API, how their key gets on the VM
+Lyceum uses it too, though it runs nothing of ours at boot: there the first
+probe that gets in sends the startup script on its stdin and starts it in a
+session of its own, once (a marker file on the VM says it was). The script
+is read before anything is sent to the background, which reads its stdin
+from /dev/null (a live run lost its script so). Whatever the cloud, the
+script writes what it does to `/var/lib/gpubox/boot.log`, whose end the
+probe shows while the box is not up. Lyceum's login is `lyceum` (its docs;
+root refuses the key), and its deletes answer slowly, then 500 while they
+run: `down` confirms them by lookup as everywhere. Measured, November 2026:
+an L40S healthy 138 s after the create.
+
+Radiant (Ori) is not done: its API gives no prices, so the price cap could
+not be kept, and its OS images have neither docker nor NVIDIA's toolkit.
+
+The other VM clouds are to use the same box; what differs is their API, how their key gets on the VM
 (an API key pair, or the startup script), and whether they have an expiry
 of their own. Without one, `down` and a scheduled `reap` end their VMs.
