@@ -226,3 +226,8 @@ def test_a_timestamp_too_large_to_be_a_time_is_skipped_not_fatal(tmp_path):
 def test_a_healthy_row_that_carries_a_reason_clears_nothing():
     odd = {**obs("healthy", 5, 60), "reason_code": "busy_gpu"}
     assert 5 in pol.blocklist([failed(5, 0, "busy_gpu"), odd], 120)
+
+
+def test_two_offers_of_one_machine_without_a_host_are_never_both_tried():
+    offers = [{"id": 1, "machine_id": 7}, {"id": 2, "machine_id": 7}, {"id": 3, "machine_id": 8}]
+    assert [o["id"] for o in pol.select_offers(offers, {}, 5)] == [1, 3]

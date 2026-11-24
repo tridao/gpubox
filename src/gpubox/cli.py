@@ -40,56 +40,96 @@ import argparse
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from . import policy as pol
-from . import sshconfig
+from . import api
 from . import job
-from . import slurm as sl
-from . import store as st
 from . import vast as v
-from .gate import GATE_VERSION, Prober
-from .provider import ProviderError
-from .launch import (
-    ConfigError,
-    Launch,
-    Policy,
-    Result,
-    Spec,
-    down,
-    explain_leftovers,
-    gpu_model,
-    log,
-    observe,
-    reap,
-    renew,
-)
-from .state import NAMESPACE, RUN_ID, State, StateError, box_name, new_run_id, state_lock
+from .api import LOCAL_KEYS_FILE, Prefixed, advisory, key_dir  # noqa: F401 (part of the CLI's surface)
+from .errors import ConfigError, GpuboxError, InfraError, NoBoxes, TeardownIncomplete
+from .launch import Policy, Result, Spec, log
+from .state import State, StateError, box_name
 
 EXIT_CONFIG = 2
 EXIT_INFRA = 75
 EXIT_TIMEOUT = 124
 EXIT_INTERRUPTED = 130
 DEFAULTS = Policy()
-LOCAL_KEYS_FILE = "~/.config/gpu-cloud-query/keys.env"
 
 
-def api_key(args) -> str:
-    key = os.environ.get("VASTAI_API_KEY")
-    path = Path(os.path.expanduser(args.keys_file))
-    if not key and path.exists():  # local use; CI passes the secret through the environment
-        for line in path.read_text().splitlines():
-            name, _, value = line.partition("=")
-            if name.strip() == "VASTAI_API_KEY":
-                key = value.strip().strip("'\"")
-    if not key:
-        raise ConfigError("VASTAI_API_KEY is not set")
-    return key
+def settings(args) -> api.Settings:
+    check_provider_args(args)
+    slurm = None
+    if is_slurm(args):
+        slurm = {
+            "login": args.login, "partition": args.partition, "account": args.slurm_account,
+            "qos": args.qos, "constraint": args.constraint, "sbatch_args": list(args.sbatch_arg),
+        }  # fmt: skip
+    return api.Settings(
+        state_dir=Path(getattr(args, "state_dir", ".gpubox")),
+        account_id=getattr(args, "account_id", None),
+        keys_file=args.keys_file,
+        observations=getattr(args, "observations", None),
+        # Said at once, not when the command ends: a CI step may be cancelled first.
+        on_observation=lambda: github_output(observations_changed="true"),
+        provider=getattr(args, "provider", "vast"),
+        slurm=slurm,
+    )
+
+
+def is_slurm(args) -> bool:
+    return getattr(args, "provider", None) == "slurm"
+
+
+def check_provider_args(args) -> None:
+    """Options that one provider has and the other has not."""
+    if is_slurm(args):
+        given = [
+            flag for flag, value in (
+                ("--image", getattr(args, "image", None)),
+                ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", None)),
+                ("--registry-user", getattr(args, "registry_user", None)),
+                ("--exclude-country", getattr(args, "exclude_country", None)),
+                ("--ssh-config", getattr(args, "ssh_config", None) or None),
+                ("--interruptible", getattr(args, "interruptible", None) or None),
+            ) if value is not None
+        ]  # fmt: skip
+        if given:
+            raise ConfigError(
+                f"{', '.join(given)}: not for a Slurm cluster (boxes run in the nodes' own "
+                "environment; reach one with `gpubox ssh`)"
+            )
+        if not getattr(args, "login", None):
+            raise ConfigError(
+                "--provider slurm needs --login HOST: the cluster's login host, as `ssh HOST` "
+                "reaches it without a password prompt"
+            )
+        return
+    slurm_only = [
+        flag for flag, value in (
+            ("--login", getattr(args, "login", None)),
+            ("--partition", getattr(args, "partition", None)),
+            ("--slurm-account", getattr(args, "slurm_account", None)),
+            ("--qos", getattr(args, "qos", None)),
+            ("--constraint", getattr(args, "constraint", None)),
+            ("--sbatch-arg", getattr(args, "sbatch_arg", None) or None),
+        ) if value is not None
+    ]  # fmt: skip
+    if slurm_only:
+        raise ConfigError(f"{', '.join(slurm_only)}: only with --provider slurm")
+    needed = [
+        flag for flag, value in (
+            ("--gpu", getattr(args, "gpu", True)),
+            ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", True)),
+            ("--image", getattr(args, "image", True)),
+        ) if not value
+    ]  # fmt: skip
+    if needed:
+        raise ConfigError(f"Vast needs {', '.join(needed)}")
 
 
 def github_output(**values) -> None:
@@ -98,7 +138,7 @@ def github_output(**values) -> None:
             f.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def write_summary(spec: Spec, result: Result, provider=None) -> None:
+def write_summary(spec: Spec, result: Result, slurm: bool = False) -> None:
     if not (path := os.environ.get("GITHUB_STEP_SUMMARY")):
         return
     ws = result.winners
@@ -109,8 +149,7 @@ def write_summary(spec: Spec, result: Result, provider=None) -> None:
         else f"no healthy box after {result.seconds:.0f}s"
     )
     lines = [
-        f"### {'Slurm' if getattr(provider, 'name', '') == 'slurm' else 'Vast'} launch: "
-        f"{spec.gpu_text}",
+        f"### {'Slurm' if slurm else 'Vast'} launch: {spec.gpu_text}",
         "",
         head,
         "",
@@ -129,6 +168,13 @@ def write_summary(spec: Spec, result: Result, provider=None) -> None:
 
 
 def spec_from(args, image: str = "") -> Spec:
+    try:
+        return _spec_from(args, image)
+    except ValueError as exc:  # what Spec itself refuses
+        raise ConfigError(str(exc)) from None
+
+
+def _spec_from(args, image: str = "") -> Spec:
     cap = None
     if args.capability:
         if not re.fullmatch(r"\d+\.\d+", args.capability):
@@ -149,6 +195,8 @@ def spec_from(args, image: str = "") -> Spec:
         exclude_countries=countries(args),
         gate_script=gate_script(args),
         **registry_login(args),
+        interruptible=getattr(args, "interruptible", False),
+        bid_markup=getattr(args, "bid_markup", 1.25),
         gate_timeout=getattr(args, "gate_timeout", 600),
         ttl_min=getattr(args, "ttl_min", 90),
     )
@@ -193,192 +241,14 @@ def countries(args) -> tuple[str, ...]:
     return codes
 
 
-def observations_path(args) -> Path:
-    if args.observations:
-        return Path(args.observations)
-    return Path(args.state_dir) / "observations.jsonl"
-
-
-def open_shared(args) -> st.Shared:
-    """The shared reputation store, if one is configured and its settings make sense."""
-    try:
-        return st.Shared(observations_path(args), st.from_env())
-    except st.StoreError as exc:  # its messages never contain the URL or the token
-        log(f"WARNING: reputation store not used: {exc}")
-    except Exception as exc:
-        log(f"WARNING: reputation store not used: {type(exc).__name__}")
-    return st.Shared(observations_path(args), None)
-
-
-def share(shared: st.Shared, what: str, **kw) -> None:
-    """Talk to the store. Whatever happens there, the command carries on."""
-    if shared.store:
-        try:
-            log(f"reputation store: {shared.sync(**kw)}")
-        except st.StoreError as exc:  # its messages never contain the URL or the token
-            log(f"WARNING: reputation store ({what}): {exc}")
-        except Exception as exc:
-            log(f"WARNING: reputation store ({what}): {type(exc).__name__}")
-
-
-def known_rows(obs: pol.Observations, shared: st.Shared) -> list[dict]:
-    """This client's own rows, then what the store said everyone saw.
-
-    A row of ours that the store has is taken as the store has it, under the
-    source that sent it. Several CI runners share one token: that way a
-    machine one of them saw fail and another then saw recover is judged as
-    one source's word, not kept blocked by the first runner's local copy.
-    """
-    try:
-        remote = shared.remote_rows()
-    except Exception as exc:
-        log(f"WARNING: reputation store not used: {type(exc).__name__}")
-        remote = []
-    echoed = {r["id"] for r in remote}
-    return [*(r for r in obs.rows if r.get("id") not in echoed), *remote]
-
-
-def advisory(what: str, fn, *a, **kw) -> None:
-    """Run something whose failure must not fail the command (reports, observations)."""
-    try:
-        fn(*a, **kw)
-    except Exception as exc:  # whatever it is, it is not worth a box
-        log(f"WARNING: {what} failed: {exc!r}")
-
-
-def key_dir(state_dir: Path, run_id: str) -> Path:
-    """Where a run keeps its SSH key and known hosts. Never shared between runs:
-    a command still holding an earlier run's endpoint must not be able to log
-    in to a later run's box that happens to get the same address."""
-    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
-        raise StateError(f"not a run id: {run_id!r}")  # it becomes part of a path
-    return Path(state_dir) / "keys" / run_id
-
-
-def is_slurm(args) -> bool:
-    return getattr(args, "provider", None) == "slurm"
-
-
-def slurm_from_args(args) -> sl.Slurm:
-    if not getattr(args, "login", None):
-        raise ConfigError(
-            "--provider slurm needs --login HOST: the cluster's login host, as `ssh HOST` "
-            "reaches it without a password prompt"
-        )
-    return sl.Slurm(
-        args.login,
-        partition=args.partition,
-        account=args.slurm_account,
-        qos=args.qos,
-        constraint=args.constraint,
-        sbatch_args=tuple(args.sbatch_arg),
-    )
-
-
-def provider_from_args(args):
-    """The provider the command line names (`up`, `reap`, `down --run-id` with no state)."""
-    if is_slurm(args):
-        return slurm_from_args(args)
-    return v.VastProvider(v.Vast(api_key(args)))
-
-
-def provider_of_run(args, state: State):
-    """The provider a run was rented from, as its state file says (Vast if it does not)."""
-    if run_is_slurm(state):
-        return sl.Slurm.from_settings(state.meta.get("slurm"))
-    return v.VastProvider(v.Vast(api_key(args)))
-
-
-def run_is_slurm(state: State) -> bool:
-    return state.meta.get("provider") == "slurm"
-
-
-def prober_for(state_dir: Path, state: State):
-    """What reaches the run's boxes: SSH with the run's key (Vast), or a step of the job
-    through the cluster's login host (Slurm)."""
-    if run_is_slurm(state):
-        return sl.SlurmProber()
-    try:
-        return Prober(key_dir(state_dir, state.run), create=False)
-    except FileNotFoundError:
-        raise StateError(f"run {state.run} has no SSH key in {state_dir} (torn down?)") from None
-
-
-def check_provider_args(args) -> None:
-    """Options that one provider has and the other has not."""
-    if is_slurm(args):
-        given = [
-            flag for flag, value in (
-                ("--image", getattr(args, "image", None)),
-                ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", None)),
-                ("--registry-user", getattr(args, "registry_user", None)),
-                ("--exclude-country", getattr(args, "exclude_country", None)),
-                ("--ssh-config", getattr(args, "ssh_config", None) or None),
-            ) if value is not None
-        ]  # fmt: skip
-        if given:
-            raise ConfigError(
-                f"{', '.join(given)}: not for a Slurm cluster (boxes run in the nodes' own "
-                "environment; reach one with `gpubox ssh`)"
-            )
-        return
-    slurm_only = [
-        flag for flag, value in (
-            ("--login", getattr(args, "login", None)),
-            ("--partition", getattr(args, "partition", None)),
-            ("--slurm-account", getattr(args, "slurm_account", None)),
-            ("--qos", getattr(args, "qos", None)),
-            ("--constraint", getattr(args, "constraint", None)),
-            ("--sbatch-arg", getattr(args, "sbatch_arg", None) or None),
-        ) if value is not None
-    ]  # fmt: skip
-    if slurm_only:
-        raise ConfigError(f"{', '.join(slurm_only)}: only with --provider slurm")
-    needed = [
-        flag for flag, value in (
-            ("--gpu", getattr(args, "gpu", True)),
-            ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", True)),
-            ("--image", getattr(args, "image", True)),
-        ) if not value
-    ]  # fmt: skip
-    if needed:
-        raise ConfigError(f"Vast needs {', '.join(needed)}")
-
-
-def pinned_account(args) -> str | None:
-    return getattr(args, "account_id", None) or os.environ.get("GPUBOX_ACCOUNT_ID") or None
-
-
-def check_account(provider, expected: str | None) -> str | None:
-    """With an account pinned: stop, before anything is rented or destroyed, if the key is
-    another account's. Returns the account, or None when none is pinned."""
-    if expected is None:
-        return None
-    actual = provider.account()
-    if actual != expected:
-        raise ConfigError(
-            f"the API key belongs to account {actual}, not to the expected account {expected}"
-        )
-    return actual
-
-
-def same_account(provider, state: State, account: str | None) -> None:
-    """Stop if the run recorded the account it was rented on and the key is another one's."""
-    if state.account and (account or provider.account()) != state.account:
-        raise ConfigError(
-            f"run {state.run} was rented on account {state.account}; "
-            "the API key belongs to another account"
-        )
+# ------------------------------------------------------------------ commands
 
 
 def cmd_up(args) -> int:
-    state_dir = Path(args.state_dir)
     check_provider_args(args)
-    slurm = is_slurm(args)
     spec = spec_from(args, args.image or "")
-    # A spare on a cluster holds a share of it that others could use, for a race against
-    # hosts that are rarely bad: none by default.
-    spare = args.spare if args.spare is not None else (0 if slurm else DEFAULTS.spare)
+    # A spare on a cluster holds a share of it that others could use: none by default.
+    spare = args.spare if args.spare is not None else (0 if is_slurm(args) else DEFAULTS.spare)
     policy = Policy(
         count=args.count,
         spare=spare,
@@ -387,85 +257,39 @@ def cmd_up(args) -> int:
         stall_timeout=args.stall_timeout,
         overall_timeout=args.overall_timeout,
     )
-    if policy.attempts < policy.count:
-        raise ConfigError(
-            f"--max-attempts {policy.attempts} cannot rent --count {policy.count} boxes"
-        )
-    if spec.ttl_min * 60 < policy.overall_timeout + policy.min_lease:
-        raise ConfigError(
-            f"--ttl-min {spec.ttl_min} leaves no lease after a launch of up to "
-            f"{policy.overall_timeout:g}s; it must cover that plus {policy.min_lease:g}s"
-        )
-    provider = provider_from_args(args)
-    with state_lock(state_dir):
-        old = State.load(state_dir)  # StateError if it cannot be read
-        if old is not None and not old.closed:
-            raise StateError(f"run {old.run} in {state_dir} is not closed; run `gpubox down` first")
-        account = check_account(provider, pinned_account(args))
-        # A key that cannot list could never find its boxes again: learn that
-        # before renting one.
-        provider.instances()
-        run_id = new_run_id(args.namespace, args.name)
-        # Before anything else: the teardown step is given this, and must have
-        # it whenever a box may exist. So unlike every later output, a failure
-        # to write it stops the launch.
+
+    def publish(run_id: str) -> None:
+        # The teardown step is given this, and must have it whenever a box may exist.
+        # So unlike every later output, a failure to write it stops the launch.
         try:
             github_output(run_id=run_id)
         except OSError as exc:
             raise ConfigError(
                 f"cannot write the run id to GITHUB_OUTPUT ({exc}); nothing was rented"
             ) from None
-        expiry = int(time.time()) + spec.ttl_min * 60
-        meta = {
-            "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
-            "count": policy.count,
-        }  # fmt: skip
-        if slurm:
-            meta.update(provider="slurm", slurm=provider.settings())
-        state = State.begin(state_dir, run_id, expiry, account, meta)
-        log(f"run {run_id}")
-        if slurm:
-            # Observations and the store are about Vast's machines (slurm.py).
-            blocked, prober = {}, sl.SlurmProber()
-        else:
-            obs = pol.Observations(observations_path(args))
-            shared = open_shared(args)
-            share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
-            blocked = pol.blocklist(known_rows(obs, shared), time.time())
-            keys = key_dir(state_dir, run_id)
-            prober = Prober(keys)
-        launch = Launch(provider, spec, policy, state, prober)
-        result = launch.run(blocked)
-        if result.winners and args.ssh_config:
-            advisory("writing the SSH configuration", write_ssh_entry, state, keys)
-    # The outcome is decided and in the state file; nothing below may change it.
-    if not slurm:
-        advisory("recording observations", observe, result, spec, run_id, obs)
-        if obs.added:
-            advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
-        share(shared, "after the launch", pull=False)  # also anything left from earlier runs
-        advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
-    advisory("writing the summary", write_summary, spec, result, provider)
-    advisory("reporting", report_result, spec, result, state, provider)
-    return 0 if result.winners else EXIT_INFRA
+
+    def reported(result: Result, run: api.Run) -> None:
+        changed = str(run.observations_changed).lower()
+        advisory("writing outputs", github_output, observations_changed=changed)
+        advisory("writing the summary", write_summary, spec, result, run.on_slurm)
+        advisory("reporting", report_result, spec, result, run.id, run.expiry, run.on_slurm)
+
+    try:
+        api.up(
+            spec, namespace=args.namespace, name=args.name, count=args.count, policy=policy,
+            ssh_config=args.ssh_config, on_run_id=publish, on_result=reported,
+            teardown_on_failure=False,  # CI runs `down` anyway, within its own deadline
+            settings=settings(args),
+        )  # fmt: skip
+    except NoBoxes:
+        return EXIT_INFRA  # report_result has said why
+    return 0
 
 
-def boxes_of(state: State) -> list[tuple[str, dict]]:
-    """(name, box) for each box of the run, in order."""
-    ws = state.winners
-    return [(box_name(state.run, i, len(ws)), w) for i, w in enumerate(ws)]
-
-
-def write_ssh_entry(state: State, keys: Path) -> None:
-    named = boxes_of(state)
-    hosts = [(name, w["host"], w["port"]) for name, w in named]
-    path = sshconfig.add(state.run, hosts, keys / "id_ed25519", keys / "known_hosts")
-    names = " / ".join(f"`ssh {name}`" for name, _ in named)
-    log(f"{names} now reach{'es' if len(named) == 1 else ''} the box(es) (entries in {path})")
-
-
-def report_result(spec: Spec, result: Result, state: State, provider=None) -> None:
-    noun = getattr(provider, "noun", "instance")
+def report_result(
+    spec: Spec, result: Result, run_id: str, expiry: int, slurm: bool = False
+) -> None:
+    noun = "job" if slurm else "instance"
     for iid in result.left:
         log(f"::warning::{noun} {iid} is not confirmed destroyed; `gpubox down` retries")
     for a in result.unanswered:
@@ -476,247 +300,61 @@ def report_result(spec: Spec, result: Result, state: State, provider=None) -> No
     if not result.winners:
         log(f"::error::no healthy {spec.gpu_text} box")
         return
-    until = time.strftime("%H:%M UTC", time.gmtime(state.expiry))
+    until = time.strftime("%H:%M UTC", time.gmtime(expiry))
     n = len(result.winners)
     for i, w in enumerate(result.winners):
         r = w.report
         where = (
             f"job {w.instance_id} on node {w.machine_id}"
-            if noun == "job"
+            if slurm
             else f"instance {w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo})"
         )
         gpus = r.get("gpus") or []
         model = w.gpu or (gpus[0] if gpus and len(set(gpus)) == 1 else "GPU")
         log(
-            f"READY in {result.seconds:.0f}s: {box_name(state.run, i, n)} is {where}; "
+            f"READY in {result.seconds:.0f}s: {box_name(run_id, i, n)} is {where}; "
             f"{len(gpus)}x {model}, {r.get('cpus')} CPUs, "
             f"driver {r.get('driver')}, torch {r.get('torch')}; lease until {until}"
         )
 
 
-# Provider states that mean the box is over, as opposed to missing or in transition.
-DEAD_STATUSES = ("exited", "offline")
-
-
-def _still_ours(state_dir: Path, run_id: str) -> bool:
-    """False once this run's teardown has started."""
-    try:
-        state = State.load(state_dir)
-    except StateError:
-        return False
-    return state is not None and state.run == run_id and not state.closing
-
-
-def live_run(state_dir: Path) -> State:
-    """The directory's run, or StateError if it has no boxes to use."""
-    state = State.load(state_dir)
-    if state is None or not state.winners or state.closing:
-        raise StateError(f"no live box in {state_dir}; run `gpubox up` first")
-    return state
-
-
-def live_box(state_dir: Path, box: int | None = None) -> tuple[State, dict]:
-    """The directory's run and box number `box` of it (the only one if None), or StateError."""
-    state = live_run(state_dir)
-    ws = state.winners
-    if box is None:
-        if len(ws) > 1:
-            raise StateError(f"the run has {len(ws)} boxes: say which with --box 0..{len(ws) - 1}")
-        box = 0
-    if not 0 <= box < len(ws):
-        raise StateError(f"no box {box}: the run has {len(ws)} (--box 0..{len(ws) - 1})")
-    return state, ws[box]
-
-
-class InfraError(RuntimeError):
-    """A box could not be reached or did not do what it was asked."""
-
-
-def box_ssh(state_dir: Path, state: State, w: dict):
-    """remote command -> ssh argv, for one box of the run: with the run's key (Vast), or
-    as a step of its job (Slurm, where a box's host is the login host and its port the
-    job id)."""
-    prober = prober_for(state_dir, state)
-    return lambda remote, **kw: prober.ssh((w["host"], w["port"]), remote, **kw)
-
-
-def chosen(state_dir: Path, args) -> tuple[State, list[tuple[int, str, dict]]]:
-    """The run and the boxes a command is for: (index, name, box) for `--box I`, the only
-    box, or with `--all` every box."""
-    state = live_run(state_dir)
-    named = boxes_of(state)
+def chosen(args) -> tuple[api.Run, list[api.Box]]:
+    """The run and the boxes a command is for: `--box I`, the only box, or with `--all`
+    every box."""
+    run = api.attach(settings=settings(args))
     if getattr(args, "all", False):
-        return state, [(i, name, w) for i, (name, w) in enumerate(named)]
-    _, w = live_box(state_dir, args.box)
-    i = next(i for i, (_, b) in enumerate(named) if b["id"] == w["id"])
-    return state, [(i, named[i][0], w)]
+        return run, run.boxes
+    return run, [run.box(args.box)]
 
 
-class BoxWatch:
-    """Asks the provider about a box whose SSH connection failed, and remembers the
-    answer, so that a box that is over ends the wait and can be recorded as died."""
-
-    def __init__(self, args, state: State, w: dict):
-        self.args, self.state, self.w, self.status = args, state, w, None
-
-    def __call__(self) -> bool | None:
-        """False if the box is over (gone, or in a terminal state); None if not known."""
-        try:
-            inst = provider_of_run(self.args, self.state).instance(self.w["id"])
-        except (ProviderError, ConfigError) as exc:
-            log(f"WARNING: could not ask the provider about the box: {exc}")
-            return None
-        self.status = "gone" if inst is None else inst.get("actual_status")
-        return False if inst is None or self.status in DEAD_STATUSES else None
-
-
-def record_if_died(args, state_dir: Path, state: State, w: dict, status) -> None:
-    """Blame the machine only on the provider's word that the box is over, and only if our
-    own teardown did not start in the meantime. An instance that no longer exists was
-    destroyed by someone (a teardown elsewhere, its own timer, the reaper), which says
-    nothing about the machine. A missing or transitional status, or an API error, is not
-    evidence either."""
-    if status not in DEAD_STATUSES or not _still_ours(state_dir, state.run):
-        return
-    meta = state.meta
-    asked = meta.get("gpus") or ([meta["gpu"]] if "gpu" in meta else [])  # v2: one model
-    extra = {"gpu": gpu_model(w.get("gpu"), asked), "num_gpus": meta.get("num_gpus")}
-
-    def record():
-        row = pol.observation(
-            "died_after_admission", w.get("machine"), w.get("host_id"), state.run,
-            reason="died", gate_version=GATE_VERSION, **extra,
-        )  # fmt: skip
-        pol.Observations(observations_path(args)).add(row)
-        shared = open_shared(args)
-        shared.queue([row])
-        share(shared, "after the run", pull=False)
-
-    advisory("recording the observation", record)
-    advisory("writing outputs", github_output, observations_changed="true")
-
-
-def lost_box(args, state_dir: Path, state: State, w: dict, watch: BoxWatch) -> int:
-    """Say that the connection to a box is lost, and why if the provider knows."""
-    if watch.status is None:
-        watch()
-    if not _still_ours(state_dir, state.run):
-        log("::error::the box was destroyed by `gpubox down` while the job ran")
-        return EXIT_INFRA
-    log(
-        f"::error::lost the SSH connection to the box (instance status: {watch.status or 'unknown'})"
-    )
-    record_if_died(args, state_dir, state, w, watch.status)
-    return EXIT_INFRA
-
-
-def start_job(args, state_dir, state, box, job_id, script, env) -> bool:
-    """Start the job on one box. True once the box has said it started it."""
-    i, name, w = box
-    count = len(state.winners)
-    env = {
-        **env, "GPUBOX_RUN_ID": state.run, "GPUBOX_JOB": job_id, "GPUBOX_BOX_INDEX": str(i),
-        "GPUBOX_BOX_COUNT": str(count), "GPUBOX_BOX_NAME": name,
-    }  # fmt: skip
-    timeout_s = 0 if not args.timeout_min else max(1, round(args.timeout_min * 60))
-    remote, stdin = job.start_command(
-        job_id, script, env, timeout_s=timeout_s, destroy_after=args.destroy_after,
-        spawn="runner" if run_is_slurm(state) else "setsid",
-    )  # fmt: skip
-    rc, out, err = job.run_remote(box_ssh(state_dir, state, w), remote, stdin, timeout=120)
-    if rc == 0 and out.strip() == job_id:
-        return True
-    if rc == 255:
-        lost_box(args, state_dir, state, w, BoxWatch(args, state, w))
-        log(f"  job {job_id} may or may not have started on {name}: `gpubox jobs --box {i}`")
-    else:
-        log(f"::error::could not start the job on {name} (exit {rc}): {err.strip()[-300:]}")
-    return False
-
-
-def end_code(args, state_dir, state, box, job_id, end: job.End, watch: BoxWatch) -> int:
+def outcome_code(o: api.Outcome) -> int:
     """The exit code for how waiting on a job ended, said in words where it is not the
     job's own."""
-    i, name, w = box
-    if end.kind == "exit":
-        if end.rc == EXIT_TIMEOUT:
-            log(f"::error::job {job_id} on {name} ran out of time (--timeout-min)")
-        return end.rc
-    if end.kind == "running":
-        return 0
-    if end.kind == "none":
-        log(f"::error::no job {job_id} on {name}")
-        return EXIT_CONFIG
-    if end.kind == "lost":
-        log(
-            f"::error::job {job_id} on {name} ended without an exit code: its box restarted, "
-            "or it was killed"
-        )
+    if o.error is not None:
+        if isinstance(o.error, GpuboxError):
+            log(f"::error::{o.error}")
+            return EXIT_CONFIG if isinstance(o.error, (ConfigError, StateError)) else EXIT_INFRA
+        log(f"::error::following job {o.job.id} on {o.job.box.name}: {o.error!r}")
         return EXIT_INFRA
-    return lost_box(args, state_dir, state, w, watch)
+    if o.code is None:  # still running
+        return 0
+    if o.code == EXIT_TIMEOUT:
+        log(f"::error::job {o.job.id} on {o.job.box.name} ran out of time (--timeout-min)")
+    return o.code
 
 
-class Prefixed:
-    """A binary stream that writes whole lines to stdout, each led by the box's name."""
-
-    def __init__(self, name: str, lock):
-        self.prefix, self.lock, self.partial = f"[{name}] ".encode(), lock, b""
-
-    def write(self, data: bytes) -> None:
-        *lines, self.partial = (self.partial + data).split(b"\n")
-        if lines:
-            with self.lock:
-                for line in lines:
-                    sys.stdout.buffer.write(self.prefix + line + b"\n")
-                sys.stdout.buffer.flush()
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        if self.partial:
-            self.write(b"\n")
-
-
-def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wait=True) -> int:
-    """Follow the job on these boxes (streaming its log unless `quiet`) and combine how it
-    ended: a lost box first, then a timeout, then the first failure, else 0."""
-    import threading
-
-    lock = threading.Lock()
-    results: dict[int, int] = {}
-
-    def one(box):
-        i, name, w = box
-        watch = BoxWatch(args, state, w)
-        if quiet:
-            out = open(os.devnull, "wb")
-        elif len(boxes) == 1:
-            out = sys.stdout.buffer
-        else:
-            out = Prefixed(name, lock)
-        end, _ = job.follow(
-            box_ssh(state_dir, state, w), job_id, out, wait=wait,
-            offset=2**62 if quiet else offset, still_there=watch,
-            patience=args.reconnect_min * 60,
-        )  # fmt: skip
-        if isinstance(out, Prefixed):
-            out.close()
-        results[i] = end_code(args, state_dir, state, box, job_id, end, watch)
-
-    threads = [threading.Thread(target=one, args=(b,), daemon=True) for b in boxes]
+def wait_jobs(args, run: api.Run, jobs_: list[api.Job], *, quiet=False, follow=True) -> int:
+    """Follow the jobs and combine how they ended: a lost box first, then a timeout,
+    then the first failure, else 0."""
     try:
-        for t in threads:
-            t.start()
-        for t in threads:
-            while t.is_alive():
-                t.join(0.5)
+        outcomes = api.wait_all(jobs_, quiet=quiet, follow=follow, reconnect_min=args.reconnect_min)
     except KeyboardInterrupt:
-        where = "" if len(boxes) == 1 and len(state.winners) == 1 else f" --box {boxes[0][0]}"
-        log(f"job {job_id} carries on: `gpubox logs -f{where} {job_id}`, "
-            f"`gpubox kill{where} {job_id}` to stop it")  # fmt: skip
+        j = jobs_[0]
+        where = "" if run.meta.get("count", 1) == 1 else f" --box {j.box.index}"
+        log(f"job {j.id} carries on: `gpubox logs -f{where} {j.id}`, "
+            f"`gpubox kill{where} {j.id}` to stop it")  # fmt: skip
         return EXIT_INTERRUPTED
-    codes = [results.get(i, EXIT_INFRA) for i, _, _ in boxes]
+    codes = [outcome_code(o) for o in outcomes]
     for wanted in (EXIT_INFRA, EXIT_TIMEOUT):
         if wanted in codes:
             return wanted
@@ -724,9 +362,8 @@ def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wa
 
 
 def cmd_run(args) -> int:
-    state_dir = Path(args.state_dir)
     # No lock: `down` must be able to end a run in progress.
-    state, boxes = chosen(state_dir, args)
+    run, boxes = chosen(args)
     try:
         script = Path(args.script).read_text()
     except (OSError, UnicodeDecodeError) as exc:
@@ -736,102 +373,77 @@ def cmd_run(args) -> int:
     except job.JobError as exc:
         raise ConfigError(str(exc)) from None
     job_id = job.new_job_id()
-    started = [b for b in boxes if start_job(args, state_dir, state, b, job_id, script, env)]
-    for i, name, _ in started:
-        log(f"job {job_id} started on {name}")
-    github_output(job_id=job_id)
-    if len(started) < len(boxes):
+    started, failed = [], False
+    for box in boxes:
+        try:
+            started.append(
+                box.start(
+                    script,
+                    env,
+                    timeout_min=args.timeout_min,
+                    destroy_after=args.destroy_after,
+                    job_id=job_id,
+                )  # fmt: skip
+            )
+        except InfraError as exc:  # our own mistakes (ConfigError, StateError) end it at once
+            log(f"::error::{exc}")
+            failed = True
+    advisory("writing outputs", github_output, job_id=job_id)
+    if failed:
         return EXIT_INFRA
     if args.detach:
         print(job_id)
         return 0
-    return wait_for(args, state_dir, state, started, job_id)
-
-
-def job_of(args, state_dir, state, box) -> str:
-    """The job a command names, else the newest job on the box."""
-    if args.job:
-        try:
-            return job.check_job_id(args.job)
-        except job.JobError as exc:
-            raise ConfigError(str(exc)) from None
-    rc, out, err = job.run_remote(box_ssh(state_dir, state, box[2]), job.latest_command())
-    if rc != 0:
-        raise InfraError(f"could not ask {box[1]} for its jobs (exit {rc}): {err.strip()[-200:]}")
-    if not out.strip():
-        raise ConfigError(f"no job on {box[1]}")
-    return out.strip().splitlines()[-1]
+    return wait_jobs(args, run, started)
 
 
 def cmd_logs(args) -> int:
-    state_dir = Path(args.state_dir)
-    state, boxes = chosen(state_dir, args)
-    job_id = job_of(args, state_dir, state, boxes[0])
-    return wait_for(args, state_dir, state, boxes, job_id, wait=args.follow)
+    run, (box,) = chosen(args)
+    return wait_jobs(args, run, [box.job(args.job)], follow=args.follow)
 
 
 def cmd_wait(args) -> int:
-    state_dir = Path(args.state_dir)
-    state, boxes = chosen(state_dir, args)
-    job_id = job_of(args, state_dir, state, boxes[0])
-    return wait_for(args, state_dir, state, boxes, job_id, quiet=True)
+    run, (box,) = chosen(args)
+    return wait_jobs(args, run, [box.job(args.job)], quiet=True)
 
 
 def cmd_jobs(args) -> int:
-    state_dir = Path(args.state_dir)
-    state, boxes = chosen(state_dir, args)
-    rc, out, err = job.run_remote(box_ssh(state_dir, state, boxes[0][2]), job.list_command())
-    if rc != 0:
-        log(f"::error::could not list the jobs (exit {rc}): {err.strip()[-200:]}")
-        return EXIT_INFRA
-    print(out, end="")
+    run, (box,) = chosen(args)
+    for job_id, status in box.jobs():
+        print(job_id, status)
     return 0
 
 
 def cmd_kill(args) -> int:
-    state_dir = Path(args.state_dir)
-    state, boxes = chosen(state_dir, args)
-    job_id = job_of(args, state_dir, state, boxes[0])
-    timeout = job.KILL_GRACE + 30
-    rc, _, err = job.run_remote(
-        box_ssh(state_dir, state, boxes[0][2]), job.kill_command(job_id), timeout=timeout
-    )
-    if rc != 0:
-        log(f"::error::could not kill job {job_id} (exit {rc}): {err.strip()[-200:]}")
-        return EXIT_INFRA
-    log(f"job {job_id} killed")
+    run, (box,) = chosen(args)
+    j = box.job(args.job)
+    log(f"job {j.id}: {j.kill()}")
     return 0
 
 
 def cmd_ssh(args) -> int:
     """A shell on the box, or a command run there with the container's environment."""
-    state_dir = Path(args.state_dir)
-    state, boxes = chosen(state_dir, args)
+    run, (box,) = chosen(args)
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
-    ssh = box_ssh(state_dir, state, boxes[0][2])
     if command:
         remote = job.LOAD_ENV + "exec " + " ".join(shlex.quote(c) for c in command)
-        argv = ssh(remote, tty=sys.stdin.isatty())
+        argv = box.ssh_argv(remote, tty=sys.stdin.isatty())
     else:
-        argv = ssh(None, tty=True)  # a login shell, which loads the environment itself
-    return subprocess.run(argv).returncode
+        argv = box.ssh_argv(None, tty=True)  # a login shell, which loads the environment itself
+    rc = subprocess.run(argv).returncode
+    if box._refreshed(rc):  # not run again: the command may have run before the drop
+        log(f"{box.name} answers at a new address now; run the command again")
+    return rc
 
 
 def cmd_renew(args) -> int:
-    state_dir = Path(args.state_dir)
-    with state_lock(state_dir):
-        state = live_run(state_dir)
-        provider = provider_of_run(args, state)
-        account = check_account(provider, pinned_account(args))
-        same_account(provider, state, account)  # before anything on the box is changed
-        prober = prober_for(state_dir, state)
-        expiry = int(time.time()) + args.ttl_min * 60
-        renew(provider, state, prober, expiry)
+    run = api.attach(settings=settings(args))
+    expiry = run.renew(args.ttl_min)
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry))
-    ids = ", ".join(str(w["id"]) for w in state.winners)
-    log(f"{provider.noun}(s) {ids}: lease now ends at {until}")
+    ids = ", ".join(str(b.instance_id) for b in run.boxes)
+    log(f"{'job' if run.on_slurm else 'instance'}(s) {ids}: lease now ends at {until}")
     return 0
 
 
@@ -846,11 +458,13 @@ def cmd_status(args) -> int:
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(state.expiry))
     left = (state.expiry - time.time()) / 60
     what = "closing" if state.closing else f"lease ends {until} ({left:.0f} min)"
-    print(f"run {state.run}: {len(state.winners)} box(es), {what}")
-    for i, (name, w) in enumerate(boxes_of(state)):
+    ws = state.winners
+    print(f"run {state.run}: {len(ws)} box(es), {what}")
+    for i, w in enumerate(ws):
+        name = box_name(state.run, i, len(ws))
         gpu = f"  {w['gpu']}" if w.get("gpu") else ""
-        if run_is_slurm(state):
-            # Its host is the login host and its port the job id (box_ssh).
+        if api.is_slurm(state.meta):
+            # Its host is the login host and its port the job id (api.prober_for).
             node = f" on {w['machine']}" if w.get("machine") else ""
             where = f"job {w['id']:<10}{node}  (ssh {w['host']}; `gpubox ssh --box {i}`)"
         else:
@@ -860,66 +474,22 @@ def cmd_status(args) -> int:
 
 
 def cmd_down(args) -> int:
-    state_dir = Path(args.state_dir)
-    run_id = args.run_id
-    if run_id is not None and not RUN_ID.fullmatch(run_id):
-        # Also an empty one: a job whose `up` never got as far as a run id has
-        # rented nothing, and must not tear down whatever else is here.
-        raise StateError(f"not a run id: {run_id!r}")
-    with state_lock(state_dir):
-        try:
-            state = State.load(state_dir)
-        except StateError as exc:
-            if run_id is None:
-                raise  # we cannot even tell which run this is
-            log(f"WARNING: {exc}; working from the run id alone")
-            state = None
-        if state is None and run_id is None:
-            log(f"no run in {state_dir}: nothing to destroy")
-            return 0
-        ours = state is not None and (run_id is None or state.run == run_id)
-        # The run's own provider, from its state; for a run this directory does not
-        # have, the one the command line names.
-        provider = provider_of_run(args, state) if ours else provider_from_args(args)
-        account = check_account(provider, pinned_account(args))
-        if ours:
-            # An empty listing on another account says nothing about this run.
-            same_account(provider, state, account)
-        else:
-            # By tag alone. The directory's own state and keys are not touched.
-            log(f"run {run_id} has no state in {state_dir}: destroying what carries its tag")
-            state = State.ephemeral(run_id)
-        left = down(provider, state, Policy())
-        if left == []:
-            log(f"run {state.run}: nothing left")
-            if ours:
-                # Nothing of this run is left to log in to.
-                shutil.rmtree(key_dir(state_dir, state.run), ignore_errors=True)
-                advisory("removing the SSH configuration entry", sshconfig.remove, state.run)
-            return 0
-        explain_leftovers(provider, state, left)
-    return EXIT_INFRA
+    try:
+        api.down(run_id=args.run_id, policy=Policy(), settings=settings(args))
+    except TeardownIncomplete:
+        return EXIT_INFRA  # explain_leftovers has said what is left and what to do
+    return 0
 
 
 def cmd_reap(args) -> int:
-    if not NAMESPACE.fullmatch(args.namespace):
-        raise ConfigError(f"not a namespace: {args.namespace!r}")
-    check_provider_args(args)
-    provider = provider_from_args(args)
-    check_account(provider, pinned_account(args))
-    failed = reap(provider, Policy(), args.namespace, destroy=args.destroy)
+    failed = api.reap(
+        args.namespace, destroy=args.destroy, policy=Policy(), settings=settings(args)
+    )
     return EXIT_INFRA if failed else 0
 
 
 def cmd_search(args) -> int:
-    check_provider_args(args)
-    spec = spec_from(args)
-    obs = pol.Observations(observations_path(args))
-    shared = open_shared(args)
-    share(shared, "search")
-    blocked = pol.blocklist(known_rows(obs, shared), time.time())
-    found = v.Vast(api_key(args)).offers(v.offer_query(spec))
-    offers = pol.select_offers(v.in_allowed_country(found, spec.exclude_countries), blocked, 2)
+    offers, blocked = api.search(spec_from(args), settings=settings(args))
     print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
     for o in offers:
         note = blocked.get(o.get("machine_id"), {}).get("reason", "")
@@ -1021,6 +591,18 @@ def main(argv=None) -> int:
             "--min-ram-gb", type=number(int, 1), help="GB of RAM for the box (default: 32 per GPU)"
         )
         s.add_argument("--must-reach", action="append", default=[], metavar="URL")
+        s.add_argument(
+            "--interruptible",
+            action="store_true",
+            help="bid for interruptible boxes: cheaper, but stopped when outbid "
+            "(run `reap --destroy` on a schedule)",
+        )
+        s.add_argument(
+            "--bid-markup",
+            type=number(float, 1),
+            default=1.25,
+            help="bid this times the offer's minimum bid (default 1.25)",
+        )
         s.add_argument(
             "--exclude-country",
             action="append",
@@ -1206,9 +788,6 @@ def main(argv=None) -> int:
         return EXIT_CONFIG
     except v.VastError as exc:
         log(f"::error::Vast API: {exc}")
-        return EXIT_INFRA
-    except ProviderError as exc:
-        log(f"::error::{exc}")
         return EXIT_INFRA
     except InfraError as exc:
         log(f"::error::{exc}")

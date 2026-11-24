@@ -38,12 +38,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .errors import ConfigError, InfraError
 
-class ConfigError(RuntimeError):
-    """Our mistake (image, key, arguments): another host cannot help."""
+__all__ = ["ConfigError", "CreateRefused", "CreateUnknown", "ProviderError", "View"]
 
 
-class ProviderError(RuntimeError):
+class ProviderError(InfraError):
     """A provider's answer could not be had or could not be read. Never evidence that a
     box is gone."""
 

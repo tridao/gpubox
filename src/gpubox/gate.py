@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .policy import REASONS
+from .vast import LOAD_ENV
 
 GATE_VERSION = 3  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old
 
@@ -287,7 +288,8 @@ class Prober:
         }
         if self.scoped:
             want["scoped"] = True
-        argv = self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want)))
+        # With the image's environment (its PATH may be where its python3 is).
+        argv = self.ssh(ep, LOAD_ENV + "python3 - " + shlex.quote(json.dumps(want)))
         return self._start(argv, read_gate, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT)
 
     def start_hook(self, ep: tuple[str, int], spec) -> Check:
@@ -302,7 +304,7 @@ READY_TIMEOUT = 25
 GATE_TIMEOUT = 240
 # The caller's gate script is stored first, so nothing it runs can read it from
 # stdin, then run: by its own #! line if it has one, else by bash.
-HOOK_REMOTE = (
+HOOK_REMOTE = LOAD_ENV + (
     'f=$(mktemp /tmp/gpubox-gate.XXXXXX) && cat > "$f" && chmod 700 "$f" && '
     'if [ "$(head -c 2 "$f")" = "#!" ]; then exec "$f" </dev/null; '
     'else exec bash "$f" </dev/null; fi'

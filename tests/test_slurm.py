@@ -420,8 +420,8 @@ def test_a_process_left_holding_stderr_does_not_hold_up_a_command(tmp_path, monk
 def test_the_batch_script_is_bash_and_a_job_is_started_by_it():
     script = sl.batch_script(EXPIRY)
     assert subprocess.run(["bash", "-n"], input=script.encode()).returncode == 0
-    remote, program = job.start_command("20261123-000000-abcd", "true\n", {}, spawn="runner")
-    assert '"$d/start"' in program and "setsid" not in program.split('"$d/wrapper"')[-1]
+    remote, program = job.start_command(job.new_job_id(), "true\n", {}, spawn="runner")
+    assert '"$d/start"' in program and 'setsid bash "$d/wrapper"' not in program
     assert subprocess.run(["bash", "-n"], input=program.encode()).returncode == 0
 
 
@@ -727,3 +727,26 @@ def test_reap_cancels_jobs_whose_lease_has_ended(tmp_path, local_cluster):
     assert cli.main(argv) == 0
     assert local_cluster.jobs[old]["state"] == "CANCELLED"
     assert local_cluster.jobs[new]["state"] != "CANCELLED"
+
+
+def test_the_library_rents_from_a_cluster_and_tears_down_at_the_end(tmp_path, local_cluster):
+    import gpubox
+
+    where = {"provider": "slurm", "slurm": {"login": "login.example"}}
+    spec = L.Spec(image="", gpus=(), max_dph_per_gpu=0, ttl_min=30)
+    fast = L.Policy(**{**FAST.__dict__, "spare": 0})
+    with gpubox.up(
+        spec, namespace="dev", name="lib", policy=fast, state_dir=tmp_path / "s", **where
+    ) as run:
+        assert run.on_slurm and run.provider.name == "slurm"
+        (box,) = run.boxes
+        assert box.machine == "node1" and "job" in repr(box)
+        (j,) = run.start("echo hi; exit 4\n")
+        assert j.wait(quiet=True) == 4
+        jid = box.instance_id
+    assert local_cluster.jobs[jid]["state"] == "CANCELLED"
+    with pytest.raises(ConfigError, match="not on a Slurm cluster"):
+        gpubox.up(L.Spec(image="img", gpus=(), max_dph_per_gpu=0, ttl_min=30), namespace="dev",
+                  name="lib", state_dir=tmp_path / "t", **where)  # fmt: skip
+    with pytest.raises(ConfigError, match="login host"):
+        gpubox.up(spec, namespace="dev", name="lib", state_dir=tmp_path / "u", provider="slurm")

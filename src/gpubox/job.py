@@ -1,26 +1,33 @@
 """Jobs on a box: a script started detached, its log followed from wherever we are.
 
 A job lives in a directory on the box, `/var/lib/gpubox/jobs/<id>/` (or under
-$GPUBOX_JOBS, if the box sets it):
+$GPUBOX_JOBS, if the box's environment sets it):
 
-    script   what to run
-    env      the caller's variables (secrets among them), 0600; deleted as the job starts
-    log      the script's stdout and stderr
-    wpid     "<pid> <start time>" of the wrapper that runs the script and waits for it
-    pid      the script's process group
-    exit     its exit code, written (atomically) once it has ended
-    expired  present if the box killed it at its timeout
+    script     what to run
+    env        the caller's variables (secrets among them), 0600; deleted as the job starts
+    log        the script's stdout and stderr
+    wpid       "<pid> <start time>" of the wrapper that runs the script and waits for it
+    pid        the script's process group
+    exit       its exit code, written (atomically) once it has ended
+    expired    present if the box ended it at its timeout
+    cancelled  present if it was killed (`gpubox kill`)
 
 The wrapper runs in a session of its own, so nothing that happens to an SSH
 connection reaches it: a dropped connection, a killed `gpubox run`, a laptop
-that went to sleep. The timeout is kept on the box for the same reason. What
-reads the log is a small program on the box (FOLLOW) that prints the log from
-a byte offset and ends with one status line on stderr; the controller counts
-the bytes it got, so after a dropped connection it carries on where it was.
+that went to sleep. It owns the job's end: the timeout, kept on the box for
+the same reason, and a kill both go through it, and it signals only its own
+child's process group. The job's variables are loaded in that child alone, so
+nothing the caller passes can change what the wrapper does.
+
+What reads the log is a small program on the box (TOOL) that prints the log
+from a byte offset and ends with one status line on stderr; the controller
+counts the bytes it got, so after a dropped connection it carries on where it
+was. The same program lists jobs and kills them, with one test of whether a
+wrapper is alive: its pid, its start time, and not a zombie.
 
 The job sees the container's environment (Docker's ENV, Vast's variables,
 saved by the bootstrap), then the caller's variables, then GPUBOX_RUN_ID,
-GPUBOX_JOB, GPUBOX_BOX_INDEX and GPUBOX_BOX_COUNT.
+GPUBOX_JOB, GPUBOX_BOX_INDEX, GPUBOX_BOX_COUNT and GPUBOX_BOX_NAME.
 """
 
 from __future__ import annotations
@@ -37,15 +44,14 @@ from dataclasses import dataclass
 from . import vast as v
 
 JOBS_DIR = "/var/lib/gpubox/jobs"
-# The jobs directory, as the shell on the box finds it.
+# The jobs directory, as a shell on the box finds it (after loading the environment).
 JOBS = '"${GPUBOX_JOBS:-%s}"' % JOBS_DIR
-# Loads the container's environment into a shell on the box. POSIX sh: root's
-# login shell, which runs what ssh is asked to run, need not be bash.
-LOAD_ENV = f"[ -r {v.ENV_FILE} ] && . {v.ENV_FILE}; "
-JOB_ID = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{4}")
+LOAD_ENV = v.LOAD_ENV
+JOB_ID = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9a-f]{4}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MARK = "GPUBOX-JOB"  # starts the follower's status line
 KILL_GRACE = 10  # seconds between SIGTERM and SIGKILL when a job's time is up or it is killed
+START_WAIT = 10  # seconds the start waits for the wrapper to have started the script
 
 
 class JobError(RuntimeError):
@@ -53,9 +59,10 @@ class JobError(RuntimeError):
 
 
 def new_job_id(now: float | None = None) -> str:
-    """Sortable by start time, so the newest job is the last name in the directory."""
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(time.time() if now is None else now))
-    return f"{stamp}-{secrets.token_hex(2)}"
+    """Sortable by start time, to the millisecond, so the newest job is the last name."""
+    now = time.time() if now is None else now
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now))
+    return f"{stamp}-{int(now * 1000) % 1000:03d}-{secrets.token_hex(2)}"
 
 
 def check_job_id(job_id) -> str:
@@ -92,34 +99,40 @@ def _heredoc(path: str, text: str) -> str:
 
 
 # The wrapper: $1 is the job directory, $2 the timeout in seconds (0: none), $3 is 1 to
-# destroy the box when the script ends. Run by bash, in a session of its own.
+# destroy the box when the script ends. Run by bash, in a session of its own. Its own
+# variables are never touched by the job's: those are loaded in the child only.
 _WRAPPER = r"""
 d=$1; limit=$2; destroy=$3
 echo "$$ $(cut -d' ' -f22 /proc/$$/stat 2>/dev/null)" > "$d/wpid"
-[ -r %(env_file)s ] && . %(env_file)s
-set -a; . "$d/env"; set +a
-rm -f "$d/env"
-cd "${GPUBOX_WORKDIR:-$HOME}" 2>/dev/null || cd /
-setsid bash "$d/script" </dev/null >>"$d/log" 2>&1 &
+setsid bash -c '
+    [ -r %(env_file)s ] && . %(env_file)s
+    set -a; . "$1/env"; set +a
+    rm -f "$1/env"
+    cd "${GPUBOX_WORKDIR:-$HOME}" 2>/dev/null || cd /
+    exec bash "$1/script"
+' gpubox-job "$d" </dev/null >>"$d/log" 2>&1 &
 child=$!
-echo "$child" > "$d/pid"
-watcher=
-if [ "$limit" -gt 0 ]; then
-    (
-        sleep "$limit" & s=$!
-        trap 'kill $s 2>/dev/null; exit 0' TERM
-        wait $s
-        if kill -0 -- -"$child" 2>/dev/null; then
-            touch "$d/expired"
-            kill -TERM -- -"$child" 2>/dev/null
-            sleep %(grace)d
-            kill -KILL -- -"$child" 2>/dev/null
-        fi
-    ) &
-    watcher=$!
-fi
+echo "$child" > "$d/pid.tmp" && mv "$d/pid.tmp" "$d/pid"
+# The end of the job: SIGTERM to its process group, SIGKILL to whatever is left of it
+# after the grace. Waits for that, so no exit code is written while it still runs.
+escalate() {
+    kill -TERM -- -"$child" 2>/dev/null
+    n=0
+    while kill -0 -- -"$child" 2>/dev/null && [ "$n" -lt %(grace2)d ]; do
+        sleep 0.5; n=$((n + 1))
+    done
+    kill -KILL -- -"$child" 2>/dev/null
+}
+trap 'touch "$d/cancelled"; escalate' TERM
+deadline=0
+[ "$limit" -gt 0 ] && deadline=$(( $(date +%%s) + limit ))
+while kill -0 "$child" 2>/dev/null; do
+    if [ "$deadline" -gt 0 ] && [ "$(date +%%s)" -ge "$deadline" ]; then
+        touch "$d/expired"; escalate; deadline=0
+    fi
+    sleep 1 & wait $!
+done
 wait "$child"; rc=$?
-[ -n "$watcher" ] && kill "$watcher" 2>/dev/null
 [ -e "$d/expired" ] && rc=124
 echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"
 if [ "$destroy" = 1 ]; then "${GPUBOX_DESTROY_SELF:-%(destroy_self)s}"; fi
@@ -128,7 +141,7 @@ if [ "$destroy" = 1 ]; then "${GPUBOX_DESTROY_SELF:-%(destroy_self)s}"; fi
 
 def wrapper() -> str:
     return _WRAPPER % {
-        "grace": KILL_GRACE, "env_file": v.ENV_FILE, "destroy_self": v.DESTROY_SELF,
+        "grace2": 2 * KILL_GRACE, "env_file": v.ENV_FILE, "destroy_self": v.DESTROY_SELF,
     }  # fmt: skip
 
 
@@ -141,9 +154,9 @@ def start_command(
     destroy_after: bool = False,
     spawn: str = "setsid",
 ) -> tuple[str, str]:
-    """(remote command, its stdin) that starts a job and returns at once. The script and
-    the variables travel on stdin, never on a command line. The command prints the job id
-    once the job is started.
+    """(remote command, its stdin) that starts a job. The script and the variables travel
+    on stdin, never on a command line. It prints the job id once the wrapper has started
+    the script; if the wrapper does not, it removes the variables and fails.
 
     `spawn`: "setsid" starts the wrapper from this command, in a session of its own.
     "runner" asks a process on the box that outlives this command to start it (a Slurm
@@ -153,6 +166,7 @@ def start_command(
     check_job_id(job_id)
     if type(timeout_s) is not int or timeout_s < 0:
         raise JobError(f"bad timeout {timeout_s!r}")
+    hint = "is setsid there?" if spawn == "setsid" else "is the batch script of the box alive?"
     if spawn == "setsid":
         launch = (
             f'setsid bash "$d/wrapper" "$d" {timeout_s} {int(destroy_after)}'
@@ -161,18 +175,15 @@ def start_command(
     elif spawn == "runner":
         launch = (
             f'echo {timeout_s} {int(destroy_after)} > "$d/start.tmp" && mv "$d/start.tmp" "$d/start"\n'
-            "i=0\n"
-            'while [ -e "$d/start" ]; do\n'
-            "    i=$((i + 1))\n"
-            '    if [ "$i" -gt 300 ] && rm "$d/start" 2>/dev/null; then\n'
-            '        echo "the box did not take the job in 30 s" >&2; exit 1\n'
-            "    fi\n"
-            "    sleep 0.1\n"
-            "done\n"
+            'i=0; while [ -e "$d/start" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done\n'
+            # Not taken: take it back, unless the runner took it in the meantime.
+            'if [ -e "$d/start" ] && rm "$d/start" 2>/dev/null; then rm -f "$d/env"; '
+            "echo 'the box did not take the job in 30 s' >&2; exit 1; fi\n"
         )
     else:
         raise JobError(f"unknown way to start a job: {spawn!r}")
     program = (
+        LOAD_ENV + "\n"
         "set -eu\n"
         "umask 077\n"
         f'J={JOBS}; d="$J/{job_id}"\n'
@@ -182,113 +193,155 @@ def start_command(
         + _heredoc('"$d/wrapper"', wrapper())
         + ': > "$d/log"\n'
         + launch
-        + f"echo {job_id}\n"
+        + f'i=0; while [ ! -e "$d/pid" ] && [ "$i" -lt {START_WAIT * 10} ]; do '
+        "sleep 0.1; i=$((i + 1)); done\n"
+        f'if [ -e "$d/pid" ]; then echo {job_id}; else rm -f "$d/env"; '
+        f"echo 'the job did not start ({hint})' >&2; exit 1; fi\n"
     )
     return "bash -s", program
 
 
-# The follower: argv is the job directory, the byte offset to start from, and 1 to wait
-# for the job to end (0: print what there is and stop). Ends with one line on stderr:
-# "GPUBOX-JOB exit N", "GPUBOX-JOB running", "GPUBOX-JOB lost" or "GPUBOX-JOB none".
-FOLLOW = r"""
-import os, sys, time
-d, off, wait = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
-out = sys.stdout.buffer
-def end(what):
-    out.flush()
-    sys.stderr.write("\nGPUBOX-JOB %s\n" % what)
-    sys.exit(0)
-def chunk():
-    global off
+# On the box: `follow DIR OFFSET MODE`, `list JOBS`, `latest JOBS` or `kill DIR`.
+# follow prints the log from OFFSET (MODE 0: what there is; 1: until the job ends;
+# 2: wait without printing) and ends with one line on stderr: "GPUBOX-JOB exit N",
+# "GPUBOX-JOB running", "GPUBOX-JOB lost" or "GPUBOX-JOB none".
+TOOL = r"""
+import os, re, signal, sys, time
+def alive(d):
+    # The job's wrapper, recognised by its pid and its start time (a process that got
+    # its pid after a container restart is not it), and not a zombie.
     try:
-        with open(os.path.join(d, "log"), "rb") as f:
-            f.seek(off)
-            data = f.read(1 << 16)
-    except FileNotFoundError:
-        return False
-    if data:
-        out.write(data)
-        out.flush()
-        off += len(data)
-    return bool(data)
-def exit_code():
+        with open(os.path.join(d, "wpid")) as f:
+            pid, start = (f.read().split() + [""])[:2]
+        pid = int(pid)
+        if not start:  # no /proc where it started
+            os.kill(pid, 0)
+            return pid
+        with open("/proc/%%d/stat" %% pid) as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return pid if fields[0] != "Z" and fields[19] == start else None
+    except PermissionError:
+        return pid
+    except (OSError, ValueError, IndexError):
+        return None
+def exit_code(d):
     try:
         with open(os.path.join(d, "exit")) as f:
             return f.read().strip()
     except FileNotFoundError:
         return None
-def wrapper_alive():
-    # The wrapper, recognised by its pid and its start time, so that a process that got
-    # its pid after a container restart is not taken for it. (Without /proc, by its pid.)
-    try:
-        with open(os.path.join(d, "wpid")) as f:
-            pid, start = (f.read().split() + [""])[:2]
-        pid = int(pid)
-        if not start:
-            os.kill(pid, 0)
-            return True
-        with open("/proc/%d/stat" % pid) as f:
-            return f.read().rsplit(")", 1)[1].split()[19] == start
-    except PermissionError:
-        return True
-    except (OSError, ValueError, IndexError):
-        return False
-if not os.path.isdir(d):
-    end("none")
-started = time.monotonic()
-gone = None
-while True:
-    if chunk():
-        continue
-    rc = exit_code()
+def status(d):
+    rc = exit_code(d)
     if rc is not None:
-        while chunk():
-            pass
-        end("exit " + rc)
-    if not wait:
-        end("running")
-    if wrapper_alive() or time.monotonic() - started < 5:
-        gone = None
-    elif gone is None:
-        gone = time.monotonic()
-    elif time.monotonic() - gone > 3:  # not just between the script's end and the exit file
-        end("lost")
-    time.sleep(0.5)
-"""
+        return "exit " + rc
+    if not os.path.exists(os.path.join(d, "wpid")):
+        # Being started, unless that was long ago: a start the box stopped under.
+        young = time.time() - os.path.getmtime(d) < %(start_wait)d + 60
+        return "running" if young else "lost"
+    return "running" if alive(d) else "lost"
+def jobs(root):
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    return sorted(n for n in names if re.fullmatch(r"%(job_id)s", n))
+def follow(d, off, mode):
+    out = sys.stdout.buffer
+    def end(what):
+        out.flush()
+        sys.stderr.write("\nGPUBOX-JOB %%s\n" %% what)
+        sys.stderr.flush()
+        sys.exit(0)
+    def chunk():
+        nonlocal off
+        if mode == 2:
+            return False
+        try:
+            with open(os.path.join(d, "log"), "rb") as f:
+                f.seek(off)
+                data = f.read(1 << 16)
+        except FileNotFoundError:
+            return False
+        if data:
+            out.write(data)
+            out.flush()
+            off += len(data)
+        return bool(data)
+    if not os.path.isdir(d):
+        end("none")
+    started, gone = time.monotonic(), None
+    while True:
+        if chunk():
+            continue
+        rc = exit_code(d)
+        if rc is not None:
+            while chunk():
+                pass
+            end("exit " + rc)
+        if mode == 0:
+            end("running")
+        if alive(d) or time.monotonic() - started < 5:
+            gone = None
+        elif gone is None:
+            gone = time.monotonic()
+        elif time.monotonic() - gone > 3:  # not just between the script's end and the exit file
+            end("lost")
+        time.sleep(0.5)
+def kill(d, grace):
+    if not os.path.isdir(d):
+        sys.exit("no such job")
+    if exit_code(d) is not None:
+        print("already ended: exit " + exit_code(d))
+        return
+    pid = alive(d)
+    if pid is None:
+        sys.exit("the job's wrapper is gone: the job is lost, not killed")
+    os.kill(pid, signal.SIGTERM)  # the wrapper ends its own job's process group
+    deadline = time.monotonic() + grace + 15
+    while exit_code(d) is None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if exit_code(d) is None:
+        sys.exit("the job did not end within %%ds" %% (grace + 15))
+    print("killed: exit " + exit_code(d))
+cmd = sys.argv[1]
+if cmd == "follow":
+    follow(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+elif cmd == "list":
+    for n in jobs(sys.argv[2]):
+        print(n, status(os.path.join(sys.argv[2], n)))
+elif cmd == "latest":
+    print((jobs(sys.argv[2]) or [""])[-1])
+elif cmd == "kill":
+    kill(sys.argv[2], int(sys.argv[3]))
+""" % {"job_id": JOB_ID.pattern, "start_wait": START_WAIT}
 
 
-def follow_command(job_id: str, offset: int, wait: bool) -> str:
+def _tool(*args: str) -> str:
+    return LOAD_ENV + f"exec python3 -c {shlex.quote(TOOL)} " + " ".join(args)
+
+
+def follow_command(job_id: str, offset: int, mode: int) -> str:
+    """mode 0: print what there is; 1: until the job ends; 2: wait for it, printing nothing."""
     check_job_id(job_id)
-    return (
-        LOAD_ENV
-        + f"exec python3 -c {shlex.quote(FOLLOW)} {JOBS}/{job_id} {int(offset)} {int(wait)}"
-    )
+    if mode not in (0, 1, 2):
+        raise JobError(f"bad follow mode {mode!r}")
+    return _tool("follow", f"{JOBS}/{job_id}", str(int(offset)), str(mode))
 
 
 def latest_command() -> str:
-    """Prints the newest job's id, or nothing."""
-    return f"ls -1 {JOBS} 2>/dev/null | grep -E '^{JOB_ID.pattern}$' | tail -n 1; true"
+    """Prints the newest job's id, or an empty line."""
+    return _tool("latest", JOBS)
 
 
 def list_command() -> str:
     """One line per job, oldest first: its id, then `exit N`, `running` or `lost`."""
-    return (
-        f'for d in {JOBS}/*/; do [ -d "$d" ] || continue; j=$(basename "$d"); '
-        'if [ -e "$d/exit" ]; then echo "$j exit $(cat "$d/exit")"; '
-        'elif [ -e "$d/wpid" ] && kill -0 "$(cut -d" " -f1 "$d/wpid")" 2>/dev/null; '
-        'then echo "$j running"; else echo "$j lost"; fi; done'
-    )
+    return _tool("list", JOBS)
 
 
 def kill_command(job_id: str) -> str:
-    """SIGTERM to the job's process group, SIGKILL if it is still there after the grace."""
+    """Asks the job's wrapper to end it, and waits until it has."""
     check_job_id(job_id)
-    return (
-        f"p=$(cat {JOBS}/{job_id}/pid 2>/dev/null) || {{ echo 'no such job' >&2; exit 3; }}; "
-        'kill -TERM -- -"$p" 2>/dev/null; sleep 1; '
-        f'if kill -0 -- -"$p" 2>/dev/null; then sleep {KILL_GRACE}; '
-        'kill -KILL -- -"$p" 2>/dev/null; fi; true'
-    )
+    return _tool("kill", f"{JOBS}/{job_id}", str(KILL_GRACE))
 
 
 @dataclass(frozen=True)
@@ -297,10 +350,11 @@ class End:
 
     exit      the job ended with `rc`
     running   it is still running (we were not asked to wait)
-    lost      it ended without an exit code: its box restarted, or it was killed
+    lost      it ended without an exit code: its box restarted, or its wrapper was killed
     none      there is no such job on the box
     gone      the box no longer exists
     unreachable  no connection for longer than we were prepared to wait
+    cancelled    the caller asked to stop following (the job goes on)
     """
 
     kind: str
@@ -309,8 +363,9 @@ class End:
 
 
 def parse_end(stderr: str) -> End | None:
-    """The follower's status line, or None if it never got to say (a dropped connection)."""
-    for line in reversed(stderr.splitlines()):
+    """The follower's status line, or None if it never finished saying it (a dropped
+    connection). Only a whole line counts: `exit 1` may be the start of `exit 124`."""
+    for line in reversed(stderr.split("\n")[:-1]):  # the last piece has no newline yet
         if not line.startswith(MARK + " "):
             continue
         parts = line.split()
@@ -328,29 +383,40 @@ def follow(
     out,
     *,
     wait: bool = True,
+    quiet: bool = False,
     offset: int = 0,
     still_there=None,
     patience: float = 600,
     retry: float = 5,
+    started=None,
+    cancel=None,
 ) -> tuple[End, int]:
     """Copy a job's log to `out` (a binary stream) from `offset` until the job ends (or,
-    without `wait`, until what there is has been copied). Returns how it ended and the
-    offset reached.
+    without `wait`, until what there is has been copied; with `quiet`, copy nothing and
+    wait). Returns how it ended and the offset reached.
 
     A dropped connection is not the end of anything: the follower is started again
-    from the offset reached. Between tries `still_there()`, if given, says whether the
-    box still exists (False ends it as "gone"; None, unknown, keeps trying). After
-    `patience` seconds without a connection that got anywhere, it gives up as
-    "unreachable"; the job, if any, carries on regardless.
+    from the offset reached. Its status line counts only if it is whole and the
+    follower exited cleanly. Between tries `still_there()`, if given, says whether
+    the box still exists (False ends it as "gone"; None, unknown, keeps trying). After
+    `patience` seconds without a connection, it gives up as "unreachable"; the job, if
+    any, carries on regardless. `started(proc)`, if given, is told of each ssh process,
+    so that an interrupted caller can stop it; once `cancel` (a threading.Event) is set,
+    no new connection is made and it ends as "cancelled".
     """
+    mode = 2 if quiet else (1 if wait else 0)
     failing_since = None
     while True:
-        before = offset
+        if cancel is not None and cancel.is_set():
+            return End("cancelled"), offset
+        before, t0 = offset, time.monotonic()
         with tempfile.TemporaryFile() as err:
             proc = subprocess.Popen(
-                ssh_argv(follow_command(job_id, offset, wait)),
+                ssh_argv(follow_command(job_id, offset, mode)),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
             )  # fmt: skip
+            if started is not None:
+                started(proc)
             try:
                 while True:
                     data = proc.stdout.read1(1 << 16)
@@ -366,18 +432,23 @@ def follow(
                 raise
             err.seek(0)
             stderr = err.read().decode("utf-8", errors="replace")
-        end = parse_end(stderr)
+        end = parse_end(stderr) if proc.returncode == 0 else None
         if end is not None:
             return end, offset
         now = time.monotonic()
-        if offset > before or failing_since is None:
+        # A connection that brought something, or held for a while, was a connection:
+        # the next outage is counted from now.
+        if failing_since is None or offset > before or now - t0 > 30:
             failing_since = now
         if still_there is not None and still_there() is False:
             return End("gone", detail="the box no longer exists"), offset
         if now - failing_since > patience:
             tail = stderr.strip().splitlines()[-1:] or ["no answer"]
             return End("unreachable", detail=tail[0][:200]), offset
-        time.sleep(retry)
+        if cancel is not None:
+            cancel.wait(retry)
+        else:
+            time.sleep(retry)
 
 
 def run_remote(ssh_argv, remote: str, stdin: str | None = None, timeout: float = 60):

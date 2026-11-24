@@ -662,3 +662,23 @@ def test_the_destroy_self_helper_moves_the_lease_into_the_past(tmp_path):
     expiry.write_text("1795400000\n")
     assert subprocess.run([str(helper)], capture_output=True).returncode == 0
     assert expiry.read_text().strip() == "1"  # the timer acts on its next look
+
+
+def test_the_saved_environment_is_private_even_over_a_file_the_image_had(tmp_path):
+    out = tmp_path / "env.sh"
+    out.write_text("old\n")
+    out.chmod(0o644)
+    save = v.SAVE_ENV.replace(v.ENV_FILE, str(out))
+    assert subprocess.run(["bash", "-c", save], env={"A": "1"}).returncode == 0
+    assert oct(out.stat().st_mode & 0o777) == "0o600" and "export A=" in out.read_text()
+
+
+def test_a_restarted_container_forgets_the_variables_of_a_start_it_cut_short(tmp_path):
+    script = v.bootstrap_script("KEY", 1795400000)
+    (line,) = [p for p in script.split("; ") if p.endswith("/*/env")]
+    d = tmp_path / "20261123-000000-000-abcd"
+    d.mkdir()
+    (d / "env").write_text("export T=secret\n")
+    (d / "log").write_text("kept\n")
+    assert subprocess.run(["bash", "-c", line], env={"GPUBOX_JOBS": str(tmp_path)}).returncode == 0
+    assert not (d / "env").exists() and (d / "log").exists()

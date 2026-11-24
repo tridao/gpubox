@@ -48,6 +48,17 @@ A private image: `--registry-user USER` with the token in
 `GPUBOX_REGISTRY_TOKEN` (the registry comes from the image name). Vast and
 the host's docker daemon see the token, so make it a read-only pull token.
 
+`--interruptible` rents interruptible boxes, bidding `--bid-markup` (1.25)
+times each offer's minimum bid; the price cap applies to the bid with the
+disk. An outbid box is stopped: its job dies, and the box keeps billing its
+disk, with its lease timer stopped too, until something destroys it. So run
+`gpubox reap --namespace NS --destroy` on a schedule, and expect `wait` to
+report a lost job (75). Two launches in different state directories can still
+bid on one machine at the same moment: the account's boxes are looked at
+once, when a launch starts. Machines
+the account already has a box on are skipped (our own bids would outbid each
+other), and a box that stops or never starts is not held against its machine.
+
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
 
@@ -166,6 +177,36 @@ gpubox reap --namespace my-ci --destroy
 to `down` lets the teardown work even from a runner that has lost the state
 directory. Always run `down` after `up`, whatever `up` returned.
 
+## From Python
+
+```python
+import gpubox
+
+spec = gpubox.Spec(image="ghcr.io/org/img:1", gpus=("RTX 5090", "RTX 4090"),
+                   max_dph_per_gpu=1.0, min_cpus=12, min_ram_gb=64, ttl_min=240)
+with gpubox.up(spec, namespace="eval", name="shard", count=4) as run:
+    jobs = run.start(open("shard.sh").read(), env={"TOKEN": token}, timeout_min=180)
+    outcomes = gpubox.wait_all(jobs)   # per job: .code, or .error
+# the boxes are destroyed when the block ends, however it ends (run.keep() to keep them)
+```
+
+If `up` fails or is interrupted after it began the run, it tears the run down
+before raising (and says how to retry if that fails too). A `Run` is a
+handle, not a lock: once the run is torn down or replaced in its state
+directory, whatever would touch its boxes raises `StateError`.
+
+`gpubox.attach(state_dir)` picks up a run left in a state directory (also by
+the command line); `run.boxes[i]` has `ssh_argv`, `sh`, `start`, `job`,
+`jobs`; a `Job` has `wait`, `logs` and `kill`. `gpubox.down(run_id=...)` and
+`gpubox.reap(namespace)` are the teardowns. Failures are exceptions:
+`ConfigError` and `StateError` for our own mistakes, `InfraError` (`NoBoxes`,
+`TeardownIncomplete`, `BoxLost`, `JobLost`) for the provider's or a box's.
+`gpubox.set_log(fn)` sends what it says somewhere other than stdout, for the
+whole process. The command line is a thin layer over this (`gpubox/api.py`).
+On a Slurm cluster, pass `provider="slurm", slurm={"login": "mycluster", ...}`
+to `up` (and to `down(run_id=...)` and `reap`); a run remembers where its
+boxes came from.
+
 ## Commands
 
 | | |
@@ -247,10 +288,19 @@ of machines are shared through a small Cloudflare Worker (`store/`), so that
 a machine that failed for one client is skipped by the others. It is
 advisory: it costs a command a few seconds at most and never fails it.
 
-## Tests
+## Development checks
 
 ```bash
+python3 -m pip install pytest pre-commit
+pre-commit install         # lint and format staged Python files with Ruff
+pre-commit run --all-files
+(cd store && npm ci && npm test)  # Node 24 LTS; also enables the Python/Worker integration test
 python3 -m pytest          # fake provider and fake SSH; rents nothing
 python3 tests/mutations.py # breaks each behaviour in turn; a test named for it must fail
-cd store && npm ci && npm test
 ```
+
+On PRs and pushes to `main`, GitHub Actions runs the hooks, tests Python 3.10
+and current Python 3, and checks the installed wheel's `gpubox` entry point.
+The current-Python job also tests the Worker and Python client against local D1.
+All jobs use GitHub-hosted Ubuntu runners; no GPUs or cloud credentials are
+needed. Mutation tests run weekly or on demand (Actions → Mutation tests).

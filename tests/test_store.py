@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from fakes import FAST, FakeProber, FakeVast
 
-from gpubox import cli
+from gpubox import api, cli
 from gpubox import policy as pol
 from gpubox import store as st
 
@@ -337,10 +337,10 @@ def test_runners_that_share_a_token_are_one_source(tmp_path, remote):
     b.sync()
     a.sync()
     assert 7 in pol.blocklist(a_obs.rows, now)  # A alone still says busy...
-    assert pol.blocklist(cli.known_rows(a_obs, a), now) == {}  # ...the source as a whole does not
+    assert pol.blocklist(api.known_rows(a_obs, a), now) == {}  # ...the source as a whole does not
     # A row the store does not have yet stays this client's own word.
     a_obs.add(failed(8, reason="busy_gpu", now=now - 60))
-    assert set(pol.blocklist(cli.known_rows(a_obs, a), now)) == {8}
+    assert set(pol.blocklist(api.known_rows(a_obs, a), now)) == {8}
 
 
 @pytest.mark.parametrize("mode", ["quota", "bad_counts", "error"])
@@ -704,7 +704,7 @@ def world(tmp_path, monkeypatch, remote):
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     monkeypatch.setattr(cli.v, "Vast", lambda key: vast)
-    monkeypatch.setattr(cli, "Prober", prober)
+    monkeypatch.setattr(api, "Prober", prober)
     monkeypatch.setattr(cli, "Policy", lambda **kw: type(FAST)(**{**FAST.__dict__, **kw}))
     # The loopback fake speaks http; the command itself only ever accepts https.
     monkeypatch.setattr(

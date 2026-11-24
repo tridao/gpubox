@@ -16,7 +16,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import policy as pol
 from . import provider as prov
 
 API_BASE = "https://console.vast.ai/api"
@@ -268,7 +267,7 @@ def offer_query(spec) -> dict:
         "disk_space": {"gte": spec.disk_gb},
         # Price the offer with the disk we will actually allocate.
         "allocated_storage": spec.disk_gb,
-        "type": "on-demand",
+        "type": "bid" if spec.interruptible else "on-demand",
         "order": [["dph_total", "asc"]],
         "limit": 200,
     }
@@ -307,10 +306,14 @@ def set_expiry_command(expiry: int) -> str:
 # over SSH, which does not inherit it: login shells load it, and so does every
 # command gpubox runs on the box (job.LOAD_ENV). POSIX syntax, so sh can read it.
 ENV_FILE = "/etc/gpubox/env.sh"
+# Written afresh and renamed into place, so it is 0600 whatever the image had there.
 SAVE_ENV = (
     "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; set -o posix; "
-    f"umask 077; export -p > {ENV_FILE})"
+    f"umask 077; rm -f {ENV_FILE}.tmp; export -p > {ENV_FILE}.tmp && mv {ENV_FILE}.tmp {ENV_FILE})"
 )
+# Loads it into a shell on the box. POSIX sh: root's login shell, which runs what ssh
+# is asked to run, need not be bash.
+LOAD_ENV = f"[ -r {ENV_FILE} ] && . {ENV_FILE}; "
 # A job ends its own box with this: the lease timer, which reads the expiry file
 # every 30 s, then destroys it. One way to destroy a box from inside, not two.
 DESTROY_SELF = "/usr/local/bin/gpubox-destroy-self"
@@ -364,6 +367,9 @@ def bootstrap_script(pubkey: str, expiry: int) -> str:
                 " --no-install-recommends openssh-server; fi",
                 "mkdir -p /run/sshd /etc/ssh /etc/gpubox /etc/profile.d /usr/local/bin",
                 SAVE_ENV,
+                # The variables of a job whose start the container stopped under, the only
+                # ones still on disk: a started job deletes its own at once.
+                'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
                 f"echo {shlex.quote(f'[ -r {ENV_FILE} ] && . {ENV_FILE}')}"
                 " > /etc/profile.d/gpubox-env.sh",
                 "printf '%s\\n' "
@@ -396,7 +402,7 @@ def registry_of(image: str) -> str:
     return "docker.io"
 
 
-def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
+def create_payload(spec, label: str, pubkey: str, expiry: int, bid: float | None = None) -> dict:
     payload = {
         "image": spec.image,
         "disk": spec.disk_gb,
@@ -409,6 +415,10 @@ def create_payload(spec, label: str, pubkey: str, expiry: int) -> dict:
         "onstart": "bash",
         "args": ["-c", bootstrap_script(pubkey, expiry)],
     }
+    if spec.interruptible:
+        if bid is None:
+            raise ValueError("an interruptible box needs a bid")
+        payload["price"] = bid  # $/hr for the machine, the disk not included
     if spec.registry_user is not None:
         # Vast's form: `docker login` arguments, in one string.
         login = f"-u {spec.registry_user} -p {spec.registry_token} {registry_of(spec.image)}"
@@ -467,15 +477,11 @@ class VastProvider:
         self.client = client
 
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
+        from .launch import candidates  # the launcher's, which `search` shows too
+
         if not spec.gpus:
             raise ValueError("a Vast search needs at least one GPU model")
-        found = self.client.offers(offer_query(spec))
-        # The search is asked for the price cap and the order; neither is taken
-        # on trust, since what comes back is what gets rented.
-        cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
-        found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
-        allowed = in_allowed_country(found, spec.exclude_countries)
-        offers = pol.select_offers(allowed, blocked, policy.max_live)
+        offers, found, allowed = candidates(self.client, spec, blocked, policy.max_live)
         note = (
             f"{len(offers)} candidate host(s) for {spec.gpu_text} "
             f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
@@ -485,7 +491,8 @@ class VastProvider:
 
     def create(self, offer: dict, spec, label: str, pubkey: str, expiry: int, avoid=()) -> int:
         # `avoid` is for providers that choose the machine themselves; here the offer is one.
-        return self.client.create(offer["id"], create_payload(spec, label, pubkey, expiry))
+        payload = create_payload(spec, label, pubkey, expiry, bid=offer.get("_bid"))
+        return self.client.create(offer["id"], payload)
 
     def view(self, row: dict) -> prov.View:
         status = str(row.get("actual_status") or "none")

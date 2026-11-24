@@ -33,22 +33,29 @@ answers are well formed, or that one host is right about the image.
 from __future__ import annotations
 
 import collections
+import math
 import re
 import time
 from dataclasses import dataclass, field
 
 from . import policy as pol
 from . import provider as prov
-from .provider import ConfigError  # noqa: F401  (raised here, and imported from here)
+from .errors import ConfigError
 from . import vast as v
 from .gate import GATE_VERSION
 from .state import State, make_tag, parse_tag
 
 
+_sink = None  # where log() sends what it says; None: stdout (api.set_log)
+
+
 def log(msg: str) -> None:
     """Say something. Never raises: a closed pipe must not stop a teardown."""
     try:
-        print(msg, flush=True)
+        if _sink is not None:
+            _sink(msg)
+        else:
+            print(msg, flush=True)
     except Exception:
         pass
 
@@ -83,12 +90,18 @@ class Spec:
     # host's docker daemon see both; the token is kept out of the repr.
     registry_user: str | None = None
     registry_token: str | None = field(default=None, repr=False)
+    # Interruptible: bid this times the offer's minimum bid. An outbid box is stopped (and
+    # bills its disk until destroyed); its job dies with its container.
+    interruptible: bool = False
+    bid_markup: float = 1.25
 
     def __post_init__(self):
         gpus = (self.gpus,) if isinstance(self.gpus, str) else tuple(self.gpus)
         if not all(isinstance(g, str) and g.strip() for g in gpus):
             raise ValueError(f"gpus must be GPU model names: {self.gpus!r}")
         object.__setattr__(self, "gpus", gpus)
+        if not 1 <= self.bid_markup <= 100:
+            raise ValueError(f"bid_markup must be between 1 and 100: {self.bid_markup!r}")
         if (self.registry_user is None) != (self.registry_token is None):
             raise ValueError("a registry login needs both a user and a token")
         for value in (self.registry_user, self.registry_token):
@@ -147,6 +160,7 @@ class Attempt:
     dph: float
     geo: str = ""
     gpu: str | None = None  # the model the offer said it has
+    bid: float | None = None  # interruptible: what we bid for the machine, $/hr
     # unanswered: the create got no usable answer, so a box may exist that we have no id for
     state: str = "unanswered"  # unanswered | refused | rented
     instance_id: int | None = None
@@ -271,6 +285,45 @@ def tagged(provider, run_id: str, policy: Policy, timeout: float | None = None) 
 
 
 # ---------------------------------------------------------------------- launch
+
+
+def priced_bids(vast, spec: Spec, found: list[dict]) -> list[dict]:
+    """Interruptible offers, each with what we would bid (`_bid`, at least the minimum,
+    rounded up) and what that costs an hour with the disk (`dph_total`; the disk's price
+    is what the offer's total says beyond its minimum bid). An offer that cannot be priced
+    so is left out, and so is any machine this account already has an instance on: two
+    bids of ours on one machine outbid each other. A listing row that does not say its
+    machine fails the launch rather than let such a bid through."""
+    ours = set()
+    for r in vast.instances():
+        if type(r.get("machine_id")) is not int:
+            raise v.VastError(200, f"instance {r.get('id')} is listed without its machine")
+        ours.add(r["machine_id"])
+    priced = []
+    for o in found:
+        min_bid, total = o.get("min_bid"), o["dph_total"]
+        if type(min_bid) not in (int, float) or not 0 < min_bid <= total < 1e4:
+            continue
+        if o["machine_id"] in ours:
+            continue
+        bid = max(min_bid, math.ceil(min_bid * spec.bid_markup * 1e4) / 1e4)
+        priced.append({**o, "_bid": bid, "dph_total": bid + (total - min_bid)})
+    return priced
+
+
+def candidates(vast, spec: Spec, blocked: dict[int, dict], want: int):
+    """(offers to try, in order; the offers within the price cap; those also in an allowed
+    country). What `up` rents from and `search` shows."""
+    found = vast.offers(v.offer_query(spec))
+    if spec.interruptible:
+        found = priced_bids(vast, spec, found)
+    # The search is asked for the price cap and the order; neither is taken
+    # on trust, since what comes back is what gets rented.
+    cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
+    found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
+    allowed = v.in_allowed_country(found, spec.exclude_countries)
+    return pol.select_offers(allowed, blocked, want), found, allowed
+
 
 # The phases of a rented box on its way to a verdict.
 PENDING = ("booting", "probing", "gating", "checking")
@@ -410,7 +463,10 @@ class Launch:
             healthy = sum(a.phase == "healthy" for a in self.attempts.values())
             short = f" ({healthy} of {policy.count} healthy)" if policy.count > 1 else ""
             if not self._possible(offers):
-                why = f"{policy.count} healthy boxes are no longer possible{short}"
+                want = (
+                    f"{policy.count} healthy boxes are" if policy.count > 1 else "a healthy box is"
+                )
+                why = f"{want} no longer possible{short}"
                 return self._give_up(image_said, why)
             out_of_time = time.monotonic() >= deadline
             if not out_of_time:
@@ -475,6 +531,12 @@ class Launch:
         return round(time.monotonic() - a.t0, 1)
 
     def _fail(self, a: Attempt, reason: str | None, detail: str) -> None:
+        if reason == "unreachable" and self.spec.interruptible and a.state == "rented":
+            # Lost while being admitted: if the provider does not say it still runs, it
+            # was most likely outbid, which is the market, not the machine.
+            answered, inst = self._lookup(a.instance_id)
+            if not answered or inst is None or self.provider.view(inst).state != "running":
+                reason, detail = None, f"{detail} (stopped: most likely outbid)"
         a.phase, a.reason, a.detail = "failed", reason, detail
         a.failed_at = time.monotonic()
         if reason and a.machine_id is not None:
@@ -564,7 +626,9 @@ class Launch:
                 detail = (
                     f"not reachable after {policy.startup_timeout:g}s (status={a.status}; {extra})"
                 )
-                self._fail(a, "unreachable", detail)
+                # An interruptible box that never got to run may simply have been outbid.
+                outbid = spec.interruptible and a.status != "running"
+                self._fail(a, None if outbid else "unreachable", detail)
             else:
                 self._fail(a, None, f"provider API gave no status for {policy.startup_timeout:g}s")
             return None
@@ -604,9 +668,13 @@ class Launch:
             # nor the stall rule counts this time. The launch's own deadline does.
             a.ready_from = a.changed_at = time.monotonic()
             return None
+        # An interruptible box that stops or never starts was most likely outbid:
+        # that is the market, not the machine.
+        blame = None if spec.interruptible else "unreachable"
         if view.state == "exited":
             # Our container command ends only when sshd could not be started.
-            self._fail(a, "unreachable", f"container exited during bootstrap ({a.msg[:120]})")
+            why = "outbid, or " if spec.interruptible else ""
+            self._fail(a, blame, f"container exited during bootstrap ({why}{a.msg[:120]})")
             return None
         if view.state != "running":
             quiet = time.monotonic() - a.changed_at
@@ -615,7 +683,7 @@ class Launch:
                 # long while: a pull that is stuck, or too slow to wait for.
                 self._fail(
                     a,
-                    "unreachable",
+                    blame,
                     f"stalled: status {a.status} unchanged for {quiet:.0f}s ({a.msg[:120]})",
                 )
             return None
@@ -659,6 +727,11 @@ class Launch:
                 self._fail(a, None, "passed the gate, then the box no longer existed")
             elif (view := self.provider.view(inst)).state != "running":
                 self._fail(a, None, f"passed the gate, then was {view.status}")
+            elif (ep := view.endpoint) is not None and ep != a.endpoint:
+                # It restarted somewhere else (an interruptible box resumed): what passed
+                # the gate is not what would be handed over. Admit it again.
+                log(f"  {a.tag_name} moved to {ep[0]}:{ep[1]}; checking it again")
+                a.phase, a.endpoint, a.check = "booting", None, None
             else:
                 chosen.append(a)
                 if len(chosen) == count:
@@ -690,6 +763,7 @@ class Launch:
                 dph=float(o["dph_total"]),
                 geo=str(o.get("geolocation") or ""),
                 gpu=o.get("gpu_name") if isinstance(o.get("gpu_name"), str) else None,
+                bid=o.get("_bid"),
             )
             self.attempts[seq] = a  # as unanswered: if the request is interrupted, it stays so
             try:
@@ -863,8 +937,14 @@ def explain_leftovers(provider, state: State, left: list[int] | None) -> None:
     log(f"  Run this again:   gpubox down --run-id {state.run}")
     log(f"  {provider.manual_hint(state.run, left or [])}")
     if when:
-        log(f"  If nothing is done, each box destroys itself when its lease ends, at {when},")
-        log("  and the reaper removes whatever is left after that.")
+        log(
+            f"  If nothing is done, each running box destroys itself when its lease ends, at {when}."
+        )
+        ns = state.run.split(".")[0]
+        stopped = "an interruptible box that was outbid" if state.meta.get("interruptible") else (
+            "one stuck before it ran")  # fmt: skip
+        log(f"  A box that is not running ({stopped}) cannot: after the lease, run")
+        log(f"  `gpubox reap --namespace {ns} --destroy`, as a scheduled job should anyway.")
 
 
 # ---------------------------------------------------------------------- reaper

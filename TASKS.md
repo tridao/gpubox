@@ -22,7 +22,7 @@ close the gaps found when comparing the two. Work them in order; each is one or 
   command line). Sent as Vast's `image_login`; the registry is taken from the image name.
   Use a read-only pull token: Vast and the host's docker daemon see it.
 
-## 3. N boxes in one run [R]
+## 3. N boxes in one run [R] (reviewed; checked on real boxes)
 
 - [x] `up --count N`: one run id, one race with `N + --spare` slots, all-or-nothing (a launch
   that cannot get N healthy boxes rolls back like today's). `--max-attempts` defaults to
@@ -32,7 +32,7 @@ close the gaps found when comparing the two. Work them in order; each is one or 
   writes one `Host` entry each. `gpubox status` prints the boxes (alias, address, lease).
   `run` takes `--box I` (`ssh`, `logs` will too); `renew` and `down` act on all of them.
 
-## 4. Detached jobs; ssh in [R] (live check pending: entrypoint override, env, detach)
+## 4. Detached jobs; ssh in [R] (reviewed; checked on real boxes)
 
 - [x] The container's environment (Docker `ENV`, Vast's variables) is saved by the bootstrap
   and loaded by every gpubox command on the box and by login shells, so `ssh` sees the
@@ -60,9 +60,9 @@ Partly done: the lease timer destroys a box when its lease ends, and writing a p
 - [x] `--min-cpus N`, `--min-ram-gb N` for the whole box (defaults as now: max(16, 8 per GPU)
   CPUs, 32 GB per GPU).
 
-## 7. Python API [R]
+## 7. Python API [R] (reviewed; used live for task 10)
 
-- [ ] `gpubox.api`: `up(spec, ...) -> Run` (context manager: `down` on exit unless told to keep),
+- [x] `gpubox.api`: `up(spec, ...) -> Run` (context manager: `down` on exit unless told to keep),
   `Run.boxes -> [Box]`, `Box.ssh_argv(cmd)`, `Box.start(script, env) -> Job`, `Job.wait()`,
   `Job.logs()`, `Run.renew(ttl)`, `Run.down()`, `down(run_id)`, `reap(namespace)`.
   Exceptions instead of exit codes; the CLI is a thin layer over it.
@@ -89,7 +89,7 @@ GitHub secrets, Doppler etc. all work the same way:
 - [x] Values travel over SSH stdin into a 0600 file in the job's directory, read by the job's
   shell and deleted as it starts; never into Vast's instance `env`, label or arguments.
 
-## 10. Interruptible instances [R]
+## 10. Interruptible instances [R] (done, checked on a real box; see DESIGN 5b)
 
 New problems they bring, and the answer to each:
 - An outbid box is stopped, not destroyed, and Vast keeps billing its disk; its container is

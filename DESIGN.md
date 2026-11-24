@@ -182,17 +182,27 @@ connection drops without that line, it asks the provider whether the box is
 still there and starts again from its offset. So every byte arrives once,
 however often the connection drops.
 
-A job is `lost` when its wrapper is gone and it has no exit code: the
-container restarted, or someone killed it. The wrapper is recognised by its
-pid and its start time, so a process that got its pid after a restart is not
-taken for it. The timeout is kept by the wrapper, on the box, so that it holds
-with nobody connected; it kills the job's process group (TERM, then KILL
-after 10 s) and the exit code is 124.
+The wrapper owns the job's end. At the timeout, kept on the box so that it
+holds with nobody connected, and on `gpubox kill`, which signals the wrapper
+rather than a remembered process group, it sends TERM to its child's process
+group, then KILL to whatever is left after 10 s, and only then writes the exit
+code (124 at the timeout). A job is `lost` when its wrapper is gone and it has
+no exit code: the container restarted, or someone killed the wrapper. A
+wrapper counts as alive by its pid, its start time (so a process that got its
+pid after a restart is not taken for it) and not being a zombie.
 
 The caller's variables go over SSH stdin into a 0600 file in the job's
-directory, which the wrapper reads and deletes before the script starts. They
-are on no command line, here or on the box, and not in the provider's
-instance settings.
+directory. Only the wrapper's child, which then execs the script, reads them,
+and deletes the file; nothing the caller passes can change what the wrapper
+does. They are on no command line, here or on the box, and not in the
+provider's instance settings. The start reports success only once the wrapper
+has started the script; otherwise it deletes the file and fails.
+
+The follower's status line counts only when it is whole and the follower
+exited cleanly: `exit 1` cut short may have been `exit 124`. A connection that
+brought output, or held for 30 s, ends an outage; `--reconnect-min` counts
+from there. Job ids are the start time to the millisecond, so the newest job
+is the last name.
 
 **The container's start.** gpubox sets the container's entrypoint to bash
 (Vast's `onstart` in the args launch mode, which is what its own CLI sends for
@@ -203,6 +213,41 @@ saves the container's environment, which sessions over SSH do not inherit, to
 `/etc/gpubox/env.sh` (POSIX syntax; login shells and every gpubox command on
 the box load it), and installs `gpubox-destroy-self`, which writes a past time
 to the expiry file: the lease timer destroys the box within 30 s.
+
+## 5b. Interruptible boxes
+
+`--interruptible` searches Vast's bid offers and bids `--bid-markup` times an
+offer's minimum bid, rounded up and never below it; the price cap and the
+cheapest-first order apply to the bid plus the disk, whose price is what the
+offer's total says beyond its minimum bid (an offer that cannot be priced so
+is not a candidate). `search` shows the same candidates. What changes:
+
+- An outbid box is stopped, not destroyed, and bills its disk; with its
+  container stopped, its lease timer cannot fire. `down` and the reaper
+  destroy it by tag whatever its state, so a scheduled
+  `reap --namespace NS --destroy` is the bound, and a teardown that could
+  not finish says so.
+- Being outbid is the market, not the machine: a box that exits, stalls, or
+  never reaches `running` within the start-up timeout fails without blame; so
+  does one that loses its connection while being admitted unless the provider
+  then says it still runs; and a stopped box is never recorded as `died`.
+- A healthy box waiting for the others may stop and resume elsewhere; the
+  last look before the hand-off sees its new address and admits it again.
+- The job dies with its container (Vast kills it 0.1 s after SIGTERM). When
+  the bid wins again the container restarts without it; `wait` sees the
+  wrapper gone and reports the job `lost`.
+- A resumed box may answer on another port. When SSH fails, the provider is
+  asked about the box; a running box's address is taken from the answer and
+  written to the state file (unless a teardown holds the directory).
+- Two of our own bids on one machine outbid each other, so machines the
+  account already has an instance on are skipped (a listing row that does
+  not say its machine fails the launch), and no launch races two offers of
+  one machine. Two launches in different state directories that start at the
+  same moment can still bid on one machine: the account's boxes are looked
+  at once, when a launch starts.
+- A start cut short by a stop leaves the job's variables on the box's disk:
+  the bootstrap deletes any it finds when the container starts again, and a
+  job directory that never got a wrapper is listed `lost` after a minute.
 
 ## 6. Teardown
 
@@ -323,6 +368,21 @@ and a full test suite on 2x RTX 5090.
 
 Not yet seen on a real box: a create that got no answer, a delete that did
 not take, and a provider subaccount.
+
+Also on real boxes (RTX 3060s, November 2026): an image whose ENTRYPOINT is
+`ffmpeg` started our sshd, so `onstart` does replace the entrypoint; a
+python:3.12-slim image passed the gate with its CUDA checks skipped; two boxes
+handed over together with the spare destroyed; the image's environment in SSH
+sessions; a job on each box with its index; a job followed across killed
+connections with every byte once and its exit code kept; Ctrl-C leaving the
+job running; the box ending a job at its timeout with nothing left of it; and
+`--destroy-after` (the instance gone 26 s after the job ended). Through the
+Python API: an interruptible box rented at 1.25 times the minimum bid; a job
+killed through its wrapper (143); a job with a child that ignores SIGTERM
+ended at its timeout (124), the child gone; and the box stopped through the
+API, as when outbid (`actual_status` exited, `intended_status` stopped): the
+wait ended as a lost box with nothing recorded as died, and once the box ran
+again its job was reported lost and the saved environment was there.
 
 ## 11. Considered, and decided against
 
