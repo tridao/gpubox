@@ -336,9 +336,10 @@ def test_the_key_comes_from_the_environment_or_the_keys_file(tmp_path, monkeypat
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     s = api.Settings(state_dir=tmp_path, provider="runpod", keys_file=str(keys))
     provider = s.named_provider()
-    assert isinstance(provider, rp.RunPod) and provider.client.key == "r-key"
+    auth = lambda p: p.client.headers["Authorization"]
+    assert isinstance(provider, rp.RunPod) and auth(provider) == "Bearer r-key"
     monkeypatch.setenv("RUNPOD_API_KEY", "from-env")
-    assert s.named_provider().client.key == "from-env"
+    assert auth(s.named_provider()) == "Bearer from-env"
     s = api.Settings(state_dir=tmp_path, provider="runpod", keys_file=str(tmp_path / "none"))
     monkeypatch.delenv("RUNPOD_API_KEY")
     with pytest.raises(ConfigError, match="RUNPOD_API_KEY"):
@@ -349,6 +350,8 @@ def test_every_provider_says_what_it_can_do():
     for kind in providers.KINDS.values():
         assert kind.access in ("ssh", "srun", "vm") and kind.spawn in ("setsid", "runner")
         assert type(kind.self_destroy) is bool and type(kind.observes_machines) is bool
+        assert kind.lease in ("box", "provider", "reaper")
+        assert kind.lease != "box" or kind.self_destroy  # a timer in the box must be able to
         assert kind.features <= set(providers.FEATURES)
         assert type(kind.default_spare) is int and isinstance(kind.noun, str)
     with pytest.raises(ConfigError, match="not on runpod: an interruptible box"):

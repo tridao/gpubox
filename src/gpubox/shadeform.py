@@ -32,14 +32,10 @@ from __future__ import annotations
 
 import base64
 import calendar
-import http.client
-import json
 import re
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
+from . import httpapi
 from . import provider as prov
 from . import vmbox
 from .errors import ConfigError
@@ -58,44 +54,9 @@ class ShadeformError(prov.ProviderError):
     pass
 
 
-class Client:
-    """Shadeform's REST API, standard library only."""
-
-    def __init__(self, key: str, base: str = API_BASE, timeout: float = 30):
-        self.key, self.base, self.timeout = key, base, timeout
-
-    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None):
-        timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
-        url = f"{self.base}/{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        headers = {"X-API-KEY": self.key, "Accept": "application/json", "User-Agent": "gpubox"}
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode()
-            headers["Content-Type"] = "application/json"
-        for attempt in range(retries + 1):
-            req = urllib.request.Request(url, data=data, method=method, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    raw = resp.read()
-                    return json.loads(raw) if raw.strip() else None
-            except urllib.error.HTTPError as exc:
-                try:
-                    text = " ".join(exc.read().decode(errors="replace").split())[:300]
-                except Exception:
-                    text = ""
-                if (exc.code == 429 or exc.code >= 500) and attempt < retries:
-                    time.sleep(2**attempt)
-                    continue
-                msg = f"{method} /{path}: HTTP {exc.code}: {text or 'no details'}"
-                raise ShadeformError(exc.code, msg) from None
-            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-                if attempt < retries:
-                    time.sleep(2**attempt)
-                    continue
-                raise ShadeformError(0, f"{method} /{path}: {exc}") from None
-        raise AssertionError("unreachable")
+def Client(key: str, base: str = API_BASE, timeout: float = 30):
+    """Shadeform's REST API (httpapi.Client): its errors are ShadeformError."""
+    return httpapi.Client(base, {"X-API-KEY": key}, ShadeformError, timeout)
 
 
 def os_cuda(name: str) -> float | None:
@@ -133,6 +94,7 @@ class Shadeform:
     spawn = "setsid"
     own_sshd = False
     self_destroy = False
+    lease = "provider"  # auto_delete
     observes_machines = False
     default_spare = 1
     features = frozenset({"image", "price_cap", "any_gpu"})

@@ -27,15 +27,11 @@ to it before anything is rented.
 
 from __future__ import annotations
 
-import http.client
-import json
 import math
 import re
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
+from . import httpapi
 from . import provider as prov
 from . import vast as v
 from .errors import ConfigError
@@ -55,64 +51,9 @@ class RunpodError(prov.ProviderError):
     pass
 
 
-class Client:
-    """RunPod's REST API v2, standard library only. Answers are parsed, never trusted:
-    callers check their shape."""
-
-    def __init__(self, key: str, base: str = API_BASE, timeout: float = 20):
-        self.key, self.base, self.timeout = key, base, timeout
-
-    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None):
-        """The parsed JSON answer (None for an empty one), or RunpodError with the HTTP
-        status (0: no answer). `retries` only for calls that can safely be repeated."""
-        timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
-        url = f"{self.base}/{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        headers = {
-            "Authorization": f"Bearer {self.key}",
-            "Accept": "application/json",
-            "User-Agent": "gpubox",
-        }
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode()
-            headers["Content-Type"] = "application/json"
-        for attempt in range(retries + 1):
-            req = urllib.request.Request(url, data=data, method=method, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    raw = resp.read()
-                    return json.loads(raw) if raw.strip() else None
-            except urllib.error.HTTPError as exc:
-                try:
-                    text = exc.read().decode(errors="replace")
-                except Exception:
-                    text = ""
-                if (exc.code == 429 or exc.code >= 500) and attempt < retries:
-                    time.sleep(2**attempt)
-                    continue
-                raise RunpodError(
-                    exc.code, f"{method} /{path}: HTTP {exc.code}: {_why(text)}"
-                ) from None
-            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-                if attempt < retries:
-                    time.sleep(2**attempt)
-                    continue
-                raise RunpodError(0, f"{method} /{path}: {exc}") from None
-        raise AssertionError("unreachable")
-
-
-def _why(text: str) -> str:
-    """What a v2 error answer says: its title and detail, else the start of the body."""
-    try:
-        err = json.loads(text)
-        if isinstance(err, dict) and ("detail" in err or "title" in err):
-            more = "; ".join(map(str, err.get("errors") or []))
-            return " ".join(f"{err.get('title', '')}: {err.get('detail', '')} {more}".split())[:300]
-    except ValueError:
-        pass
-    return " ".join(text.split())[:300] or "no details"
+def Client(key: str, base: str = API_BASE, timeout: float = 20):
+    """RunPod's REST API v2 (httpapi.Client): its errors are RunpodError."""
+    return httpapi.Client(base, {"Authorization": f"Bearer {key}"}, RunpodError, timeout)
 
 
 def _compact(text) -> str:
@@ -136,6 +77,7 @@ class RunPod:
     spawn = "setsid"
     own_sshd = True
     self_destroy = True  # with the pod's own key (DESTROY)
+    lease = "box"
     observes_machines = False  # v2 names no machine
     default_spare = 1
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})

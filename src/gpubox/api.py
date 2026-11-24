@@ -356,6 +356,12 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
         }  # fmt: skip
         if provider.name != "vast":
             meta.update(provider=provider.name, options=provider.options())
+        if provider.lease == "reaper":
+            log(
+                f"NOTE: a box on {provider.name} cannot end itself and {provider.name} keeps no "
+                "expiry: only `gpubox down`, or a scheduled `gpubox reap --namespace "
+                f"{namespace} --destroy`, ends it if this run is left behind"
+            )
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
         begun.append(run_id)
         log(f"run {run_id}")

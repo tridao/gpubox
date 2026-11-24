@@ -14,6 +14,9 @@ Each provider class (provider.py describes the calls) also says, as class attrib
                       that the image did not run our start-up command
     self_destroy      a box can end itself (its lease timer, `run --destroy-after`)
                       without an account-wide key on it
+    lease             what ends a box when its lease does: "box" (its own timer),
+                      "provider" (an expiry the provider keeps), or "reaper" (nothing
+                      but `down` and a scheduled `reap`: `up` says so)
     observes_machines its machine ids mean the same machine from run to run, so the
                       blocklist and the reputation store apply
     default_spare     boxes raced beyond the count unless asked otherwise

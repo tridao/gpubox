@@ -480,6 +480,7 @@ class VastProvider:
     # shows that the image did not run our start-up command.
     own_sshd = True
     self_destroy = True  # with the container's own key (bootstrap_script)
+    lease = "box"
     observes_machines = True
     default_spare = 1
     features = frozenset(
