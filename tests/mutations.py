@@ -1401,8 +1401,8 @@ MUTATIONS = [
      'how_to_finish_it_on_this_provider'),
     ('a Hyperstack page whose count says otherwise is believed',
      'hyperstack.py',
-     '                count is not None and count != len(batch)',
-     '                False',
+     '                or (count is not None and count != len(batch))',
+     '                or False',
      'says_otherwise_than_it_shows'),
 ]
 # fmt: on
