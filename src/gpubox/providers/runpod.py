@@ -32,9 +32,11 @@ import re
 import time
 
 from . import httpapi
-from . import provider as prov
-from . import vast as v
-from .errors import ConfigError
+from . import base as prov
+from .base import gpu_matches
+from ..onbox import set_expiry_command
+from . import container
+from ..errors import ConfigError
 
 API_BASE = "https://api.runpod.io/v2"
 MAX_PAGES = 50
@@ -54,17 +56,6 @@ class RunpodError(prov.ProviderError):
 def Client(key: str, base: str = API_BASE, timeout: float = 20):
     """RunPod's REST API v2 (httpapi.Client): its errors are RunpodError."""
     return httpapi.Client(base, {"Authorization": f"Bearer {key}"}, RunpodError, timeout)
-
-
-def _compact(text) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
-
-
-def gpu_matches(asked: str, *names) -> bool:
-    """A model asked for, as a person writes it ("RTX 4090", "H100 SXM"), against
-    RunPod's ids and names ("NVIDIA GeForce RTX 4090", "NVIDIA H100 80GB HBM3")."""
-    needle = _compact(asked)
-    return bool(needle) and any(needle in _compact(n) for n in names if n)
 
 
 class RunPod:
@@ -179,7 +170,7 @@ class RunPod:
             "disk": spec.disk_gb,
             # Our start-up command replaces the image's ENTRYPOINT, as on Vast.
             "entrypoint": ["bash"],
-            "cmd": ["-c", v.bootstrap_script(pubkey, expiry, destroy=DESTROY)],
+            "cmd": ["-c", container.bootstrap_script(pubkey, expiry, DESTROY)],
             "ports": ["22/tcp"],
             "env": {"RUNPOD_POD_USER": "0"},  # run as root, as dstack does
         }
@@ -286,7 +277,7 @@ class RunPod:
         return prov.View("loading", status, "" if status != "RUNNING" else "no SSH address yet")
 
     def expiry_command(self, expiry: int) -> str:
-        return v.set_expiry_command(expiry)
+        return set_expiry_command(expiry)
 
     def manual_hint(self, run_id: str, ids) -> str:
         return (

@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 from fakes import FAST, OTHER_RUN, FakeCheck, FakeProber, FakeVast, foreign_untouched
 
+from gpubox import onbox
 from gpubox import api, cli, gate, job
 from gpubox import policy as pol
-from gpubox import vast as v
+from gpubox.providers import vast as v
 from gpubox.state import State, make_tag, parse_tag, state_lock
 
 REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
@@ -604,7 +605,7 @@ def test_renew_moves_the_lease(world, tmp_path, capsys):
     after = parse_tag(vast.live[iid]["label"]).expiry
     assert 598 * 60 < after - time.time() <= 600 * 60 and after > before
     assert State.load(tmp_path).expiry == after
-    assert vast.probers[-1].ran[-1][1] == v.set_expiry_command(after)
+    assert vast.probers[-1].ran[-1][1] == onbox.set_expiry_command(after)
     assert "lease now ends" in capsys.readouterr().out
     assert run(["down"]) == 0 and vast.ours() == []
 
@@ -1030,7 +1031,7 @@ def test_a_job_can_destroy_its_box_when_it_ends(world, tmp_path, local_box, monk
     helper = tmp_path / "destroy-self"
     helper.write_text(f"#!/bin/sh\ntouch {marker}\n")
     helper.chmod(0o755)
-    monkeypatch.setattr(cli.v, "DESTROY_SELF", str(helper))
+    monkeypatch.setattr(onbox, "DESTROY_SELF", str(helper))
     assert run([*job_script(tmp_path, "exit 9\n"), "--destroy-after"]) == 9
     deadline = time.monotonic() + 5
     while not marker.exists() and time.monotonic() < deadline:

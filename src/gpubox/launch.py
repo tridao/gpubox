@@ -33,15 +33,15 @@ answers are well formed, or that one host is right about the image.
 from __future__ import annotations
 
 import collections
-import math
 import re
 import time
 from dataclasses import dataclass, field
 
 from . import policy as pol
-from . import provider as prov
+from .providers import base as prov
 from .errors import ConfigError
-from . import vast as v
+from . import onbox
+from .providers.container import classify_status
 from .gate import GATE_VERSION
 from .state import State, make_tag, parse_tag
 
@@ -299,44 +299,6 @@ def tagged(provider, run_id: str, policy: Policy, timeout: float | None = None) 
 
 
 # ---------------------------------------------------------------------- launch
-
-
-def priced_bids(vast, spec: Spec, found: list[dict]) -> list[dict]:
-    """Interruptible offers, each with what we would bid (`_bid`, at least the minimum,
-    rounded up) and what that costs an hour with the disk (`dph_total`; the disk's price
-    is what the offer's total says beyond its minimum bid). An offer that cannot be priced
-    so is left out, and so is any machine this account already has an instance on: two
-    bids of ours on one machine outbid each other. A listing row that does not say its
-    machine fails the launch rather than let such a bid through."""
-    ours = set()
-    for r in vast.instances():
-        if type(r.get("machine_id")) is not int:
-            raise v.VastError(200, f"instance {r.get('id')} is listed without its machine")
-        ours.add(r["machine_id"])
-    priced = []
-    for o in found:
-        min_bid, total = o.get("min_bid"), o["dph_total"]
-        if type(min_bid) not in (int, float) or not 0 < min_bid <= total < 1e4:
-            continue
-        if o["machine_id"] in ours:
-            continue
-        bid = max(min_bid, math.ceil(min_bid * spec.bid_markup * 1e4) / 1e4)
-        priced.append({**o, "_bid": bid, "dph_total": bid + (total - min_bid)})
-    return priced
-
-
-def candidates(vast, spec: Spec, blocked: dict[int, dict], want: int):
-    """(offers to try, in order; the offers within the price cap; those also in an allowed
-    country). What `up` rents from and `search` shows."""
-    found = vast.offers(v.offer_query(spec))
-    if spec.interruptible:
-        found = priced_bids(vast, spec, found)
-    # The search is asked for the price cap and the order; neither is taken
-    # on trust, since what comes back is what gets rented.
-    cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
-    found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
-    allowed = v.in_allowed_country(found, spec.exclude_countries)
-    return pol.select_offers(allowed, blocked, want), found, allowed
 
 
 # The phases of a rented box on its way to a verdict.
@@ -614,9 +576,9 @@ class Launch:
                 return None
             a.check = None
             ok, a.ssh_err = result
-            if not ok and self.provider.access == "vm" and v.classify_status(a.ssh_err) == "image":
+            if not ok and self.provider.access == "vm" and classify_status(a.ssh_err) == "image":
                 # The box said its image could not be pulled (a VM box's probe reports
-                # its docker pull, vmbox.py): as a host's word on Vast, two settle it.
+                # its docker pull, providers/vmbox.py): as a host's word on Vast, two settle it.
                 said = f"image {spec.image!r} cannot be pulled: {a.ssh_err[-200:]}"
                 self._fail(a, None, said)
                 return said
@@ -1040,7 +1002,7 @@ def renew(provider, state: State, prober, expiry: int) -> None:
     boxes = state.winners
     if not boxes:
         raise ConfigError("this run has no box to renew")
-    v.check_expiry(expiry)
+    onbox.check_expiry(expiry)
     # Only a timer in the box reads the file; a lease the provider keeps moves with the tag.
     on_box = getattr(provider, "lease", "box") == "box"
     for i, w in enumerate(boxes if on_box else []):

@@ -4,7 +4,7 @@ import pytest
 
 from gpubox import api, providers
 from gpubox import launch as L
-from gpubox import runpod as rp
+from gpubox.providers import runpod as rp
 from gpubox.errors import ConfigError
 
 
@@ -48,7 +48,7 @@ def test_an_authenticated_call_is_not_redirected():
     import http.server
     import threading
 
-    from gpubox import httpapi
+    from gpubox.providers import httpapi
 
     class Redirect(http.server.BaseHTTPRequestHandler):
         def do_GET(self):

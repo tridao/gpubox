@@ -33,11 +33,11 @@ import re
 import time
 
 from . import httpapi
-from . import provider as prov
+from . import base as prov
 from . import vmbox
-from .errors import ConfigError
-from .runpod import gpu_matches
-from .state import parse_tag
+from ..errors import ConfigError
+from .base import gpu_matches
+from ..state import parse_tag
 
 API_BASE = "https://infrahub-api.nexgencloud.com/v1"
 PAGE = 100

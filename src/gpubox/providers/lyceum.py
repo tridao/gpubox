@@ -25,9 +25,9 @@ from __future__ import annotations
 import re
 
 from . import httpapi
-from . import provider as prov
-from .errors import ConfigError
-from .runpod import gpu_matches
+from . import base as prov
+from ..errors import ConfigError
+from .base import gpu_matches
 
 API_BASE = "https://api.lyceum.technology/api/v2/external"
 GONE = ("terminated", "deleted")

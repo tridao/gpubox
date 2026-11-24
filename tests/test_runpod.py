@@ -11,8 +11,8 @@ from fakes import FAST, FakeCheck
 
 from gpubox import cli
 from gpubox import launch as L
-from gpubox import provider as prov
-from gpubox import runpod as rp
+from gpubox.providers import base as prov
+from gpubox.providers import runpod as rp
 from gpubox.errors import ConfigError
 from gpubox.state import State, make_tag, parse_tag
 

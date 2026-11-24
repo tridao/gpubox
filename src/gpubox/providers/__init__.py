@@ -1,6 +1,6 @@
 """The providers gpubox knows, and what each can do.
 
-Each provider class (provider.py describes the calls) also says, as class attributes:
+Each provider class (base.py describes the calls) also says, as class attributes:
 
     name, noun        "runpod", "pod"
     credential        the environment variable with its API key (None: it needs none),
@@ -38,7 +38,7 @@ that every class declares the above.
 from __future__ import annotations
 
 from . import hyperstack, lyceum, massed, runpod, shadeform, slurm, vast
-from .errors import ConfigError
+from ..errors import ConfigError
 
 KINDS = {
     k.name: k

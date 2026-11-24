@@ -25,7 +25,7 @@ The API key is `api_key`, else VASTAI_API_KEY, else the line `VASTAI_API_KEY=...
 `keys_file`. `account_id` (else GPUBOX_ACCOUNT_ID) pins the account: a key of another
 one is refused before anything is rented or destroyed.
 
-Other providers (providers.py): `provider="runpod"` (its key RUNPOD_API_KEY, as for
+Other providers (providers/): `provider="runpod"` (its key RUNPOD_API_KEY, as for
 Vast), or `provider="slurm"` with `options={"login": HOST, ...}` (`slurm.Slurm`'s
 settings: partition, account, qos, constraint, sbatch_args). `options` are a
 provider's own settings (RunPod: {"cloud": "COMMUNITY"}). A run remembers where its
@@ -50,15 +50,15 @@ from . import job as jobs
 from . import launch as L
 from . import policy as pol
 from . import providers
-from . import slurm as sl
 from . import sshconfig
-from . import vmbox
 from . import store as st
-from . import vast as v
+from .providers import slurm as sl
+from .providers import vast as v
+from .providers import vmbox
 from .errors import BoxLost, ConfigError, GpuboxError, InfraError, JobLost, NoBoxes, NoSuchJob
 from .errors import TeardownIncomplete
 from .gate import GATE_VERSION, Prober
-from .provider import ProviderError
+from .providers.base import ProviderError
 from .launch import Policy, Spec, log
 from .state import NAMESPACE, RUN_ID, State, StateError, box_name, new_run_id, state_lock
 
@@ -145,7 +145,7 @@ class Settings:
         )
 
     def named_provider(self):
-        """The provider these settings name (provider.py)."""
+        """The provider these settings name (providers/base.py)."""
         return self._make(providers.kind(self.provider), dict(self.options or {}))
 
     def provider_of(self, meta: dict):
@@ -376,7 +376,7 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
             share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
             blocked = pol.blocklist(known_rows(obs, shared), time.time())
         else:
-            # Its machine ids, if any, are not comparable from run to run (providers.py).
+            # Its machine ids, if any, are not comparable from run to run (providers/__init__.py).
             obs, shared, blocked = None, None, {}
         if provider.access == "srun":
             prober = sl.SlurmProber()
@@ -485,7 +485,7 @@ def search(spec: Spec, *, want: int = 2, state_dir=None, **settings):
     shared = s.shared()
     share(shared, "search")
     blocked = pol.blocklist(known_rows(obs, shared), time.time())
-    offers, _, _ = L.candidates(s.vast(), spec, blocked, want)
+    offers, _, _ = v.candidates(s.vast(), spec, blocked, want)
     return offers, blocked
 
 
@@ -516,7 +516,7 @@ class Run:
 
     @property
     def provider(self):
-        """Where the run's boxes came from (provider.py)."""
+        """Where the run's boxes came from (providers/base.py)."""
         return self.settings.provider_of(self._meta)
 
     def _live(self) -> State:

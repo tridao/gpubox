@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from fakes import EXPIRY, FAST, RUN_ID, SPEC, FakeProber, FileVast  # noqa: E402
 
 from gpubox.launch import Launch, Policy  # noqa: E402
-from gpubox.vast import VastProvider  # noqa: E402
+from gpubox.providers.vast import VastProvider  # noqa: E402
 from gpubox.state import State, state_lock  # noqa: E402
 
 state_dir, cue = Path(sys.argv[1]), sys.argv[2]

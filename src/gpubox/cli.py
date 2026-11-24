@@ -24,10 +24,10 @@ The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
 
-`--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, runpod.py),
-`--provider shadeform` VMs on Shadeform's clouds (SHADEFORM_API_KEY, shadeform.py,
-vmbox.py), and `--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
-holding an allocation, reached with `ssh HOST srun --jobid ...` (slurm.py), whose
+`--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, providers/runpod.py),
+`--provider shadeform` VMs on Shadeform's clouds (SHADEFORM_API_KEY,
+providers/shadeform.py and vmbox.py), and `--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
+holding an allocation, reached with `ssh HOST srun --jobid ...` (providers/slurm.py), whose
 account is `user@cluster`. `up`, `search`, `down --run-id` and `reap` take these
 options; the other commands read them from the run's state file. Keys are read from
 the environment, else from ~/.config/gpu-cloud-query/keys.env.
@@ -52,7 +52,7 @@ from pathlib import Path
 from . import api
 from . import job
 from . import providers
-from . import vast as v
+from .providers import vast as v
 from .api import LOCAL_KEYS_FILE, Prefixed, advisory, key_dir  # noqa: F401 (part of the CLI's surface)
 from .errors import ConfigError, GpuboxError, InfraError, NoBoxes, TeardownIncomplete
 from .launch import Policy, Result, Spec, log

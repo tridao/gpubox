@@ -36,9 +36,10 @@ reaper see only this:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from .errors import ConfigError, InfraError
+from ..errors import ConfigError, InfraError
 
 __all__ = ["ConfigError", "CreateRefused", "CreateUnknown", "ProviderError", "View"]
 
@@ -86,3 +87,14 @@ class View:
     problem: str | None = None
     endpoint: tuple | None = None
     machine: object = None
+
+
+def _compact(text) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def gpu_matches(asked: str, *names) -> bool:
+    """A model asked for, as a person writes it ("RTX 4090", "H100 SXM"), against
+    RunPod's ids and names ("NVIDIA GeForce RTX 4090", "NVIDIA H100 80GB HBM3")."""
+    needle = _compact(asked)
+    return bool(needle) and any(needle in _compact(n) for n in names if n)

@@ -9,33 +9,21 @@ from __future__ import annotations
 
 import http.client
 import json
-import re
+import math
 import shlex
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import provider as prov
+from .. import policy as pol
+from ..onbox import set_expiry_command
+from . import base as prov
+from . import container
+from .container import classify_status
 
 API_BASE = "https://console.vast.ai/api"
 MAX_PAGES = 400  # 10,000 instances; a listing longer than this is a loop
-
-# status_msg substrings. An image problem is ours and identical on every host;
-# a runtime problem belongs to the machine.
-IMAGE_ERRORS = (
-    "manifest unknown",
-    "pull access denied",
-    "repository does not exist",
-    "authentication required",
-)
-MACHINE_ERRORS = (
-    "oci runtime create failed",
-    "failed to create shim",
-    "nvidia-container-cli",
-    "no space left on device",
-)
-_CDI = re.compile(r"\bCDI\b")
 
 
 class VastError(prov.ProviderError):
@@ -283,118 +271,18 @@ SELF_DESTROY = (
 )
 
 
-EXPIRY_FILE = "/etc/gpubox-expiry"
-# The run's key goes into a file of our own, and sshd is told to read only that.
-# /root/.ssh/authorized_keys is not ours to rely on: on a real box Vast was seen to
-# replace it with the account's registered key as the container started, which locked
-# the launcher out of an image whose sshd was up within the first second.
-KEYS_FILE = "/etc/ssh/gpubox_authorized_keys"
+DESTROY = f"python3 -c {shlex.quote(SELF_DESTROY)}"
 
 
-def check_expiry(expiry) -> None:
-    if type(expiry) is not int or not 0 < expiry < 10**10:
-        raise ValueError(f"bad expiry {expiry!r}")
-
-
-def set_expiry_command(expiry: int) -> str:
-    """Shell for the box: move the time at which its timer destroys it (see `renew`)."""
-    check_expiry(expiry)
-    return f"echo {expiry} > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE}"
-
-
-# The container's environment (Docker's ENV, Vast's variables), saved for what runs
-# over SSH, which does not inherit it: login shells load it, and so does every
-# command gpubox runs on the box (job.LOAD_ENV). POSIX syntax, so sh can read it.
-ENV_FILE = "/etc/gpubox/env.sh"
-# Written afresh and renamed into place, so it is 0600 whatever the image had there.
-SAVE_ENV = (
-    "(unset HOME PWD OLDPWD SHLVL _ HOSTNAME TERM SHELL USER LOGNAME MAIL; set -o posix; "
-    f"umask 077; rm -f {ENV_FILE}.tmp; export -p > {ENV_FILE}.tmp && mv {ENV_FILE}.tmp {ENV_FILE})"
-)
-# Loads it into a shell on the box. POSIX sh: root's login shell, which runs what ssh
-# is asked to run, need not be bash.
-LOAD_ENV = f"[ -r {ENV_FILE} ] && . {ENV_FILE}; "
-# A job ends its own box with this: the lease timer, which reads the expiry file
-# every 30 s, then destroys it. One way to destroy a box from inside, not two.
-DESTROY_SELF = "/usr/local/bin/gpubox-destroy-self"
-DESTROY_SELF_SCRIPT = (
-    "#!/bin/sh",
-    "# Ends this box: its lease timer destroys it within 30 s.",
-    f"echo 1 > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE} &&",
-    'echo "gpubox: this box will be destroyed within 30 s" >&2',
-)
-
-
-def bootstrap_script(pubkey: str, expiry: int, destroy: str | None = None) -> str:
-    """The container's command, as one line of bash: a self-destruct timer, then the
-    container's environment saved, the self-destroy helper installed, and sshd for our key.
-
-    `destroy` is the shell command with which the box deletes itself, with a key the
-    provider gives that one container: Vast's (the default) or RunPod's (runpod.py).
-
-    The timer is a dead-man switch that needs neither the launcher nor our API
-    key. It has to destroy the instance: merely exiting does not stop the
-    billing, because Vast restarts a container whose main process ends. It is
-    part of the create request, so even a box whose create response we never
-    saw carries it. One line, because Vast passes this as `docker run` arguments.
-
-    It is started first, so a box stuck installing sshd is covered. It waits
-    for an absolute time, so a container that restarts does not start counting
-    again. That time is read from a file on the box, which `renew` rewrites;
-    the file is created with the expiry of the create request unless it is
-    already there (a restart must not undo a renewal), and anything in it
-    that is not a number of at most ten digits falls back to that first expiry. Once the time has
-    passed, the delete is sent every 30 s for as long as the timer runs,
-    whatever the answers say: if it works, the loop ends with the box.
-
-    It is the container's entrypoint (`create_payload`), so an image's own
-    ENTRYPOINT does not run first; a job that wants it runs it itself.
-    """
-    check_expiry(expiry)
-    destroy = destroy or f"python3 -c {shlex.quote(SELF_DESTROY)}"
-    watchdog = (
-        f"[ -f {EXPIRY_FILE} ] || echo {expiry} > {EXPIRY_FILE}; "
-        f"(while :; do e=$(cat {EXPIRY_FILE} 2>/dev/null); "
-        # Empty, not a number, or longer than a time: bash could not compare it.
-        f'case "$e" in ""|*[!0-9]*|???????????*) e={expiry};; esac; '
-        f'if [ "$(date +%s)" -ge "$e" ]; then'
-        f" {destroy}; fi; sleep 30; done) >/dev/null 2>&1 &"
-    )
-    script = (
-        watchdog
-        + " "
-        + "; ".join(
-            [
-                "set -eu",
-                "if ! command -v sshd >/dev/null 2>&1; then apt-get update -qq"
-                " && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq"
-                " --no-install-recommends openssh-server; fi",
-                "mkdir -p /run/sshd /etc/ssh /etc/gpubox /etc/profile.d /usr/local/bin",
-                SAVE_ENV,
-                # The variables of a job whose start the container stopped under, the only
-                # ones still on disk: a started job deletes its own at once.
-                'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
-                f"echo {shlex.quote(f'[ -r {ENV_FILE} ] && . {ENV_FILE}')}"
-                " > /etc/profile.d/gpubox-env.sh",
-                "printf '%s\\n' "
-                + " ".join(shlex.quote(line) for line in DESTROY_SELF_SCRIPT)
-                + f" > {DESTROY_SELF}",
-                f"chmod 755 {DESTROY_SELF}",
-                f"printf '%s\\n' {shlex.quote(pubkey)} > {KEYS_FILE}",
-                f"chmod 600 {KEYS_FILE}",
-                "ssh-keygen -A >/dev/null",
-                "exec /usr/sbin/sshd -D -e"
-                " -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no"
-                f" -o AuthorizedKeysFile={KEYS_FILE}",
-            ]
-        )
-    )
-    return script
+def bootstrap_script(pubkey: str, expiry: int) -> str:
+    """Vast's box: the container's start-up command (container.py), deleting itself with
+    the container's own key."""
+    return container.bootstrap_script(pubkey, expiry, DESTROY)
 
 
 def bootstrap_command(pubkey: str, expiry: int) -> str:
     """The bootstrap as one shell command line, for a person to read or run."""
-    return "bash -c " + shlex.quote(bootstrap_script(pubkey, expiry))
+    return container.bootstrap_command(pubkey, expiry, DESTROY)
 
 
 def registry_of(image: str) -> str:
@@ -445,16 +333,6 @@ def in_allowed_country(offers: list[dict], excluded) -> list[dict]:
     return [o for o in offers if country_of(o) not in excluded]
 
 
-def classify_status(msg: str) -> str | None:
-    """'image', 'machine', or None for a status message that decides nothing."""
-    low = msg.lower()
-    if any(s in low for s in IMAGE_ERRORS):
-        return "image"
-    if any(s in low for s in MACHINE_ERRORS) or _CDI.search(msg):
-        return "machine"
-    return None
-
-
 def endpoint_of(instance: dict) -> tuple[str, int] | None:
     """Where the box's sshd is, or None if the row does not say so in a form we can use.
     A row we cannot read is one box's problem, never an error for the whole launch."""
@@ -465,6 +343,44 @@ def endpoint_of(instance: dict) -> tuple[str, int] | None:
         return None
     usable = ip and not ip.startswith("-") and not any(c.isspace() for c in ip)
     return (ip, port) if usable and 0 < port < 65536 else None
+
+
+def priced_bids(vast, spec, found: list[dict]) -> list[dict]:
+    """Interruptible offers, each with what we would bid (`_bid`, at least the minimum,
+    rounded up) and what that costs an hour with the disk (`dph_total`; the disk's price
+    is what the offer's total says beyond its minimum bid). An offer that cannot be priced
+    so is left out, and so is any machine this account already has an instance on: two
+    bids of ours on one machine outbid each other. A listing row that does not say its
+    machine fails the launch rather than let such a bid through."""
+    ours = set()
+    for r in vast.instances():
+        if type(r.get("machine_id")) is not int:
+            raise VastError(200, f"instance {r.get('id')} is listed without its machine")
+        ours.add(r["machine_id"])
+    priced = []
+    for o in found:
+        min_bid, total = o.get("min_bid"), o["dph_total"]
+        if type(min_bid) not in (int, float) or not 0 < min_bid <= total < 1e4:
+            continue
+        if o["machine_id"] in ours:
+            continue
+        bid = max(min_bid, math.ceil(min_bid * spec.bid_markup * 1e4) / 1e4)
+        priced.append({**o, "_bid": bid, "dph_total": bid + (total - min_bid)})
+    return priced
+
+
+def candidates(vast, spec, blocked: dict[int, dict], want: int):
+    """(offers to try, in order; the offers within the price cap; those also in an allowed
+    country). What `up` rents from and `search` shows."""
+    found = vast.offers(offer_query(spec))
+    if spec.interruptible:
+        found = priced_bids(vast, spec, found)
+    # The search is asked for the price cap and the order; neither is taken
+    # on trust, since what comes back is what gets rented.
+    cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
+    found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
+    allowed = in_allowed_country(found, spec.exclude_countries)
+    return pol.select_offers(allowed, blocked, want), found, allowed
 
 
 class VastProvider:
@@ -501,8 +417,6 @@ class VastProvider:
         return {}
 
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
-        from .launch import candidates  # the launcher's, which `search` shows too
-
         if not spec.gpus:
             raise ValueError("a Vast search needs at least one GPU model")
         offers, found, allowed = candidates(self.client, spec, blocked, policy.max_live)

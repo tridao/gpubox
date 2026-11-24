@@ -7,8 +7,8 @@ from fakes import FAST
 from test_shadeform import VmProber
 
 from gpubox import launch as L
-from gpubox import lyceum as ly
-from gpubox import provider as prov
+from gpubox.providers import lyceum as ly
+from gpubox.providers import base as prov
 from gpubox.errors import ConfigError
 from gpubox.state import State, make_tag, parse_tag
 
@@ -160,7 +160,7 @@ def test_a_vm_runs_for_us_as_lyceum_once_ready_with_an_address():
 
 def test_a_launch_starts_the_box_through_its_first_probe_and_down_ends_it(tmp_path):
     from gpubox import api as gapi
-    from gpubox import vmbox
+    from gpubox.providers import vmbox
 
     p, api = make()
     assert not ly.Lyceum.startup_script  # the cloud runs nothing of ours at boot
@@ -177,7 +177,7 @@ def test_a_launch_starts_the_box_through_its_first_probe_and_down_ends_it(tmp_pa
 
 def test_up_gives_the_probe_the_script_where_the_cloud_cannot_run_it(tmp_path, monkeypatch):
     from gpubox import api as gapi
-    from gpubox import vmbox
+    from gpubox.providers import vmbox
 
     seen = {}
 

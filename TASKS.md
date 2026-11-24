@@ -126,7 +126,7 @@ A task fleet could also run on a cluster. First a general provider, then what th
 ## 12. More providers
 
 Providers to add, in this order.
-- [x] The groundwork: each provider declares what it can do (`providers.py`); keys from the
+- [x] The groundwork: each provider declares what it can do (`providers/`); keys from the
   environment or that file; ids that are tokens.
 - [x] RunPod (REST API v2): pods as boxes, the same bootstrap as Vast, self-deletion with the
   pod's own key. Checked live (DESIGN.md, section 14).
@@ -134,7 +134,7 @@ Providers to add, in this order.
   the machine id (GraphQL) for the blocklist.
 - [x] Shadeform: an aggregator of VM clouds (Hyperstack, Massed Compute, ...), with a lease it
   enforces itself (`auto_delete.date_threshold`) and tags. The box is the image as a container
-  on the VM, reached with SSH and `docker exec` (vmbox.py). Checked live (DESIGN.md, 15).
+  on the VM, reached with SSH and `docker exec` (providers/vmbox.py). Checked live (DESIGN.md, 15).
 - [ ] Shadeform: spot instances, private images (a token the startup script does not keep),
   `--ssh-config` (a ProxyCommand into the container).
 - [x] Hyperstack, on the VM box; the lease is `down` and the reaper (it keeps no expiry). Not

@@ -9,7 +9,7 @@ import fcntl
 import json
 import time
 
-from gpubox import vast as v
+from gpubox.providers import vast as v
 from gpubox.launch import Launch, Policy, Spec
 from gpubox.state import State, make_tag
 

@@ -36,11 +36,11 @@ import re
 import time
 
 from . import httpapi
-from . import provider as prov
+from . import base as prov
 from . import vmbox
-from .errors import ConfigError
-from .runpod import gpu_matches
-from .state import parse_tag
+from ..errors import ConfigError
+from .base import gpu_matches
+from ..state import parse_tag
 
 API_BASE = "https://api.shadeform.ai/v1"
 MAX_PAGES = 100

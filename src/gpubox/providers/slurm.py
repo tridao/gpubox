@@ -47,10 +47,10 @@ import subprocess
 import tempfile
 import time
 
-from . import provider as prov
-from .gate import Prober
-from .provider import ConfigError
-from .state import parse_tag
+from . import base as prov
+from ..gate import Prober
+from .base import ConfigError
+from ..state import parse_tag
 
 # Each box keeps what it needs in a directory of its own on its node. Every command
 # gpubox runs in the job starts with this, and so does the batch script.

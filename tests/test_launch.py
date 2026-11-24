@@ -22,10 +22,11 @@ from fakes import (
     start,
 )
 
+from gpubox import onbox
 from gpubox import launch as L
 from gpubox import policy as pol
-from gpubox import vast as v
-from gpubox.provider import ProviderError
+from gpubox.providers import vast as v
+from gpubox.providers.base import ProviderError
 from gpubox.state import State, make_tag, parse_tag
 
 
@@ -820,7 +821,7 @@ def test_renewing_moves_the_lease_on_the_box_in_the_tag_and_in_the_state(tmp_pat
     prober, later = FakeProber(vast), EXPIRY + 7200
     L.renew(v.VastProvider(vast), state, prober, later)
     iid = result.winner.instance_id
-    assert prober.ran == [(("10.0.0.1", 2222), v.set_expiry_command(later))]
+    assert prober.ran == [(("10.0.0.1", 2222), onbox.set_expiry_command(later))]
     assert parse_tag(vast.live[iid]["label"]) == parse_tag(make_tag(RUN_ID, 1, later))
     assert on_disk(state).expiry == later
     # The reaper now goes by the new expiry, and `down` still finds the box by its tag.

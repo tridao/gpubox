@@ -415,12 +415,12 @@ again its job was reported lost and the saved environment was there.
 ## 12. Providers
 
 The launcher, `down`, `renew` and the reaper talk to a provider through a
-small interface (`provider.py`): candidates to rent, a create sent once,
+small interface (`providers/base.py`): candidates to rent, a create sent once,
 lookups and a listing read strictly, a delete, a relabel that is also how a
 lease moves, and a way to read a row (`View`: queued, loading, running or
 exited; what the provider says; where SSH reaches it). What differs between
 providers and is not a call is declared by each, as class attributes, and
-read through one table (`providers.py`): its API key's variable; how a box
+read through one table (`providers/__init__.py`): its API key's variable; how a box
 is reached (our sshd with the run's key, or a Slurm step); how a job is
 started; whether its machine ids mean the same machine from run to run, so
 that observations, the blocklist and the store apply; its default spare;
@@ -428,6 +428,18 @@ and which parts of a Spec it can honour (an image, a price cap,
 interruptible boxes, a registry login, countries to skip, an SSH
 configuration entry, any GPU model). `up` and the command line refuse what a
 provider cannot do, and insist on what it needs, before anything is rented.
+
+The code follows that line. Everything that knows a provider is in
+`providers/`: one module per provider, the interface (`base.py`), the
+registry (`__init__.py`), the HTTP client they share (`httpapi.py`), and the
+two kinds of box: a container the provider runs with our command as its
+entrypoint (`container.py`; Vast, RunPod) and a VM that runs the image as a
+container (`vmbox.py`; Shadeform, Hyperstack, Massed, Lyceum). The rest
+(`launch.py`, `state.py`, `gate.py`, `job.py`, `api.py`, `cli.py`) knows
+none of them by name except to pick one, and `onbox.py` holds what every box
+has whatever its provider: the expiry file, the saved environment, the
+self-destroy helper. Adding a provider is a module in `providers/` and a
+line in the registry.
 
 A run's state file names its provider and that provider's options (never a
 secret), so the commands that act on a run need neither. A box's id is a
@@ -546,7 +558,7 @@ countries to skip (v2 places by data center).
 
 Shadeform rents VMs on many clouds through one API. A VM is not a
 container: it boots an OS of the cloud's, with no image of ours. A box on
-a VM (`vmbox.py`) is still the caller's image: the VM's startup script,
+a VM (`providers/vmbox.py`) is still the caller's image: the VM's startup script,
 run as root once the VM is up, adds the run's key for every login user and
 starts the image as a container named `gpubox`, with the VM's GPUs,
 network and IPC, under a command of ours that saves its environment and

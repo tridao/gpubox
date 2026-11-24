@@ -8,9 +8,9 @@ from fakes import FAST
 from test_shadeform import VmProber
 
 from gpubox import launch as L
-from gpubox import provider as prov
-from gpubox import hyperstack as hs
-from gpubox import vmbox
+from gpubox.providers import base as prov
+from gpubox.providers import hyperstack as hs
+from gpubox.providers import vmbox
 from gpubox.errors import ConfigError
 from gpubox.state import State, make_tag, parse_tag
 

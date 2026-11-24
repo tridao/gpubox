@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .policy import REASONS
-from .vast import LOAD_ENV
+from .onbox import LOAD_ENV
 
 GATE_VERSION = 4  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old;
 # 4: the model compared without case or punctuation, as the providers' searches compare it

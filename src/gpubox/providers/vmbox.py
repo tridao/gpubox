@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import shlex
 
-from . import vast as v
-from .gate import READY_TIMEOUT, Prober, read_ready
+from .. import onbox
+from ..gate import READY_TIMEOUT, Prober, read_ready
 
 CONTAINER = "gpubox"
 PULL_ERROR = "/var/lib/gpubox/pull-error"
@@ -38,9 +38,9 @@ BOOT_LOG = "/var/lib/gpubox/boot.log"  # what the startup script said; the probe
 CONTAINER_INIT = "; ".join(
     [
         "mkdir -p /etc/gpubox /etc/profile.d",
-        v.SAVE_ENV,
+        onbox.SAVE_ENV,
         'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
-        f"echo {shlex.quote(f'[ -r {v.ENV_FILE} ] && . {v.ENV_FILE}')} > /etc/profile.d/gpubox-env.sh",
+        f"echo {shlex.quote(f'[ -r {onbox.ENV_FILE} ] && . {onbox.ENV_FILE}')} > /etc/profile.d/gpubox-env.sh",
         "while :; do sleep 3600; done",
     ]
 )

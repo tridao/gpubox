@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from gpubox import vast as v
+from gpubox import onbox
+from gpubox.providers import container
+from gpubox.providers import vast as v
 from gpubox.launch import Spec
 
 REFERENCE = json.loads((Path(__file__).parent / "fixtures/reference_requests.json").read_text())
@@ -129,7 +131,7 @@ def test_destroying_something_already_gone_is_fine(wire):
     ],
 )
 def test_status_messages_are_attributed(msg, kind):
-    assert v.classify_status(msg) == kind
+    assert container.classify_status(msg) == kind
 
 
 def test_bootstrap_command_is_one_valid_shell_line():
@@ -169,7 +171,7 @@ class Timer:
         # The delete is replaced by a command that records the try and fails,
         # as a delete the provider ignores would.
         timer = timer.replace(f"python3 -c {quoted}", f"{{ echo try >> {self.tries}; false; }}")
-        timer = timer.replace(v.EXPIRY_FILE, str(self.file)).replace("sleep 30", "sleep 0.05")
+        timer = timer.replace(onbox.EXPIRY_FILE, str(self.file)).replace("sleep 30", "sleep 0.05")
         self.proc = subprocess.Popen(["bash", "-c", timer], start_new_session=True)
 
     def fired(self) -> int:
@@ -218,7 +220,7 @@ def test_renewing_while_the_timer_runs_moves_its_time(tmp_path):
     try:
         time.sleep(0.3)
         assert timer.fired() == 0
-        cmd = v.set_expiry_command(now - 1).replace(v.EXPIRY_FILE, str(timer.file))
+        cmd = onbox.set_expiry_command(now - 1).replace(onbox.EXPIRY_FILE, str(timer.file))
         assert subprocess.run(["bash", "-c", cmd]).returncode == 0
         time.sleep(0.5)
         assert timer.fired() >= 1  # the lease was moved into the past: it fires
@@ -443,7 +445,7 @@ def same_but_for_the_timer(payload, reference):
         and args[0] == "-c"
         and len(args) == 2
         and subprocess.run(["bash", "-n", "-c", args[1]]).returncode == 0
-        and args[1].endswith(f" -o AuthorizedKeysFile={v.KEYS_FILE}")
+        and args[1].endswith(f" -o AuthorizedKeysFile={container.KEYS_FILE}")
     )
 
 
@@ -641,8 +643,8 @@ def test_the_container_command_replaces_the_images_entrypoint():
 
 def test_the_bootstrap_saves_the_containers_environment_for_ssh(tmp_path):
     out = tmp_path / "env.sh"
-    save = v.SAVE_ENV.replace(v.ENV_FILE, str(out))
-    assert save in v.bootstrap_script("KEY", 1795400000).replace(v.ENV_FILE, str(out))
+    save = onbox.SAVE_ENV.replace(onbox.ENV_FILE, str(out))
+    assert save in v.bootstrap_script("KEY", 1795400000).replace(onbox.ENV_FILE, str(out))
     env = {"PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/root", "TRICKY": 'a\'b "c" $d\ne'}
     assert subprocess.run(["bash", "-c", save], env=env).returncode == 0
     assert oct(out.stat().st_mode & 0o777) == "0o600"
@@ -654,10 +656,10 @@ def test_the_bootstrap_saves_the_containers_environment_for_ssh(tmp_path):
 def test_the_destroy_self_helper_moves_the_lease_into_the_past(tmp_path):
     script = v.bootstrap_script("KEY", 1795400000)
     expiry, helper = tmp_path / "expiry", tmp_path / "gpubox-destroy-self"
-    line = next(p for p in script.split("; ") if p.endswith(f"> {v.DESTROY_SELF}"))
-    line = line.replace(v.DESTROY_SELF, str(helper))
+    line = next(p for p in script.split("; ") if p.endswith(f"> {onbox.DESTROY_SELF}"))
+    line = line.replace(onbox.DESTROY_SELF, str(helper))
     assert subprocess.run(["bash", "-c", line]).returncode == 0
-    helper.write_text(helper.read_text().replace(v.EXPIRY_FILE, str(expiry)))
+    helper.write_text(helper.read_text().replace(onbox.EXPIRY_FILE, str(expiry)))
     helper.chmod(0o755)
     expiry.write_text("1795400000\n")
     assert subprocess.run([str(helper)], capture_output=True).returncode == 0
@@ -668,7 +670,7 @@ def test_the_saved_environment_is_private_even_over_a_file_the_image_had(tmp_pat
     out = tmp_path / "env.sh"
     out.write_text("old\n")
     out.chmod(0o644)
-    save = v.SAVE_ENV.replace(v.ENV_FILE, str(out))
+    save = onbox.SAVE_ENV.replace(onbox.ENV_FILE, str(out))
     assert subprocess.run(["bash", "-c", save], env={"A": "1"}).returncode == 0
     assert oct(out.stat().st_mode & 0o777) == "0o600" and "export A=" in out.read_text()
 

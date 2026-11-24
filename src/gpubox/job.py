@@ -41,12 +41,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 
-from . import vast as v
+from . import onbox
 
 JOBS_DIR = "/var/lib/gpubox/jobs"
 # The jobs directory, as a shell on the box finds it (after loading the environment).
 JOBS = '"${GPUBOX_JOBS:-%s}"' % JOBS_DIR
-LOAD_ENV = v.LOAD_ENV
+LOAD_ENV = onbox.LOAD_ENV
 JOB_ID = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9a-f]{4}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 MARK = "GPUBOX-JOB"  # starts the follower's status line
@@ -141,7 +141,7 @@ if [ "$destroy" = 1 ]; then "${GPUBOX_DESTROY_SELF:-%(destroy_self)s}"; fi
 
 def wrapper() -> str:
     return _WRAPPER % {
-        "grace2": 2 * KILL_GRACE, "env_file": v.ENV_FILE, "destroy_self": v.DESTROY_SELF,
+        "grace2": 2 * KILL_GRACE, "env_file": onbox.ENV_FILE, "destroy_self": onbox.DESTROY_SELF,
     }  # fmt: skip
 
 

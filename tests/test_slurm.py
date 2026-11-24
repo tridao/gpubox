@@ -21,9 +21,9 @@ from fakes import FAST, FakeCheck
 
 from gpubox import cli, gate, job
 from gpubox import launch as L
-from gpubox import provider as prov
-from gpubox import slurm as sl
-from gpubox.provider import ConfigError
+from gpubox.providers import base as prov
+from gpubox.providers import slurm as sl
+from gpubox.errors import ConfigError
 from gpubox.state import State, make_tag, parse_tag
 
 RUN_ID = "dev.box.0123456789ab"

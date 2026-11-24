@@ -32,10 +32,10 @@ import urllib.error
 import urllib.request
 
 from . import httpapi
-from . import provider as prov
+from . import base as prov
 from . import vmbox
-from .errors import ConfigError
-from .runpod import gpu_matches
+from ..errors import ConfigError
+from .base import gpu_matches
 
 URL = "https://vm.massedcompute.com/api/mcp"
 # Massed's Cloudflare policy turns away urllib's own user agent.
