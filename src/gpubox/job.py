@@ -122,7 +122,7 @@ wait "$child"; rc=$?
 [ -n "$watcher" ] && kill "$watcher" 2>/dev/null
 [ -e "$d/expired" ] && rc=124
 echo "$rc" > "$d/exit.tmp" && mv "$d/exit.tmp" "$d/exit"
-if [ "$destroy" = 1 ]; then %(destroy_self)s; fi
+if [ "$destroy" = 1 ]; then "${GPUBOX_DESTROY_SELF:-%(destroy_self)s}"; fi
 """
 
 
@@ -139,13 +139,39 @@ def start_command(
     *,
     timeout_s: int = 0,
     destroy_after: bool = False,
+    spawn: str = "setsid",
 ) -> tuple[str, str]:
     """(remote command, its stdin) that starts a job and returns at once. The script and
     the variables travel on stdin, never on a command line. The command prints the job id
-    once the job is started."""
+    once the job is started.
+
+    `spawn`: "setsid" starts the wrapper from this command, in a session of its own.
+    "runner" asks a process on the box that outlives this command to start it (a Slurm
+    box's batch script, slurm.batch_script: Slurm kills whatever a step started when the
+    step ends): the command leaves a `start` file and waits until it has been taken. If
+    it is not taken within 30 s, the command takes it back and fails."""
     check_job_id(job_id)
     if type(timeout_s) is not int or timeout_s < 0:
         raise JobError(f"bad timeout {timeout_s!r}")
+    if spawn == "setsid":
+        launch = (
+            f'setsid bash "$d/wrapper" "$d" {timeout_s} {int(destroy_after)}'
+            " </dev/null >/dev/null 2>&1 &\n"
+        )
+    elif spawn == "runner":
+        launch = (
+            f'echo {timeout_s} {int(destroy_after)} > "$d/start.tmp" && mv "$d/start.tmp" "$d/start"\n'
+            "i=0\n"
+            'while [ -e "$d/start" ]; do\n'
+            "    i=$((i + 1))\n"
+            '    if [ "$i" -gt 300 ] && rm "$d/start" 2>/dev/null; then\n'
+            '        echo "the box did not take the job in 30 s" >&2; exit 1\n'
+            "    fi\n"
+            "    sleep 0.1\n"
+            "done\n"
+        )
+    else:
+        raise JobError(f"unknown way to start a job: {spawn!r}")
     program = (
         "set -eu\n"
         "umask 077\n"
@@ -155,9 +181,8 @@ def start_command(
         + _heredoc('"$d/env"', env_lines(env))
         + _heredoc('"$d/wrapper"', wrapper())
         + ': > "$d/log"\n'
-        + f'setsid bash "$d/wrapper" "$d" {timeout_s} {int(destroy_after)}'
-        " </dev/null >/dev/null 2>&1 &\n"
-        f"echo {job_id}\n"
+        + launch
+        + f"echo {job_id}\n"
     )
     return "bash -s", program
 
@@ -356,21 +381,25 @@ def follow(
 
 
 def run_remote(ssh_argv, remote: str, stdin: str | None = None, timeout: float = 60):
-    """Run a short command on the box; (exit code, stdout, stderr). 255 is ssh's own failure."""
-    try:
-        r = subprocess.run(
-            ssh_argv(remote),
-            input=(stdin or "").encode(),
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return 255, "", "timed out"
-    return (
-        r.returncode,
-        r.stdout.decode("utf-8", errors="replace"),
-        r.stderr.decode("utf-8", errors="replace"),
-    )
+    """Run a short command on the box; (exit code, stdout, stderr). 255 is ssh's own failure.
+
+    stderr goes to a file, not a pipe: an ssh that starts a ControlMaster (a user's
+    configuration may say so, and a Slurm box is reached with it) leaves a process
+    behind that holds its stderr, and a pipe would not end until that process does."""
+    with tempfile.TemporaryFile() as err:
+        try:
+            r = subprocess.run(
+                ssh_argv(remote),
+                input=(stdin or "").encode(),
+                stdout=subprocess.PIPE,
+                stderr=err,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return 255, "", "timed out"
+        err.seek(0)
+        stderr = err.read().decode("utf-8", errors="replace")
+    return r.returncode, r.stdout.decode("utf-8", errors="replace"), stderr
 
 
 def env_from(items: list[str], files: list[str], environ=os.environ) -> dict[str, str]:

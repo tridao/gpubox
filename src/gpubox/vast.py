@@ -16,6 +16,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import policy as pol
+from . import provider as prov
+
 API_BASE = "https://console.vast.ai/api"
 MAX_PAGES = 400  # 10,000 instances; a listing longer than this is a loop
 
@@ -36,17 +39,15 @@ MACHINE_ERRORS = (
 _CDI = re.compile(r"\bCDI\b")
 
 
-class VastError(RuntimeError):
-    def __init__(self, status: int, msg: str):
-        super().__init__(msg)
-        self.status = status
+class VastError(prov.ProviderError):
+    pass
 
 
-class CreateRefused(VastError):
+class CreateRefused(VastError, prov.CreateRefused):
     """The provider answered and did not rent a box (stale offer, bad request)."""
 
 
-class CreateUnknown(VastError):
+class CreateUnknown(VastError, prov.CreateUnknown):
     """No usable answer: a box may or may not exist."""
 
 
@@ -450,3 +451,69 @@ def endpoint_of(instance: dict) -> tuple[str, int] | None:
         return None
     usable = ip and not ip.startswith("-") and not any(c.isspace() for c in ip)
     return (ip, port) if usable and 0 < port < 65536 else None
+
+
+class VastProvider:
+    """The launcher's view of Vast (provider.py): the HTTP client above, plus how offers
+    are chosen and how a row is read."""
+
+    name = "vast"
+    noun = "instance"
+    # A box runs an sshd that gpubox starts with the run's key: one that refuses the key
+    # shows that the image did not run our start-up command.
+    own_sshd = True
+
+    def __init__(self, client):
+        self.client = client
+
+    def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
+        if not spec.gpus:
+            raise ValueError("a Vast search needs at least one GPU model")
+        found = self.client.offers(offer_query(spec))
+        # The search is asked for the price cap and the order; neither is taken
+        # on trust, since what comes back is what gets rented.
+        cap = spec.max_dph_per_gpu * spec.num_gpus + 1e-9
+        found = sorted((o for o in found if o["dph_total"] <= cap), key=lambda o: o["dph_total"])
+        allowed = in_allowed_country(found, spec.exclude_countries)
+        offers = pol.select_offers(allowed, blocked, policy.max_live)
+        note = (
+            f"{len(offers)} candidate host(s) for {spec.gpu_text} "
+            f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
+            "excluded countries)"
+        )
+        return offers, note
+
+    def create(self, offer: dict, spec, label: str, pubkey: str, expiry: int, avoid=()) -> int:
+        # `avoid` is for providers that choose the machine themselves; here the offer is one.
+        return self.client.create(offer["id"], create_payload(spec, label, pubkey, expiry))
+
+    def view(self, row: dict) -> prov.View:
+        status = str(row.get("actual_status") or "none")
+        msg = str(row.get("status_msg") or "")
+        state = {"running": "running", "exited": "exited"}.get(status, "loading")
+        endpoint = endpoint_of(row) if state == "running" else None
+        return prov.View(state, status, msg, classify_status(msg), endpoint)
+
+    def instance(self, instance_id: int, **call):
+        return self.client.instance(instance_id, **call)
+
+    def instances(self, **call):
+        return self.client.instances(**call)
+
+    def destroy(self, instance_id: int, **call) -> None:
+        self.client.destroy(instance_id, **call)
+
+    def relabel(self, instance_id: int, label: str) -> None:
+        self.client.relabel(instance_id, label)
+
+    def account(self) -> str:
+        return self.client.account()
+
+    def expiry_command(self, expiry: int) -> str:
+        return set_expiry_command(expiry)
+
+    def manual_hint(self, run_id: str, ids) -> str:
+        return "Or destroy them at https://cloud.vast.ai/instances/ (their labels start with the run id)"
+
+    def describe(self, a) -> str:
+        return f"${a.dph:.2f}/hr, host {a.host_id}, {a.geo}"

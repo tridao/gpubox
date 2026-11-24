@@ -1,4 +1,5 @@
-"""gpubox: rent a verified GPU box from Vast.ai, and make sure it is destroyed.
+"""gpubox: rent a verified GPU box from Vast.ai or a Slurm cluster, and make sure it is
+destroyed.
 
     up      rent boxes and wait until they are reachable and pass the health gate
     status  show the run's boxes: names, addresses, lease
@@ -23,6 +24,11 @@ The API key is read from VASTAI_API_KEY. `--account-id` (or GPUBOX_ACCOUNT_ID)
 pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
 
+`--provider slurm --login HOST` rents from a Slurm cluster instead: a box is a
+batch job holding an allocation, reached with `ssh HOST srun --jobid ...`
+(slurm.py). `up`, `down --run-id` and `reap` take these options; the other
+commands read them from the run's state file. Its account is `user@cluster`.
+
 If GPUBOX_STORE_URL and GPUBOX_STORE_TOKEN are set, observations of machines
 are shared through that reputation store (`store/`). It is advisory: it costs
 a command at most a few seconds and never fails it.
@@ -44,9 +50,11 @@ from pathlib import Path
 from . import policy as pol
 from . import sshconfig
 from . import job
+from . import slurm as sl
 from . import store as st
 from . import vast as v
 from .gate import GATE_VERSION, Prober
+from .provider import ProviderError
 from .launch import (
     ConfigError,
     Launch,
@@ -90,7 +98,7 @@ def github_output(**values) -> None:
             f.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
-def write_summary(spec: Spec, result: Result) -> None:
+def write_summary(spec: Spec, result: Result, provider=None) -> None:
     if not (path := os.environ.get("GITHUB_STEP_SUMMARY")):
         return
     ws = result.winners
@@ -101,7 +109,8 @@ def write_summary(spec: Spec, result: Result) -> None:
         else f"no healthy box after {result.seconds:.0f}s"
     )
     lines = [
-        f"### Vast launch: {spec.gpu_text}",
+        f"### {'Slurm' if getattr(provider, 'name', '') == 'slurm' else 'Vast'} launch: "
+        f"{spec.gpu_text}",
         "",
         head,
         "",
@@ -127,7 +136,7 @@ def spec_from(args, image: str = "") -> Spec:
         cap = tuple(int(x) for x in args.capability.split("."))
     return Spec(
         image=image,
-        gpus=tuple(args.gpu),
+        gpus=tuple(args.gpu or ()),
         min_cpus=args.min_cpus,
         min_ram_gb=args.min_ram_gb,
         num_gpus=args.num_gpus,
@@ -135,7 +144,7 @@ def spec_from(args, image: str = "") -> Spec:
         min_vram_mib=args.min_vram_mib,
         min_cuda=args.min_cuda,
         disk_gb=args.disk_gb,
-        max_dph_per_gpu=args.max_dph_per_gpu,
+        max_dph_per_gpu=args.max_dph_per_gpu or 0.0,
         must_reach=tuple(args.must_reach),
         exclude_countries=countries(args),
         gate_script=gate_script(args),
@@ -246,16 +255,106 @@ def key_dir(state_dir: Path, run_id: str) -> Path:
     return Path(state_dir) / "keys" / run_id
 
 
+def is_slurm(args) -> bool:
+    return getattr(args, "provider", None) == "slurm"
+
+
+def slurm_from_args(args) -> sl.Slurm:
+    if not getattr(args, "login", None):
+        raise ConfigError(
+            "--provider slurm needs --login HOST: the cluster's login host, as `ssh HOST` "
+            "reaches it without a password prompt"
+        )
+    return sl.Slurm(
+        args.login,
+        partition=args.partition,
+        account=args.slurm_account,
+        qos=args.qos,
+        constraint=args.constraint,
+        sbatch_args=tuple(args.sbatch_arg),
+    )
+
+
+def provider_from_args(args):
+    """The provider the command line names (`up`, `reap`, `down --run-id` with no state)."""
+    if is_slurm(args):
+        return slurm_from_args(args)
+    return v.VastProvider(v.Vast(api_key(args)))
+
+
+def provider_of_run(args, state: State):
+    """The provider a run was rented from, as its state file says (Vast if it does not)."""
+    if run_is_slurm(state):
+        return sl.Slurm.from_settings(state.meta.get("slurm"))
+    return v.VastProvider(v.Vast(api_key(args)))
+
+
+def run_is_slurm(state: State) -> bool:
+    return state.meta.get("provider") == "slurm"
+
+
+def prober_for(state_dir: Path, state: State):
+    """What reaches the run's boxes: SSH with the run's key (Vast), or a step of the job
+    through the cluster's login host (Slurm)."""
+    if run_is_slurm(state):
+        return sl.SlurmProber()
+    try:
+        return Prober(key_dir(state_dir, state.run), create=False)
+    except FileNotFoundError:
+        raise StateError(f"run {state.run} has no SSH key in {state_dir} (torn down?)") from None
+
+
+def check_provider_args(args) -> None:
+    """Options that one provider has and the other has not."""
+    if is_slurm(args):
+        given = [
+            flag for flag, value in (
+                ("--image", getattr(args, "image", None)),
+                ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", None)),
+                ("--registry-user", getattr(args, "registry_user", None)),
+                ("--exclude-country", getattr(args, "exclude_country", None)),
+                ("--ssh-config", getattr(args, "ssh_config", None) or None),
+            ) if value is not None
+        ]  # fmt: skip
+        if given:
+            raise ConfigError(
+                f"{', '.join(given)}: not for a Slurm cluster (boxes run in the nodes' own "
+                "environment; reach one with `gpubox ssh`)"
+            )
+        return
+    slurm_only = [
+        flag for flag, value in (
+            ("--login", getattr(args, "login", None)),
+            ("--partition", getattr(args, "partition", None)),
+            ("--slurm-account", getattr(args, "slurm_account", None)),
+            ("--qos", getattr(args, "qos", None)),
+            ("--constraint", getattr(args, "constraint", None)),
+            ("--sbatch-arg", getattr(args, "sbatch_arg", None) or None),
+        ) if value is not None
+    ]  # fmt: skip
+    if slurm_only:
+        raise ConfigError(f"{', '.join(slurm_only)}: only with --provider slurm")
+    needed = [
+        flag for flag, value in (
+            ("--gpu", getattr(args, "gpu", True)),
+            ("--max-dph-per-gpu", getattr(args, "max_dph_per_gpu", True)),
+            ("--image", getattr(args, "image", True)),
+        ) if not value
+    ]  # fmt: skip
+    if needed:
+        raise ConfigError(f"Vast needs {', '.join(needed)}")
+
+
 def pinned_account(args) -> str | None:
     return getattr(args, "account_id", None) or os.environ.get("GPUBOX_ACCOUNT_ID") or None
 
 
-def check_account(vast, expected: str | None) -> str | None:
+def check_account(provider, expected: str | None) -> str | None:
     """With an account pinned: stop, before anything is rented or destroyed, if the key is
     another account's. Returns the account, or None when none is pinned."""
     if expected is None:
         return None
-    actual = vast.account()
+    actual = provider.account()
     if actual != expected:
         raise ConfigError(
             f"the API key belongs to account {actual}, not to the expected account {expected}"
@@ -263,9 +362,9 @@ def check_account(vast, expected: str | None) -> str | None:
     return actual
 
 
-def same_account(vast, state: State, account: str | None) -> None:
+def same_account(provider, state: State, account: str | None) -> None:
     """Stop if the run recorded the account it was rented on and the key is another one's."""
-    if state.account and (account or vast.account()) != state.account:
+    if state.account and (account or provider.account()) != state.account:
         raise ConfigError(
             f"run {state.run} was rented on account {state.account}; "
             "the API key belongs to another account"
@@ -274,10 +373,15 @@ def same_account(vast, state: State, account: str | None) -> None:
 
 def cmd_up(args) -> int:
     state_dir = Path(args.state_dir)
-    spec = spec_from(args, args.image)
+    check_provider_args(args)
+    slurm = is_slurm(args)
+    spec = spec_from(args, args.image or "")
+    # A spare on a cluster holds a share of it that others could use, for a race against
+    # hosts that are rarely bad: none by default.
+    spare = args.spare if args.spare is not None else (0 if slurm else DEFAULTS.spare)
     policy = Policy(
         count=args.count,
-        spare=args.spare,
+        spare=spare,
         max_attempts=args.max_attempts,
         startup_timeout=args.startup_timeout,
         stall_timeout=args.stall_timeout,
@@ -292,15 +396,15 @@ def cmd_up(args) -> int:
             f"--ttl-min {spec.ttl_min} leaves no lease after a launch of up to "
             f"{policy.overall_timeout:g}s; it must cover that plus {policy.min_lease:g}s"
         )
-    vast = v.Vast(api_key(args))
+    provider = provider_from_args(args)
     with state_lock(state_dir):
         old = State.load(state_dir)  # StateError if it cannot be read
         if old is not None and not old.closed:
             raise StateError(f"run {old.run} in {state_dir} is not closed; run `gpubox down` first")
-        account = check_account(vast, pinned_account(args))
+        account = check_account(provider, pinned_account(args))
         # A key that cannot list could never find its boxes again: learn that
         # before renting one.
-        vast.instances()
+        provider.instances()
         run_id = new_run_id(args.namespace, args.name)
         # Before anything else: the teardown step is given this, and must have
         # it whenever a box may exist. So unlike every later output, a failure
@@ -316,25 +420,33 @@ def cmd_up(args) -> int:
             "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
             "count": policy.count,
         }  # fmt: skip
+        if slurm:
+            meta.update(provider="slurm", slurm=provider.settings())
         state = State.begin(state_dir, run_id, expiry, account, meta)
         log(f"run {run_id}")
-        obs = pol.Observations(observations_path(args))
-        shared = open_shared(args)
-        share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
-        keys = key_dir(state_dir, run_id)
-        prober = Prober(keys)
-        launch = Launch(vast, spec, policy, state, prober)
-        result = launch.run(pol.blocklist(known_rows(obs, shared), time.time()))
+        if slurm:
+            # Observations and the store are about Vast's machines (slurm.py).
+            blocked, prober = {}, sl.SlurmProber()
+        else:
+            obs = pol.Observations(observations_path(args))
+            shared = open_shared(args)
+            share(shared, "before the launch")  # at most a few seconds; see store.BUDGET
+            blocked = pol.blocklist(known_rows(obs, shared), time.time())
+            keys = key_dir(state_dir, run_id)
+            prober = Prober(keys)
+        launch = Launch(provider, spec, policy, state, prober)
+        result = launch.run(blocked)
         if result.winners and args.ssh_config:
             advisory("writing the SSH configuration", write_ssh_entry, state, keys)
     # The outcome is decided and in the state file; nothing below may change it.
-    advisory("recording observations", observe, result, spec, run_id, obs)
-    if obs.added:
-        advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
-    share(shared, "after the launch", pull=False)  # also anything left from earlier runs
-    advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
-    advisory("writing the summary", write_summary, spec, result)
-    advisory("reporting", report_result, spec, result, state)
+    if not slurm:
+        advisory("recording observations", observe, result, spec, run_id, obs)
+        if obs.added:
+            advisory("queueing observations", shared.queue, obs.rows[-obs.added :])
+        share(shared, "after the launch", pull=False)  # also anything left from earlier runs
+        advisory("writing outputs", github_output, observations_changed=str(obs.added > 0).lower())
+    advisory("writing the summary", write_summary, spec, result, provider)
+    advisory("reporting", report_result, spec, result, state, provider)
     return 0 if result.winners else EXIT_INFRA
 
 
@@ -352,9 +464,10 @@ def write_ssh_entry(state: State, keys: Path) -> None:
     log(f"{names} now reach{'es' if len(named) == 1 else ''} the box(es) (entries in {path})")
 
 
-def report_result(spec: Spec, result: Result, state: State) -> None:
+def report_result(spec: Spec, result: Result, state: State, provider=None) -> None:
+    noun = getattr(provider, "noun", "instance")
     for iid in result.left:
-        log(f"::warning::instance {iid} is not confirmed destroyed; `gpubox down` retries")
+        log(f"::warning::{noun} {iid} is not confirmed destroyed; `gpubox down` retries")
     for a in result.unanswered:
         log(
             f"::warning::attempt {a.seq} got no answer to its create. If a box was rented it "
@@ -367,10 +480,16 @@ def report_result(spec: Spec, result: Result, state: State) -> None:
     n = len(result.winners)
     for i, w in enumerate(result.winners):
         r = w.report
+        where = (
+            f"job {w.instance_id} on node {w.machine_id}"
+            if noun == "job"
+            else f"instance {w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo})"
+        )
+        gpus = r.get("gpus") or []
+        model = w.gpu or (gpus[0] if gpus and len(set(gpus)) == 1 else "GPU")
         log(
-            f"READY in {result.seconds:.0f}s: {box_name(state.run, i, n)} is instance "
-            f"{w.instance_id} on machine {w.machine_id} (${w.dph:.2f}/hr, {w.geo}); "
-            f"{len(r.get('gpus') or [])}x {w.gpu or 'GPU'}, {r.get('cpus')} CPUs, "
+            f"READY in {result.seconds:.0f}s: {box_name(state.run, i, n)} is {where}; "
+            f"{len(gpus)}x {model}, {r.get('cpus')} CPUs, "
             f"driver {r.get('driver')}, torch {r.get('torch')}; lease until {until}"
         )
 
@@ -414,11 +533,10 @@ class InfraError(RuntimeError):
 
 
 def box_ssh(state_dir: Path, state: State, w: dict):
-    """remote command -> ssh argv, for one box of the run, with the run's key."""
-    try:
-        prober = Prober(key_dir(state_dir, state.run), create=False)
-    except FileNotFoundError:
-        raise StateError(f"run {state.run} has no SSH key in {state_dir} (torn down?)") from None
+    """remote command -> ssh argv, for one box of the run: with the run's key (Vast), or
+    as a step of its job (Slurm, where a box's host is the login host and its port the
+    job id)."""
+    prober = prober_for(state_dir, state)
     return lambda remote, **kw: prober.ssh((w["host"], w["port"]), remote, **kw)
 
 
@@ -438,14 +556,14 @@ class BoxWatch:
     """Asks the provider about a box whose SSH connection failed, and remembers the
     answer, so that a box that is over ends the wait and can be recorded as died."""
 
-    def __init__(self, args, w: dict):
-        self.args, self.w, self.status = args, w, None
+    def __init__(self, args, state: State, w: dict):
+        self.args, self.state, self.w, self.status = args, state, w, None
 
     def __call__(self) -> bool | None:
         """False if the box is over (gone, or in a terminal state); None if not known."""
         try:
-            inst = v.Vast(api_key(self.args)).instance(self.w["id"])
-        except (v.VastError, ConfigError) as exc:
+            inst = provider_of_run(self.args, self.state).instance(self.w["id"])
+        except (ProviderError, ConfigError) as exc:
             log(f"WARNING: could not ask the provider about the box: {exc}")
             return None
         self.status = "gone" if inst is None else inst.get("actual_status")
@@ -502,13 +620,14 @@ def start_job(args, state_dir, state, box, job_id, script, env) -> bool:
     }  # fmt: skip
     timeout_s = 0 if not args.timeout_min else max(1, round(args.timeout_min * 60))
     remote, stdin = job.start_command(
-        job_id, script, env, timeout_s=timeout_s, destroy_after=args.destroy_after
-    )
+        job_id, script, env, timeout_s=timeout_s, destroy_after=args.destroy_after,
+        spawn="runner" if run_is_slurm(state) else "setsid",
+    )  # fmt: skip
     rc, out, err = job.run_remote(box_ssh(state_dir, state, w), remote, stdin, timeout=120)
     if rc == 0 and out.strip() == job_id:
         return True
     if rc == 255:
-        lost_box(args, state_dir, state, w, BoxWatch(args, w))
+        lost_box(args, state_dir, state, w, BoxWatch(args, state, w))
         log(f"  job {job_id} may or may not have started on {name}: `gpubox jobs --box {i}`")
     else:
         log(f"::error::could not start the job on {name} (exit {rc}): {err.strip()[-300:]}")
@@ -569,7 +688,7 @@ def wait_for(args, state_dir, state, boxes, job_id, *, quiet=False, offset=0, wa
 
     def one(box):
         i, name, w = box
-        watch = BoxWatch(args, w)
+        watch = BoxWatch(args, state, w)
         if quiet:
             out = open(os.devnull, "wb")
         elif len(boxes) == 1:
@@ -704,18 +823,15 @@ def cmd_renew(args) -> int:
     state_dir = Path(args.state_dir)
     with state_lock(state_dir):
         state = live_run(state_dir)
-        vast = v.Vast(api_key(args))
-        account = check_account(vast, pinned_account(args))
-        same_account(vast, state, account)  # before anything on the box is changed
-        try:
-            prober = Prober(key_dir(state_dir, state.run), create=False)
-        except FileNotFoundError:
-            raise StateError(f"run {state.run} has no SSH key in {state_dir}") from None
+        provider = provider_of_run(args, state)
+        account = check_account(provider, pinned_account(args))
+        same_account(provider, state, account)  # before anything on the box is changed
+        prober = prober_for(state_dir, state)
         expiry = int(time.time()) + args.ttl_min * 60
-        renew(vast, state, prober, expiry)
+        renew(provider, state, prober, expiry)
     until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry))
     ids = ", ".join(str(w["id"]) for w in state.winners)
-    log(f"instance(s) {ids}: lease now ends at {until}")
+    log(f"{provider.noun}(s) {ids}: lease now ends at {until}")
     return 0
 
 
@@ -733,7 +849,13 @@ def cmd_status(args) -> int:
     print(f"run {state.run}: {len(state.winners)} box(es), {what}")
     for i, (name, w) in enumerate(boxes_of(state)):
         gpu = f"  {w['gpu']}" if w.get("gpu") else ""
-        print(f"  {i}  {name:<20} instance {w['id']:<10} root@{w['host']} -p {w['port']}{gpu}")
+        if run_is_slurm(state):
+            # Its host is the login host and its port the job id (box_ssh).
+            node = f" on {w['machine']}" if w.get("machine") else ""
+            where = f"job {w['id']:<10}{node}  (ssh {w['host']}; `gpubox ssh --box {i}`)"
+        else:
+            where = f"instance {w['id']:<10} root@{w['host']} -p {w['port']}"
+        print(f"  {i}  {name:<20} {where}{gpu}")
     return 0
 
 
@@ -755,17 +877,19 @@ def cmd_down(args) -> int:
         if state is None and run_id is None:
             log(f"no run in {state_dir}: nothing to destroy")
             return 0
-        vast = v.Vast(api_key(args))
-        account = check_account(vast, pinned_account(args))
         ours = state is not None and (run_id is None or state.run == run_id)
+        # The run's own provider, from its state; for a run this directory does not
+        # have, the one the command line names.
+        provider = provider_of_run(args, state) if ours else provider_from_args(args)
+        account = check_account(provider, pinned_account(args))
         if ours:
             # An empty listing on another account says nothing about this run.
-            same_account(vast, state, account)
+            same_account(provider, state, account)
         else:
             # By tag alone. The directory's own state and keys are not touched.
             log(f"run {run_id} has no state in {state_dir}: destroying what carries its tag")
             state = State.ephemeral(run_id)
-        left = down(vast, state, Policy())
+        left = down(provider, state, Policy())
         if left == []:
             log(f"run {state.run}: nothing left")
             if ours:
@@ -773,20 +897,22 @@ def cmd_down(args) -> int:
                 shutil.rmtree(key_dir(state_dir, state.run), ignore_errors=True)
                 advisory("removing the SSH configuration entry", sshconfig.remove, state.run)
             return 0
-        explain_leftovers(state, left)
+        explain_leftovers(provider, state, left)
     return EXIT_INFRA
 
 
 def cmd_reap(args) -> int:
     if not NAMESPACE.fullmatch(args.namespace):
         raise ConfigError(f"not a namespace: {args.namespace!r}")
-    vast = v.Vast(api_key(args))
-    check_account(vast, pinned_account(args))
-    failed = reap(vast, Policy(), args.namespace, destroy=args.destroy)
+    check_provider_args(args)
+    provider = provider_from_args(args)
+    check_account(provider, pinned_account(args))
+    failed = reap(provider, Policy(), args.namespace, destroy=args.destroy)
     return EXIT_INFRA if failed else 0
 
 
 def cmd_search(args) -> int:
+    check_provider_args(args)
     spec = spec_from(args)
     obs = pol.Observations(observations_path(args))
     shared = open_shared(args)
@@ -841,19 +967,43 @@ def main(argv=None) -> int:
         s.add_argument("--state-dir", default=".gpubox")
         s.add_argument("--observations", help="JSONL of machine observations (read and appended)")
 
+    def provider_args(s):
+        s.add_argument(
+            "--provider",
+            choices=("vast", "slurm"),
+            default="vast",
+            help="where boxes come from: Vast.ai (default), or a Slurm cluster over SSH",
+        )
+        g = s.add_argument_group("Slurm (with --provider slurm)")
+        g.add_argument(
+            "--login",
+            metavar="HOST",
+            help="the cluster's login host, as `ssh HOST` reaches it with no password prompt",
+        )
+        g.add_argument("--partition")
+        g.add_argument("--slurm-account", metavar="ACCOUNT", help="sbatch --account")
+        g.add_argument("--qos")
+        g.add_argument("--constraint", help="sbatch --constraint, e.g. a GPU model's feature")
+        g.add_argument(
+            "--sbatch-arg",
+            action="append",
+            default=[],
+            metavar="OPTION",
+            help="one more sbatch option, e.g. --sbatch-arg=--gres=gpu:h100:1 (repeatable)",
+        )
+
     def spec_args(s):
         s.add_argument(
             "--gpu",
             action="append",
-            required=True,
-            help='Vast GPU name, e.g. "RTX 5090"; repeat to accept any of several models',
+            help='GPU model, e.g. "RTX 5090" (Vast: required; Slurm: checked by the gate); '
+            "repeat to accept any of several models",
         )
         s.add_argument("--num-gpus", type=number(int, 1), default=1)
         s.add_argument(
             "--max-dph-per-gpu",
             type=number(float, 0, exclusive=True),
-            required=True,
-            help="price cap, $/GPU/hr",
+            help="price cap, $/GPU/hr (Vast: required)",
         )
         s.add_argument("--capability", help="required CUDA compute capability, e.g. 12.0")
         s.add_argument("--min-vram-mib", type=number(int, 0), default=0)
@@ -882,13 +1032,18 @@ def main(argv=None) -> int:
     s = sub.add_parser("up")
     spec_args(s)
     account_arg(s)
-    s.add_argument("--image", required=True)
+    provider_args(s)
+    s.add_argument("--image", help="the box's image (Vast: required)")
     s.add_argument("--namespace", required=True, help="who owns the box, e.g. quack-ci")
     s.add_argument("--name", required=True, help="this run, e.g. the CI run id")
     s.add_argument(
         "--count", type=number(int, 1), default=1, help="boxes to rent: all of them, or none"
     )
-    s.add_argument("--spare", type=number(int, 0), default=DEFAULTS.spare)
+    s.add_argument(
+        "--spare",
+        type=number(int, 0),
+        help=f"boxes raced beyond --count (default {DEFAULTS.spare}; on Slurm 0)",
+    )
     s.add_argument(
         "--ssh-config",
         action="store_true",
@@ -1017,15 +1172,18 @@ def main(argv=None) -> int:
     s = sub.add_parser("down")
     state_args(s)
     account_arg(s)
+    provider_args(s)
     s.add_argument(
         "--run-id",
         help="the run to tear down (printed by `up`); without it, the directory's current run. "
-        "For a run this directory has no state of, its boxes are found by their tag",
+        "For a run this directory has no state of, its boxes are found by their tag, from the "
+        "provider the options name",
     )
     s.set_defaults(fn=cmd_down)
 
     s = sub.add_parser("reap")
     account_arg(s)
+    provider_args(s)
     s.add_argument("--namespace", required=True, help="whose boxes: those tagged for it")
     s.add_argument("--destroy", action="store_true", help="destroy; without it, only report")
     s.set_defaults(fn=cmd_reap)
@@ -1048,6 +1206,9 @@ def main(argv=None) -> int:
         return EXIT_CONFIG
     except v.VastError as exc:
         log(f"::error::Vast API: {exc}")
+        return EXIT_INFRA
+    except ProviderError as exc:
+        log(f"::error::{exc}")
         return EXIT_INFRA
     except InfraError as exc:
         log(f"::error::{exc}")

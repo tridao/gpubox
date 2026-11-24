@@ -25,6 +25,7 @@ from fakes import (
 from gpubox import launch as L
 from gpubox import policy as pol
 from gpubox import vast as v
+from gpubox.provider import ProviderError
 from gpubox.state import State, make_tag, parse_tag
 
 
@@ -720,7 +721,7 @@ def test_down_keeps_trying_and_then_says_what_is_left(tmp_path, capsys):
     left = L.down(vast, state, FAST)
     assert left == [result.winner.instance_id] and len(vast.names("destroy")) > 3
     capsys.readouterr()
-    L.explain_leftovers(state, left)
+    L.explain_leftovers(v.VastProvider(vast), state, left)
     out = capsys.readouterr().out
     assert str(left[0]) in out and f"gpubox down --run-id {RUN_ID}" in out
     assert "lease ends" in out and time.strftime("%Y-%m-%d", time.gmtime(EXPIRY)) in out
@@ -817,7 +818,7 @@ def test_the_reaper_fails_on_a_listing_it_cannot_read():
 def test_renewing_moves_the_lease_on_the_box_in_the_tag_and_in_the_state(tmp_path):
     result, vast, state = up(tmp_path, {1: "ok"}, spare=0)
     prober, later = FakeProber(vast), EXPIRY + 7200
-    L.renew(vast, state, prober, later)
+    L.renew(v.VastProvider(vast), state, prober, later)
     iid = result.winner.instance_id
     assert prober.ran == [(("10.0.0.1", 2222), v.set_expiry_command(later))]
     assert parse_tag(vast.live[iid]["label"]) == parse_tag(make_tag(RUN_ID, 1, later))
@@ -832,8 +833,8 @@ def test_a_renewal_that_cannot_reach_the_box_changes_nothing(tmp_path):
     result, vast, state = up(tmp_path, {1: "ok"}, spare=0)
     prober = FakeProber(vast)
     prober.run_rc = 255
-    with pytest.raises(v.VastError, match="expiry"):
-        L.renew(vast, state, prober, EXPIRY + 7200)
+    with pytest.raises(ProviderError, match="expiry"):
+        L.renew(v.VastProvider(vast), state, prober, EXPIRY + 7200)
     assert vast.names("relabel") == [] and on_disk(state).expiry == EXPIRY
 
 
@@ -842,7 +843,7 @@ def test_a_renewal_whose_relabel_fails_leaves_the_reaper_on_the_old_expiry(tmp_p
     result, vast, state = up(tmp_path, {1: "ok"}, spare=0)
     vast.hooks["relabel"] = lambda iid: (_ for _ in ()).throw(v.VastError(500, "boom"))
     with pytest.raises(v.VastError):
-        L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)
+        L.renew(v.VastProvider(vast), state, FakeProber(vast), EXPIRY + 7200)
     label = vast.live[result.winner.instance_id]["label"]
     assert parse_tag(label).expiry == EXPIRY and on_disk(state).expiry == EXPIRY
 
@@ -859,17 +860,18 @@ def test_a_relabel_that_took_effect_but_whose_answer_was_lost_is_reported_as_hal
 
     vast.relabel = relabel
     with pytest.raises(v.VastError):
-        L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)
+        L.renew(v.VastProvider(vast), state, FakeProber(vast), EXPIRY + 7200)
     assert "half done" in capsys.readouterr().out and on_disk(state).expiry == EXPIRY
     vast.relabel = real
-    L.renew(vast, state, FakeProber(vast), EXPIRY + 7200)  # running it again settles it
+    # Running it again settles it.
+    L.renew(v.VastProvider(vast), state, FakeProber(vast), EXPIRY + 7200)
     assert on_disk(state).expiry == EXPIRY + 7200
 
 
 def test_a_run_without_a_box_cannot_be_renewed(tmp_path):
     launch, vast, state = start(tmp_path, {1: "ok"})
     with pytest.raises(L.ConfigError):
-        L.renew(vast, state, FakeProber(vast), EXPIRY + 60)
+        L.renew(v.VastProvider(vast), state, FakeProber(vast), EXPIRY + 60)
 
 
 # ---------------------------------------------------------- the gate script
@@ -939,9 +941,10 @@ def test_a_model_name_the_store_would_refuse_is_not_recorded():
     assert L.gpu_model("RTX\n5090;", ["RTX 5090"]) is None
 
 
-def test_a_spec_needs_a_model_and_takes_a_single_name():
+def test_a_spec_takes_a_single_name_and_no_blank_one():
     assert L.Spec(image="i", gpus="H100", max_dph_per_gpu=1).gpus == ("H100",)
-    for bad in ((), ("",), [None]):
+    assert L.Spec(image="i", gpus=(), max_dph_per_gpu=1).gpu_text == "1x any GPU"  # Slurm
+    for bad in (("",), [None], ("H100", " ")):
         with pytest.raises(ValueError):
             L.Spec(image="i", gpus=bad, max_dph_per_gpu=1)
 
@@ -1013,7 +1016,7 @@ def test_an_interrupt_with_some_boxes_healthy_rolls_back_all_of_them(tmp_path):
 def test_renewing_several_boxes_moves_the_lease_of_each(tmp_path):
     result, vast, state = up(tmp_path, {1: "ok", 2: "ok"}, count=2, spare=0)
     prober, later = FakeProber(vast), EXPIRY + 7200
-    L.renew(vast, state, prober, later)
+    L.renew(v.VastProvider(vast), state, prober, later)
     assert len(prober.ran) == 2
     for w in result.winners:
         assert parse_tag(vast.live[w.instance_id]["label"]).expiry == later
@@ -1025,8 +1028,8 @@ def test_a_renewal_that_reaches_only_some_boxes_relabels_none(tmp_path):
     prober = FakeProber(vast)
     rcs = iter([0, 255])
     prober.run = lambda ep, remote, timeout=60: next(rcs)
-    with pytest.raises(v.VastError, match="1 box"):
-        L.renew(vast, state, prober, EXPIRY + 7200)
+    with pytest.raises(ProviderError, match="1 box"):
+        L.renew(v.VastProvider(vast), state, prober, EXPIRY + 7200)
     assert vast.names("relabel") == [] and on_disk(state).expiry == EXPIRY
 
 

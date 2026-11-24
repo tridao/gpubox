@@ -1,7 +1,8 @@
 # gpubox
 
-Rent a GPU box from [Vast.ai](https://vast.ai), check that it works, and make
-sure it is destroyed afterwards. For CI jobs and dev boxes.
+Rent a GPU box from [Vast.ai](https://vast.ai), or take one from a Slurm
+cluster, check that it works, and make sure it is destroyed afterwards. For CI
+jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
 come up with a GPU that is already busy. gpubox rents two at once, keeps the
@@ -105,6 +106,43 @@ All or nothing: `up` races `count + --spare` hosts and returns 0 only with
 `--count` healthy boxes; otherwise it destroys the ones it had. A run of one
 box is called `NAME`; a run of several, `NAME-0`, `NAME-1`, ...
 
+## A Slurm cluster
+
+```bash
+gpubox up --provider slurm --login mycluster --num-gpus 1 --gpu H100 \
+    --namespace dev --name mybox --ttl-min 240
+gpubox ssh                     # a shell in the allocation
+gpubox run --script job.sh     # detached; follows its output
+gpubox down
+```
+
+A box is one batch job holding an allocation (`--gres=gpu:N`, and
+`--min-cpus`, `--min-ram-gb` if given; otherwise the cluster's defaults).
+gpubox runs Slurm's commands on the login host over your own SSH
+configuration, so `ssh mycluster squeue` must work without a password
+prompt (keys, or a ControlMaster opened beforehand), and the login shell
+must be POSIX; Slurm must be 20.11 or later (`srun --overlap`). Everything
+runs in the nodes' own environment: `--image` is not used.
+
+`--partition`, `--slurm-account`, `--qos`, `--constraint` and
+`--sbatch-arg OPTION` (repeatable) go to sbatch. A request the cluster can
+never satisfy (no such partition, too many GPUs, a time limit above the
+partition's) is a configuration error at once. Time in the queue is nobody's
+fault: `--startup-timeout` and `--stall-timeout` count from when the job
+starts, and only `--overall-timeout` bounds the wait. `--spare` is 0 by
+default here; a node that fails the gate is excluded from the jobs submitted
+after it.
+
+The lease is kept twice: by the job's own script, which ends the job when the
+lease ends, and by Slurm's time limit, set two minutes past it. `renew` moves
+both; a cluster that does not let users extend a time limit refuses it, and
+the box then ends at its old one. Commands reach a box with
+`srun --jobid=ID --overlap`, so they get its GPUs (`CUDA_VISIBLE_DEVICES`),
+CPUs and environment; jobs started by `run` are started by the batch script,
+since Slurm ends whatever a step started when the step ends. The gate looks
+only at the allocation's GPUs. Not available: `--ssh-config`, `search`, and
+the machine blocklist and reputation store, which are about Vast's machines.
+
 ## A CI job
 
 ```yaml
@@ -132,7 +170,7 @@ directory. Always run `down` after `up`, whatever `up` returned.
 
 | | |
 |---|---|
-| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate |
+| `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider slurm` for a cluster |
 | `status` | show the run's boxes: names, addresses, lease |
 | `run` | start a local script on a box, detached, and stream its output |
 | `logs` | a job's output (`-f`: until it ends) |

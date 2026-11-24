@@ -78,7 +78,12 @@ class FakeVast:
     hook_fail passes the gate; the caller's gate script fails without a verdict
     hook_net  passes the gate; the caller's gate script blames the network
     hook_late passes the gate; the caller's gate script never finishes
+
+    It is the Vast client; the launcher sees it through `v.VastProvider`. `down`, the
+    reaper and the destroy helpers take it as it is, as they take any provider.
     """
+
+    noun = "instance"
 
     def __init__(self, behaviour, offers=None, slow_secs=0.2):
         self.behaviour = behaviour
@@ -368,7 +373,7 @@ def start(tmp_path, behaviour, *, vast=None, policy=FAST, spec=SPEC, expiry=EXPI
     vast = vast or FakeVast(behaviour)
     meta = {"image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus}
     state = State.begin(tmp_path, RUN_ID, expiry, None, meta)
-    return Launch(vast, spec, policy, state, FakeProber(vast)), vast, state
+    return Launch(v.VastProvider(vast), spec, policy, state, FakeProber(vast)), vast, state
 
 
 def foreign_untouched(vast):

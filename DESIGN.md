@@ -1,8 +1,10 @@
 # gpubox design
 
 gpubox rents a GPU box on Vast.ai for a CI job or for development, checks
-that it works, and makes sure it is destroyed afterwards. This document says
-how, what it assumes, and what was decided against.
+that it works, and makes sure it is destroyed afterwards. It can also take
+its boxes from a Slurm cluster (section 12). This document says how, what it
+assumes, and what was decided against. Where it says Vast, read "the
+provider" unless section 12 says otherwise.
 
 ## 1. The problem
 
@@ -232,7 +234,10 @@ Beside it: `keys/<run id>/` (the run's SSH key and known-hosts file), a lock
 taken by `up`, `down` and `renew`, and `observations.jsonl`.
 
 Box `i` of a run of `n` is called `<name>` if `n` is 1, else `<name>-<i>`.
-A version 2 file (one `winner`) is read as a run of one box.
+A version 2 file (one `winner`) is read as a run of one box. A Slurm run
+says so in `meta` (`provider`, and the `slurm` settings later commands
+need); its boxes' `host` is the login host, `port` the job id and
+`machine` the node.
 
 `up --ssh-config` writes a `Host` entry for each winner, in one block per run, to
 `~/.ssh/gpubox_config` and makes sure the first directive of `~/.ssh/config`
@@ -339,7 +344,81 @@ not take, and a provider subaccount.
   wrong.** The two-host rule is faster and needs no timer.
 - **The provider's SDK.** It retries create requests and rewrites search and
   create payloads; the client here is one standard-library module.
-- **A provider interface.** There is one provider. What the launcher needs
-  from it is seven calls (`offers`, `create`, `instances`, `instance`,
-  `destroy`, `relabel`, `account`), which is where a second provider would
-  start.
+- **An sshd of our own inside a Slurm job.** It would give a dev box on a
+  cluster plain `ssh NAME`, scp and editors, as on Vast. But it needs sshd
+  on the nodes, nodes reachable from wherever gpubox runs, and the job's
+  environment (`CUDA_VISIBLE_DEVICES` above all) put back into every
+  session; `srun --overlap` through the login host needs none of that, and
+  is how a cluster's users already reach their jobs.
+
+## 12. A Slurm cluster
+
+The launcher talks to a provider through a small interface (`provider.py`):
+candidates to rent, a create sent once, lookups and a listing read
+strictly, a delete, a relabel that is also how a lease moves, and a way to
+read a row. `vast.VastProvider` and `slurm.Slurm` implement it.
+
+On a cluster a box is one batch job holding an allocation: `sbatch` with
+the tag as the job name, `squeue` for a lookup (`--jobs ID --states=all`)
+and the listing (`--me`), `scancel`, and `scontrol update` for a relabel.
+gpubox runs these on the login host through the user's own SSH
+configuration. Its output goes to files, not pipes: an `ssh` that starts a
+ControlMaster leaves a process behind that holds its stderr.
+
+**What it reads.** A job is gone when Slurm says it is over (a final state,
+or COMPLETING: told to end, and it cannot run again), or no longer knows
+it: "Invalid job id specified" is what the controller says of a job that
+ended more than MinJobAge ago. Any other failure, and an empty answer, is
+an error, never evidence. `sbatch` is sent once. An explicit refusal
+("Batch job submission failed: Invalid partition name specified") is our
+request's fault on a cluster, so it stops the launch as a configuration
+error; so does a pending job whose reason says it can never run
+(PartitionTimeLimit, BadConstraints, ...). A job id is taken only from a
+clean exit that prints one. Anything else, including sbatch's own trouble
+reaching the controller, may have submitted a job: the attempt keeps its
+slot and the job is found by its tag, as on Vast.
+
+**The queue.** A pending job is nobody's fault. The start-up timeout counts
+from when the job starts running, not from the submission, and the stall
+rule does not apply; only `--overall-timeout` bounds the wait. There are no
+offers: Slurm chooses the node, so each attempt is the same request, and a
+node that failed the gate through its own fault is excluded (`--exclude`)
+from the requests after it. `--spare` defaults to 0: a spare would hold a
+share of the cluster that others could use. Observations, the blocklist
+and the store are not used: node names are not Vast machine ids, and a
+cluster's nodes are its operators' business.
+
+**The box.** The batch script holds the allocation until the lease ends,
+then exits, which ends the job and everything in it. As the Vast timer
+does, it reads the end of the lease from a file (on the node, in
+`/tmp/gpubox-<job id>`), created from the submission unless it is there,
+with what is not a time read as the original expiry. Slurm's time limit is
+set to the lease plus two minutes, as a backstop. `renew` rewrites the
+file, then sets the job's name and time limit in one `scontrol update`; a
+cluster that does not let users extend their time limit refuses that, and
+the box ends at its old limit: early, not late. `gpubox-destroy-self`
+writes a past time to the file. On SIGTERM (a cancel) the script removes
+the directory, so the node is left clean.
+
+**Getting in.** Every command on a box is a step of its job:
+`ssh LOGIN srun --jobid=ID --overlap --nodes=1 --ntasks=1 bash -c ...`.
+Slurm gives the step the job's GPUs, CPUs and environment, which is why
+there is no sshd and no key of the run's own. A step's stdin is forwarded,
+so scripts and secrets travel as they do on Vast. The gate is told it runs
+in a share of a machine: it looks only at the GPUs in
+`CUDA_VISIBLE_DEVICES` (on a cluster that does not confine devices,
+`nvidia-smi` lists them all, other jobs' too) and does not judge the
+node's disk.
+
+**Jobs.** Slurm kills whatever a step started when the step ends, `setsid`
+or not. So a job is started by the batch script, which lives as long as
+the box: a step writes the job's directory and leaves a `start` file; the
+script renames it (so a job starts once) and starts the job's wrapper.
+The step waits until the file is taken, and after 30 s takes it back and
+fails. A job then sees the batch step's environment, the job's own.
+
+**Measured** on an H100 Slurm cluster (Slurm 25.11), November 2026: a box
+is healthy 21 to 25 s after `up` starts when a GPU is free; a cancel
+mid-queue rolls back in 2 s; a job killed controller-side carries on and
+is followed to its exit code from another process; `--destroy-after` and a
+renewal to one minute end the job by its own script, on time.

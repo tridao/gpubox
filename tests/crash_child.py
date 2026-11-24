@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from fakes import EXPIRY, FAST, RUN_ID, SPEC, FakeProber, FileVast  # noqa: E402
 
 from gpubox.launch import Launch, Policy  # noqa: E402
+from gpubox.vast import VastProvider  # noqa: E402
 from gpubox.state import State, state_lock  # noqa: E402
 
 state_dir, cue = Path(sys.argv[1]), sys.argv[2]
@@ -43,5 +44,5 @@ with state_lock(state_dir):
     if cue == "after:create":
         vast.hooks["created"] = lambda iid: (vast._save(), os._exit(9))
     policy = Policy(**{**FAST.__dict__, "spare": 0})
-    result = Launch(vast, SPEC, policy, state, FakeProber(vast)).run({})
+    result = Launch(VastProvider(vast), SPEC, policy, state, FakeProber(vast)).run({})
     print("winner", result.winner.instance_id, flush=True)

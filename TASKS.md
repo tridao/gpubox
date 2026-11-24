@@ -106,3 +106,19 @@ New problems they bring, and the answer to each:
   already has an instance on.
 - Price: `--interruptible` searches bid offers and bids `--bid-markup` (default 1.25) times
   the offer's minimum bid, capped at `--max-dph-per-gpu`.
+
+## 11. Slurm clusters
+
+A task fleet could also run on a cluster. First a general provider, then what the fleet needs.
+- [x] `--provider slurm --login HOST`: a box is one batch job holding an allocation, reached
+  with `srun --jobid --overlap` through the login host; the batch script keeps the lease and
+  starts detached jobs; the gate looks only at the allocation's GPUs (DESIGN.md, section 12).
+  Checked live on an H100 Slurm cluster.
+- [ ] The image. A fleet runs a private image's entrypoint unattended. On a cluster the box
+  would run it in a container: pyxis/enroot (`srun --container-image`), Apptainer, or a
+  per-job rootless Docker, whichever the cluster has; `--registry-user` and
+  `GPUBOX_REGISTRY_TOKEN` as on Vast, never in the job's script or environment.
+- [ ] Preemptible partitions: a requeued job comes back, possibly on another node, without
+  its jobs. Read it as task 10 reads an outbid box (exit 75, the box was preempted).
+- [ ] Machine records for clusters: a node that keeps failing the gate, remembered across
+  runs per cluster (not in the shared store, whose machine ids are Vast's).

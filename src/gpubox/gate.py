@@ -36,6 +36,11 @@ import json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 
 want = json.loads(sys.argv[1])
 out = {"ok": False}
+# A share of a machine (a Slurm allocation): what is ours is the GPUs the scheduler gave
+# us, named in CUDA_VISIBLE_DEVICES (nvidia-smi may list the others too), and the CPUs
+# this process may run on. The machine's disk is not ours to judge.
+scoped = want.get("scoped", False)
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() if scoped else ""
 
 def done(reason=None, detail=""):
     if reason:
@@ -48,7 +53,8 @@ def done(reason=None, detail=""):
 def smi():
     r = subprocess.run(
         ["nvidia-smi", "--format=csv,noheader,nounits", "--query-gpu="
-         "index,name,memory.total,memory.used,utilization.gpu,power.draw,driver_version"],
+         "index,name,memory.total,memory.used,utilization.gpu,power.draw,driver_version"]
+        + (["-i", visible] if visible else []),
         capture_output=True, text=True, timeout=30)
     if r.returncode:
         done("runtime_error", "nvidia-smi failed: " + (r.stderr or r.stdout).strip()[:300])
@@ -66,16 +72,17 @@ def driver_cuda():
 rows = smi()
 out["gpus"] = [r[1] for r in rows]
 out["driver"] = rows[0][6] if rows else None
-out["cpus"] = os.cpu_count()
+out["cpus"] = (len(os.sched_getaffinity(0)) if scoped and hasattr(os, "sched_getaffinity")
+               else os.cpu_count())
 out["disk_free_gb"] = shutil.disk_usage("/").free >> 30
 if len(rows) != want["num_gpus"]:
     done("wrong_hardware", "expected %d GPUs, nvidia-smi lists %d" % (want["num_gpus"], len(rows)))
 for r in rows:
-    if not any(model in r[1] for model in want["gpus"]):
+    if want["gpus"] and not any(model in r[1] for model in want["gpus"]):
         done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], " or ".join(want["gpus"])))
     if int(r[2]) < want["min_vram_mib"]:
         done("wrong_hardware", "GPU %s has %s MiB, need %d" % (r[0], r[2], want["min_vram_mib"]))
-if out["disk_free_gb"] < 10:
+if not scoped and out["disk_free_gb"] < 10:
     done("wrong_hardware", "only %d GB of disk free" % out["disk_free_gb"])
 
 # A box that cannot reach these would fail later, looking like a test failure.
@@ -190,6 +197,10 @@ def _clean_report(raw: dict) -> dict:
 class Prober:
     """SSH to candidate boxes with a throwaway key that belongs to one run."""
 
+    # The box is a share of a machine (slurm.SlurmProber): the gate looks only at the
+    # GPUs and CPUs given to it.
+    scoped = False
+
     def __init__(self, key_dir: Path, create: bool = True):
         """`create=False` only loads: a run that has been torn down has no key,
         and looking for it must not bring one back."""
@@ -274,6 +285,8 @@ class Prober:
             "capability": list(spec.capability) if spec.capability else None,
             "must_reach": list(spec.must_reach),
         }
+        if self.scoped:
+            want["scoped"] = True
         argv = self.ssh(ep, "python3 - " + shlex.quote(json.dumps(want)))
         return self._start(argv, read_gate, stdin=GATE_SCRIPT, timeout=GATE_TIMEOUT)
 
