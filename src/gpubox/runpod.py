@@ -80,6 +80,7 @@ class RunPod:
     lease = "box"
     observes_machines = False  # v2 names no machine
     default_spare = 1
+    renewable = True  # its lease can be moved (relabel)
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})
     searchable = True

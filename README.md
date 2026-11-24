@@ -183,6 +183,16 @@ VM cannot delete itself, so `up` warns: only `gpubox down`, or a scheduled
 behind. Hyperstack needs a key pair at the create: if the environment has
 none, the run's public key is imported once as `gpubox`.
 
+## Massed Compute
+
+`--provider massed` (`MASSED_COMPUTE_API_KEY`) rents Massed Compute's VMs
+directly, through its MCP server, as boxes like Shadeform's, on Massed's
+"Ubuntu Server 22.04 w/ drivers" (NVIDIA drivers and docker). Its 1-GPU
+products have 6 CPUs and 32 GB: pass `--min-cpus 6`. Massed cannot rename an
+instance, so the lease set by `up --ttl-min` cannot be moved (`renew` is
+refused), and as on Hyperstack only `down` or a scheduled `reap` ends a VM
+left behind.
+
 ## A Slurm cluster
 
 ```bash

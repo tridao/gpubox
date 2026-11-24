@@ -248,6 +248,7 @@ class Slurm:
     lease = "box"  # the batch script, and Slurm's time limit behind it
     observes_machines = False  # node names are not Vast's machine ids (module docstring)
     default_spare = 0  # a spare holds a share of the cluster that others could use
+    renewable = True  # its lease can be moved (relabel)
     requires = frozenset(())
     features = frozenset({"any_gpu"})
     searchable = False  # Slurm chooses the node: there is nothing to show

@@ -139,7 +139,8 @@ Providers to add, in this order.
   `--ssh-config` (a ProxyCommand into the container).
 - [x] Hyperstack, on the VM box; the lease is `down` and the reaper (it keeps no expiry). Not
   checked live yet.
-- [ ] The other VM clouds directly: Lyceum, Radiant (Ori), Massed Compute, on one shared
+- [x] Massed Compute (MCP), on the VM box. Checked live. No rename, so no `renew`.
+- [ ] The other VM clouds directly: Lyceum, Radiant (Ori), on one shared
   base. A VM is reached as `ubuntu`
   or `root` with an SSH key registered through the API; the box runs the image with docker
   or runs in the VM; the lease is the provider's own expiry where it has one, else `down` and

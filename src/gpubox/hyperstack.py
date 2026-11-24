@@ -74,6 +74,7 @@ class Hyperstack:
     lease = "reaper"
     observes_machines = False
     default_spare = 1
+    renewable = True  # its lease can be moved (relabel)
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True

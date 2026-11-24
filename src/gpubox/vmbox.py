@@ -68,6 +68,19 @@ for h in /root /home/*; do
 done
 mkdir -p "$(dirname {PULL_ERROR})"; rm -f {PULL_ERROR}
 for i in $(seq 1 150); do docker info >/dev/null 2>&1 && break; sleep 2; done
+# An image that has docker but not NVIDIA's container toolkit gets it, from NVIDIA's apt
+# repository (Ubuntu), so that `--gpus all` works.
+if ! docker info 2>/dev/null | grep -qi nvidia && command -v apt-get >/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
+        gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg &&
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list &&
+    apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit &&
+    nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
+    for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+fi
 pulled=
 for i in 1 2 3 4 5; do
     if out=$(docker pull {img} 2>&1); then pulled=1; break; fi

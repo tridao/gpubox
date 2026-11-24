@@ -1331,6 +1331,22 @@ MUTATIONS = [
      '            if type(have) not in (int, float) or have < least:',
      '            if type(have) in (int, float) and have < least:',
      'does_not_state_a_size'),
+    # --- Massed Compute
+    ('a Massed launch is retried',
+     'massed.py',
+     'data = self.client.tool("instances_launch", args, retries=0)',
+     'data = self.client.tool("instances_launch", args, retries=2)',
+     'launched_once_with_our_tag'),
+    ('a Massed answer of several instances is read as one',
+     'massed.py',
+     '        if not isinstance(rows, list) or len(rows) > 1:',
+     '        if not isinstance(rows, list):',
+     'error_never_is'),
+    ('the login user is taken for granted',
+     'massed.py',
+     '        if not (isinstance(user, str) and _USER.fullmatch(user)):',
+     '        if False:',
+     'its_login_user'),
 ]
 # fmt: on
 

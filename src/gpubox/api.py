@@ -594,6 +594,10 @@ class Run:
         """Move the end of every box's lease to `ttl_min` from now. Returns the new expiry."""
         if type(ttl_min) is not int or ttl_min < 1:
             raise ConfigError(f"ttl_min must be a positive number of minutes: {ttl_min!r}")
+        if not self.kind.renewable:
+            raise ConfigError(
+                f"a lease on {self.kind.name} cannot be moved: it was set by `up --ttl-min`"
+            )
         s = self.settings
         with state_lock(s.state_dir):
             state = self._live()  # this run, under the lock: not one that replaced it

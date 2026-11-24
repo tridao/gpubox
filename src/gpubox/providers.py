@@ -22,6 +22,7 @@ Each provider class (provider.py describes the calls) also says, as class attrib
     default_spare     boxes raced beyond the count unless asked otherwise
     features          what of a Spec beyond the hardware it honours (FEATURES)
     requires          which of those it cannot do without ("image", "price_cap")
+    renewable         its lease can be moved: `relabel` works (else `renew` is refused)
     searchable        `search` can show what `up` would try
 
 and `from_options(options, key)` builds one from the options a run keeps in its state
@@ -34,13 +35,14 @@ that every class declares the above.
 
 from __future__ import annotations
 
-from . import hyperstack, runpod, shadeform, slurm, vast
+from . import hyperstack, massed, runpod, shadeform, slurm, vast
 from .errors import ConfigError
 
 KINDS = {
     k.name: k
     for k in (
         vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform, hyperstack.Hyperstack,
+        massed.Massed,
     )
 }  # fmt: skip
 

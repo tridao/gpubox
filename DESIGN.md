@@ -590,7 +590,13 @@ label. It keeps no expiry, so its lease is `down` and the reaper, and `up`
 says so. It requires a key pair at the create, though the run's key goes in
 with the script: one is imported, once per environment, if there is none.
 
-The other VM clouds (Lyceum, Radiant, Massed Compute) are to use the same
-box; what differs is their API, how their key gets on the VM
+Massed Compute uses it too, through its MCP server: the startup script is
+the instance's boot command, and the tag its name. It cannot rename an
+instance, so a lease cannot be moved: providers say whether they can
+(`renewable`), and `renew` is refused where not. Its login user is the
+instance's own (`Ubuntu`, capital U, on its images); a VM's user is never
+assumed. Measured, November 2026: an A6000 healthy 127 s after the launch.
+
+The other VM clouds (Lyceum, Radiant) are to use the same box; what differs is their API, how their key gets on the VM
 (an API key pair, or the startup script), and whether they have an expiry
 of their own. Without one, `down` and a scheduled `reap` end their VMs.

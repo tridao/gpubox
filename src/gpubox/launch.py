@@ -645,9 +645,8 @@ class Launch:
             # Only the provider's own account of the box is evidence against
             # the machine; our failure to reach the API is not.
             if a.answered:
-                detail = (
-                    f"not reachable after {policy.startup_timeout:g}s (status={a.status}; {extra})"
-                )
+                limit = policy.startup_timeout + a.boot_s
+                detail = f"not reachable after {limit:g}s (status={a.status}; {extra})"
                 # An interruptible box that never got to run may simply have been outbid.
                 outbid = spec.interruptible and a.status != "running"
                 self._fail(a, None if outbid else "unreachable", detail)

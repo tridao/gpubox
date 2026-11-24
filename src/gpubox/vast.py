@@ -483,6 +483,7 @@ class VastProvider:
     lease = "box"
     observes_machines = True
     default_spare = 1
+    renewable = True  # its lease can be moved (relabel)
     requires = frozenset({"image", "price_cap"})
     features = frozenset(
         {"image", "price_cap", "interruptible", "registry_login", "exclude_country", "ssh_config"}
