@@ -299,6 +299,15 @@ options={"login": "mycluster", ...}`, to `up` (and to `down(run_id=...)`,
 
 ## Commands
 
+`gpubox.receipt(state_dir, run_id)` reads the durable rental attempts, keyed by
+tag. Each has an offer, machine, host, quoted `dph`, `instance_id` (when known)
+and `outcome`: `unknown`, `refused`, `rented` or `gone`. Use a persistent state
+directory per run. An unanswered create, including an HTTP 429 on Vast, stays
+unknown until its box is identified; `down` with that state directory reports
+incomplete even if the listing is empty. Retry `down` later. A missing receipt
+or teardown by tag alone is not proof that no rental was made. A receipt is a
+record of quoted compute cost, not an invoice or account-wide spending cap.
+
 | | |
 |---|---|
 | `up` | rent boxes (`--count`, default 1) and wait until they pass the health gate; `--provider runpod`, `shadeform` or `slurm` for those |

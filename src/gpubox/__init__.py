@@ -17,10 +17,10 @@ from .errors import (
     TeardownIncomplete,
 )
 from .launch import Policy, Spec
-from .state import StateError
+from .state import StateError, receipt
 
 __all__ = [
     "Box", "BoxLost", "ConfigError", "GpuboxError", "InfraError", "Job", "JobLost", "NoBoxes",
     "NoSuchJob", "Policy", "Run", "Settings", "Spec", "StateError", "TeardownIncomplete",
-    "attach", "down", "reap", "search", "set_log", "up", "wait_all",
+    "attach", "down", "reap", "receipt", "search", "set_log", "up", "wait_all",
 ]  # fmt: skip

@@ -476,7 +476,9 @@ class BrokenBody(io.BytesIO):
         raise http.client.IncompleteRead(b"")
 
 
-@pytest.mark.parametrize("status,kind", [(503, v.CreateUnknown), (400, v.CreateRefused)])
+@pytest.mark.parametrize(
+    "status,kind", [(503, v.CreateUnknown), (429, v.CreateUnknown), (400, v.CreateRefused)]
+)
 def test_an_unreadable_error_body_does_not_change_what_the_status_means(monkeypatch, status, kind):
     # The status line arrived; only its description could not be read.
     calls = []

@@ -352,8 +352,6 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
         # before renting one.
         provider.instances()
         run_id = new_run_id(namespace, name)
-        if on_run_id is not None:
-            on_run_id(run_id)
         expiry = int(time.time()) + spec.ttl_min * 60
         meta = {
             "image": spec.image, "gpus": list(spec.gpus), "num_gpus": spec.num_gpus,
@@ -369,6 +367,13 @@ def _up(spec, namespace, name, policy, s, provider, ssh_config, on_run_id, on_re
             )
         state = State.begin(s.state_dir, run_id, expiry, account, meta)
         begun.append(run_id)
+        if on_run_id is not None:
+            try:
+                on_run_id(run_id)  # an empty receipt already exists; no create has been sent
+            except BaseException:
+                state.close()  # a refused reservation leaves the directory reusable
+                begun.clear()  # there is nothing at the provider to clean up
+                raise
         log(f"run {run_id}")
         if provider.observes_machines:
             obs = pol.Observations(s.observations_path)

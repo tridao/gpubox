@@ -286,7 +286,7 @@ def destroy_confirmed(provider, ids, budget: float, policy: Policy) -> list[int]
             _try_destroy(provider, iid, share(len(left) - k))
 
 
-def tagged(provider, run_id: str, policy: Policy, timeout: float | None = None) -> set[int] | None:
+def tagged(provider, state: State, policy: Policy, timeout: float | None = None) -> set[int] | None:
     """The ids of the boxes the listing shows with this run's tag, or None if it could not
     be listed. Not retried here: callers loop."""
     timeout = policy.call_timeout if timeout is None else min(policy.call_timeout, timeout)
@@ -295,7 +295,15 @@ def tagged(provider, run_id: str, policy: Policy, timeout: float | None = None) 
     except prov.ProviderError as exc:
         log(f"WARNING: listing instances: {exc}")
         return None
-    return {r["id"] for r in rows if (t := parse_tag(r.get("label"))) and t.run == run_id}
+    found = set()
+    for row in rows:
+        label = row.get("label")
+        tag = parse_tag(label)
+        if tag and tag.run == state.run:
+            found.add(row["id"])
+            if state.data.get("attempts", {}).get(label, {}).get("outcome") == "unknown":
+                state.record(label, outcome="rented", instance_id=row["id"])
+    return found
 
 
 # ---------------------------------------------------------------------- launch
@@ -378,12 +386,13 @@ class Launch:
         # Half the time for the ids we hold, so that one that will not go away
         # leaves room for the listing and for what it finds.
         left = set(destroy_confirmed(self.provider, self.held - keep, budget / 2, self.policy))
-        found = tagged(self.provider, self.state.run, self.policy, remaining()) or set()
+        found = tagged(self.provider, self.state, self.policy, remaining()) or set()
         extra = found - self.held  # the winners are among those we hold
         noun = self.provider.noun
         for iid in sorted(extra):
             log(f"  {noun} {iid} carries this run's tag and was not known: destroying it")
         left = sorted(destroy_confirmed(self.provider, left | extra, remaining(), self.policy))
+        self.state.confirm_gone((self.held | extra) - keep - set(left))
         for iid in left:
             log(f"WARNING: {noun} {iid} is not confirmed destroyed; `gpubox down` retries")
         return left
@@ -751,11 +760,23 @@ class Launch:
             )
             a.noun = self.provider.noun
             self.attempts[seq] = a  # as unanswered: if the request is interrupted, it stays so
+            state.record(
+                a.tag,
+                outcome="unknown",
+                instance_id=None,
+                offer_id=a.offer_id,
+                machine=a.machine_id,
+                host=a.host_id,
+                gpu=a.gpu,
+                dph=a.dph,
+                ram_gb=(o.get("cpu_ram") or 0) / 1024,
+            )
             try:
                 iid = self.provider.create(
                     o, spec, a.tag, self.prober.pubkey, state.expiry, frozenset(self.avoid)
                 )
             except prov.CreateRefused as exc:
+                state.record(a.tag, outcome="refused")
                 # Usually a stale offer (rented between search and create).
                 a.state, a.detail = "refused", f"create refused: {exc}"
                 log(f"  {a.tag_name} {a.detail}")
@@ -775,6 +796,7 @@ class Launch:
             self.held.add(iid)
             a.instance_id, a.state, a.phase = iid, "rented", "booting"
             a.t0 = a.changed_at = a.ready_from = time.monotonic()
+            state.record(a.tag, outcome="rented", instance_id=iid)
             state.add_id(iid)  # if this raises, the rollback destroys what `held` names
             noun, where = self.provider.noun, self.provider.describe(a)
             log(f"  {a.tag_name} rented {noun} {iid}" + (f": {where}" if where else ""))
@@ -872,16 +894,21 @@ def down(provider, state: State, policy: Policy) -> list[int] | None:
         state.set_closing()
     except OSError as exc:
         log(f"WARNING: could not record that the run is closing: {exc}")
-    pending = set(state.ids)
+    pending = set(state.ids) | {
+        r["instance_id"]
+        for r in state.data.get("attempts", {}).values()
+        if r["outcome"] == "rented"
+    }
     deadline = time.monotonic() + policy.confirm_timeout
     clean = 0  # listings in a row that showed nothing of the run, with nothing pending
     while True:
         if pending:
             left = set(destroy_confirmed(provider, pending, policy.round, policy))
+            state.confirm_gone(pending - left)
             for iid in sorted(pending - left):
                 log(f"{provider.noun} {iid}: gone")
             pending = left
-        found = tagged(provider, state.run, policy)
+        found = tagged(provider, state, policy)
         new = (found or set()) - pending  # these have not been sent a delete yet
         if found is None:
             clean = 0
@@ -904,6 +931,9 @@ def down(provider, state: State, policy: Policy) -> list[int] | None:
             break
         time.sleep(policy.recheck if not pending else policy.confirm_poll)
     if clean >= 2:
+        if any(r["outcome"] == "unknown" for r in state.data.get("attempts", {}).values()):
+            log(f"WARNING: {state.run}: a create is unresolved; an empty listing cannot settle it")
+            return None
         try:
             state.close()
         except OSError as exc:
@@ -917,6 +947,8 @@ def explain_leftovers(provider, state: State, left: list[int] | None) -> None:
     when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(state.expiry)) if state.expiry else None
     if left:
         log(f"::error::not confirmed destroyed: {provider.noun}(s) {', '.join(map(str, left))}")
+    elif any(r["outcome"] == "unknown" for r in state.data.get("attempts", {}).values()):
+        log("::error::unanswered create: no confirmed ID; keep the receipt and retry down")
     else:
         log("::error::the provider could not be listed, so boxes of this run may remain")
     flags = provider_flags(provider)

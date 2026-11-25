@@ -182,7 +182,7 @@ class State:
         state = cls(Path(state_dir) / STATE, {})
         state._replace({
             "version": 3, "run": run_id, "expiry": int(expiry), "account": account,
-            "meta": dict(meta), "ids": [], "winners": [], "closing": False, "closed": False,
+            "meta": dict(meta), "ids": [], "winners": [], "attempts": {}, "closing": False, "closed": False,
         })  # fmt: skip
         return state
 
@@ -224,6 +224,11 @@ class State:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.path)
+                parent = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
             except BaseException:
                 try:
                     os.unlink(tmp)
@@ -240,6 +245,28 @@ class State:
         if instance_id not in self.data["ids"]:
             self._set(ids=[*self.data["ids"], instance_id])
 
+    def record(self, tag, **fields):
+        rows = self.data.get("attempts", {})
+        row = {**rows.get(tag, {}), **fields}
+        if rows.get(tag) != row:
+            self._set(attempts={**rows, tag: row})
+
+    def confirm_gone(self, ids):
+        """A confirmed release settles its own receipt even if another create is unknown."""
+        rows = self.data.get("attempts", {})
+        changed = {
+            tag: {**row, "outcome": "gone"}
+            for tag, row in rows.items()
+            if row["outcome"] == "rented" and row["instance_id"] in ids
+        }
+        if changed:
+            try:
+                self._set(attempts={**rows, **changed})
+            except OSError:
+                # The receipt stays conservative. Do not stop the teardown of
+                # other boxes just because recording this release failed.
+                pass
+
     def publish(self, winners: list[dict]) -> None:
         """The hand-off: once this is on disk the winners are kept."""
         self._set(winners=[dict(w) for w in winners])
@@ -252,4 +279,23 @@ class State:
             self._set(closing=True)
 
     def close(self) -> None:
-        self._set(closing=True, closed=True)
+        if "attempts" not in self.data:
+            self._set(closing=True, closed=True)
+            return
+        rows = {
+            tag: {**row, "outcome": "gone"} if row["outcome"] == "rented" else row
+            for tag, row in self.data.get("attempts", {}).items()
+        }
+        self._set(closing=True, closed=True, attempts=rows)
+
+
+def receipt(state_dir, run_id):
+    """Return the durable attempts for this run, keyed by attempt tag, even after down.
+
+    An unknown attempt may still bill. Missing, legacy or replaced state is not
+    evidence that the run made no purchases.
+    """
+    state = State.load(state_dir)
+    if state is None or state.run != run_id or "attempts" not in state.data:
+        raise StateError(f"no receipt for {run_id} in {state_dir}")
+    return state.data["attempts"]

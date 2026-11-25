@@ -32,7 +32,17 @@ def crash(tmp_path, cue):
 def test_killed_after_the_provider_rented_but_before_we_knew_the_id(tmp_path):
     vast, state = crash(tmp_path, "after:create")
     assert len(vast.on_disk()) == 1 and state.ids == []
+    from gpubox import receipt
+
+    (attempt,) = receipt(tmp_path, state.run).values()
+    assert attempt["outcome"] == "unknown" and attempt["instance_id"] is None
+    assert attempt["dph"] == 1 and attempt["offer_id"] == 1001
+    vast.hidden.update(vast.on_disk())
+    assert L.down(vast, state, FAST) is None and not State.load(tmp_path).closed
+    vast.hidden.clear()
     assert L.down(vast, state, FAST) == []  # found by its tag
+    (attempt,) = receipt(tmp_path, state.run).values()
+    assert attempt["outcome"] == "gone" and attempt["instance_id"] == 1
     assert vast.on_disk() == [] and State.load(tmp_path).closed
 
 

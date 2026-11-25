@@ -21,6 +21,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # (what is broken, file, text, replacement, a test that must fail)
 # fmt: off
 MUTATIONS = [
+    ('unknown receipt cleared by empty listings',
+     'launch.py',
+     'if any(r["outcome"] == "unknown" for r in state.data.get("attempts", {}).values()):',
+     'if False:',
+     'killed_after_the_provider_rented'),
     ('create is retried',
      'providers/vast.py',
      'body=payload, retries=0)',
@@ -28,7 +33,7 @@ MUTATIONS = [
      'never_retried'),
     ('5xx on create read as refused',
      'providers/vast.py',
-     'refused = 400 <= exc.status < 500 and exc.status != 408',
+     'refused = 400 <= exc.status < 500 and exc.status not in (408, 429)',
      'refused = True',
      'never_retried'),
     ('empty create answer read as refused',
@@ -728,7 +733,7 @@ MUTATIONS = [
      'even_when_a_loser_will_not_go_away'),
     ('the sweep at the end of up does not look for the tag',
      'launch.py',
-     '        found = tagged(self.provider, self.state.run, self.policy, remaining()) or set()',
+     '        found = tagged(self.provider, self.state, self.policy, remaining()) or set()',
      '        found = set()',
      'destroyed_by_its_tag_when_up_ends'),
     ('an offer above the price cap is rented',

@@ -334,7 +334,7 @@ def test_the_launch_does_not_start_if_the_run_id_cannot_be_published(world, monk
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "no" / "such" / "dir" / "out"))
     assert run(UP) == cli.EXIT_CONFIG
     assert vast.creates == 0 and vast.names("create") == []
-    assert not (tmp_path / "run.json").exists()  # and the directory is free for the next run
+    assert State.load(tmp_path).closed  # empty receipt, directory free for the next run
 
 
 def test_nothing_after_the_decision_can_fail_the_launch(world, monkeypatch, tmp_path):
@@ -429,13 +429,17 @@ def test_a_machine_that_failed_is_skipped_by_the_next_up(world, tmp_path):
     assert vast.creates == first + 1
 
 
-def test_a_create_that_got_no_answer_does_not_fail_the_teardown(world, tmp_path, capsys):
+def test_an_unanswered_create_keeps_the_receipt_open_after_teardown(world, tmp_path, capsys):
     vast, run = world
     vast.behaviour.update({1: "ghost", 2: "ok"})
     assert run(UP) == 0  # a healthy winner; the ghost is a warning
     assert "got no answer to its create" in capsys.readouterr().out
-    assert run(["down"]) == 0 and vast.ours() == []
-    assert State.load(tmp_path).closed
+    assert run(["down"]) == 75 and vast.ours() == []
+    assert not State.load(tmp_path).closed
+    assert sorted(r["outcome"] for r in State.load(tmp_path).data["attempts"].values()) == [
+        "gone",
+        "unknown",
+    ]
 
 
 def test_down_that_cannot_finish_says_what_to_do_and_keeps_the_key(

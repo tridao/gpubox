@@ -116,7 +116,7 @@ class Vast:
         try:
             data = self._call("PUT", f"/v0/asks/{offer_id}/", body=payload, retries=0)
         except VastError as exc:
-            refused = 400 <= exc.status < 500 and exc.status != 408
+            refused = 400 <= exc.status < 500 and exc.status not in (408, 429)
             raise (CreateRefused if refused else CreateUnknown)(exc.status, str(exc)) from None
         if isinstance(data, dict):
             if data.get("success") is False:

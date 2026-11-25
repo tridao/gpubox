@@ -267,6 +267,13 @@ from the tag alone. That is the CI case: a runner whose disk is gone.
 
 ## 7. Local state
 
+The run state includes one receipt row per attempted create. The unknown row
+is written before sending the request. A reply gives it an ID or a refusal;
+a later listing can supply a missing ID by tag. Closing the run records known
+rentals as gone, but cannot turn an unknown into a refusal. The file and its
+parent directory are synced before a write returns. Tag-only cleanup cannot
+reconstruct a receipt from an empty listing.
+
 `<state-dir>/run.json`, replaced whole at each change:
 
 ```

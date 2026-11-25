@@ -69,6 +69,9 @@ Partly done: the lease timer destroys a box when its lease ends, and writing a p
 
 ## 8. Cost accounting
 
+Implemented: durable attempt receipts with quoted rate, identity and outcome.
+Account budgets and provider invoices remain outside the library.
+
 Not now.
 
 ## 9. Secrets
