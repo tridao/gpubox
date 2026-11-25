@@ -21,6 +21,7 @@ close the gaps found when comparing the two. Work them in order; each is one or 
 - [x] `--registry-user USER`, with the token read from `GPUBOX_REGISTRY_TOKEN` (never on the
   command line). Sent as Vast's `image_login`; the registry is taken from the image name.
   Use a read-only pull token: Vast and the host's docker daemon see it.
+- [x] Omit provider response bodies from Vast errors; track private pull progress without logging registry status text.
 
 ## 3. N boxes in one run [R] (reviewed; checked on real boxes)
 

@@ -98,6 +98,24 @@ def test_an_explicit_refusal_in_a_200_is_refused(wire):
         v.Vast("k").create(7, {})
 
 
+def test_private_pull_errors_do_not_echo_provider_bodies(wire):
+    secret = "fake_pull_secret"
+    for answer, kind in [
+        (
+            urllib.error.HTTPError(
+                "https://example.org", 400, "bad", {}, io.BytesIO(secret.encode())
+            ),
+            v.CreateRefused,
+        ),
+        ({"success": False, "message": secret}, v.CreateRefused),
+        ({"new_contract": secret}, v.CreateUnknown),
+    ]:
+        wire(answer)
+        with pytest.raises(kind) as caught:
+            v.Vast("k").create(7, {"image_login": secret})
+        assert secret not in str(caught.value)
+
+
 def test_reads_are_retried_and_listing_follows_pages(wire):
     last = {"instances": [{"id": 2, "label": None}], "next_token": None}
     w = wire(503, {"instances": [{"id": 1, "label": None}], "next_token": "t"}, last)

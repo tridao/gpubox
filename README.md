@@ -58,6 +58,7 @@ the machine being blamed, and offers with drivers as old are skipped.
 A private image: `--registry-user USER` with the token in
 `GPUBOX_REGISTRY_TOKEN` (the registry comes from the image name). Vast and
 the host's docker daemon see the token, so make it a read-only pull token.
+Private pull reports omit the provider's raw status message and error body.
 
 `--interruptible` rents interruptible boxes, bidding `--bid-markup` (1.25)
 times each offer's minimum bid; the price cap applies to the bid with the

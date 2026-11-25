@@ -267,6 +267,11 @@ from the tag alone. That is the CI case: a runner whose disk is gone.
 
 ## 7. Local state
 
+Vast responses can echo registry credentials. Errors describe the operation
+and status without copying the response body. For authenticated pulls, the
+launcher tracks changes to a digest of the provider's status message instead
+of retaining the message in an attempt or a failure report.
+
 The run state includes one receipt row per attempted create. The unknown row
 is written before sending the request. A reply gives it an ID or a refusal;
 a later listing can supply a missing ID by tag. Closing the run records known

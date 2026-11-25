@@ -635,6 +635,13 @@ class Launch:
             return None
         view = self.provider.view(inst)
         status, msg = view.status, view.msg
+        if spec.registry_token:
+            # A registry error can quote docker login arguments. Detect pull
+            # progress without storing or printing the message itself.
+            from hashlib import sha256
+
+            status = view.state
+            msg = sha256(msg.encode()).hexdigest()[:12] if msg else ""
         if not a.answered or (status, msg) != (a.status, a.msg):
             a.changed_at = time.monotonic()
             if view.state == "queued":
@@ -718,7 +725,7 @@ class Launch:
                 a.gone = True
                 self._fail(a, None, "passed the gate, then the box no longer existed")
             elif (view := self.provider.view(inst)).state != "running":
-                self._fail(a, None, f"passed the gate, then was {view.status}")
+                self._fail(a, None, f"passed the gate, then was {view.state}")
             elif (ep := view.endpoint) is not None and ep != a.endpoint:
                 # It restarted somewhere else (an interruptible box resumed): what passed
                 # the gate is not what would be handed over. Admit it again.

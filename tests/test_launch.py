@@ -105,6 +105,28 @@ def test_failed_machine_is_replaced_and_blamed(tmp_path):
     assert observed(result) == {(1, "failed_admission", "cuda_init"), (2, "healthy", None)}
 
 
+def test_private_pull_status_stays_out_of_launch_reports(tmp_path, capsys, monkeypatch):
+    from dataclasses import replace
+
+    token = "example_pull_token"
+    launch, vast, state = start(
+        tmp_path, {1: "image"}, spec=replace(SPEC, registry_user="bot", registry_token=token)
+    )
+    original = vast.instance
+
+    def instance(iid, **kwargs):
+        row = original(iid, **kwargs)
+        if row is not None:
+            row.update(status_msg="pull access denied: " + token)
+        return row
+
+    monkeypatch.setattr(vast, "instance", instance)
+    with pytest.raises(L.ConfigError, match="cannot be pulled") as caught:
+        launch.run({})
+    assert token not in str(caught.value) and token not in repr(launch.attempts)
+    assert token not in capsys.readouterr().out and token not in state.path.read_text()
+
+
 def test_race_keeps_one_and_does_not_blame_the_loser(tmp_path):
     result, vast, state = run(tmp_path, {1: "ok", 2: "ok", 3: "ok"})
     assert result.winner.machine_id in (1, 2)

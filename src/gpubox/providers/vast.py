@@ -69,29 +69,25 @@ class Vast:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read() or b"{}")
             except urllib.error.HTTPError as exc:
-                # The status is the answer; the body is only a description and
-                # reading it may fail too.
-                try:
-                    text = exc.read().decode(errors="replace").strip()[:500]
-                except Exception:
-                    text = "<unreadable error body>"
+                # Provider error bodies can echo a private registry login.
+                exc.close()
                 if (exc.code == 429 or exc.code >= 500) and attempt < retries:
                     time.sleep(2**attempt)
                     continue
-                raise VastError(exc.code, f"{method} {path}: HTTP {exc.code}: {text}") from None
+                raise VastError(exc.code, f"{method} {path}: HTTP {exc.code}") from None
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 # Includes a body cut short or one that is not JSON.
                 if attempt < retries:
                     time.sleep(2**attempt)
                     continue
-                raise VastError(0, f"{method} {path}: {exc}") from None
+                raise VastError(0, f"{method} {path}: {type(exc).__name__}") from None
         raise AssertionError("unreachable")
 
     def offers(self, query: dict) -> list[dict]:
         data = self._call("POST", "/v0/bundles/", body=query)
         offers = data.get("offers") if isinstance(data, dict) else None
         if not isinstance(offers, list):
-            raise VastError(200, f"unexpected answer to the offer search: {str(data)[:200]}")
+            raise VastError(200, "unexpected answer to the offer search")
         # An offer we cannot identify or price is simply not a candidate.
         return [
             o
@@ -120,11 +116,11 @@ class Vast:
             raise (CreateRefused if refused else CreateUnknown)(exc.status, str(exc)) from None
         if isinstance(data, dict):
             if data.get("success") is False:
-                raise CreateRefused(200, f"create on offer {offer_id} refused: {str(data)[:300]}")
+                raise CreateRefused(200, f"create on offer {offer_id} refused")
             contract = data.get("new_contract")
             if data.get("success") is True and type(contract) is int and contract > 0:
                 return contract
-        raise CreateUnknown(200, f"create on offer {offer_id}: unusable answer {str(data)[:300]}")
+        raise CreateUnknown(200, f"create on offer {offer_id}: unusable answer")
 
     def account(self) -> str:
         """The id of the account this key belongs to."""
@@ -136,7 +132,7 @@ class Vast:
             and data["id"] > 0
         ):
             return str(data["id"])
-        raise VastError(200, f"unexpected answer to the account lookup: {str(data)[:200]}")
+        raise VastError(200, "unexpected answer to the account lookup")
 
     def instance(self, instance_id: int, **call) -> dict | None:
         """The instance, or None only when the provider says it does not exist.
@@ -159,7 +155,7 @@ class Vast:
                 return None
             if isinstance(row, dict) and type(row.get("id")) is int and row["id"] == instance_id:
                 return row
-        raise VastError(200, f"unexpected answer for instance {instance_id}: {str(data)[:200]}")
+        raise VastError(200, f"unexpected answer for instance {instance_id}")
 
     def instances(self, **call) -> list[dict]:
         """Every instance of the account, or an error: never a partial list.
@@ -184,14 +180,10 @@ class Vast:
             data = self._call("GET", "/v1/instances/", query=query, **call)
             page = data.get("instances") if isinstance(data, dict) else None
             if not isinstance(page, list) or data.get("success", True) is not True:
-                raise VastError(
-                    200, f"unexpected answer to the instance listing: {str(data)[:200]}"
-                )
+                raise VastError(200, "unexpected answer to the instance listing")
             for row in page:
                 if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0:
-                    raise VastError(
-                        200, f"unreadable row in the instance listing: {str(row)[:200]}"
-                    )
+                    raise VastError(200, "unreadable row in the instance listing")
                 label = row.get("label", ...)
                 if label is ... or not (label is None or isinstance(label, str)):
                     raise VastError(200, f"instance {row['id']} is listed without a usable label")
@@ -208,13 +200,12 @@ class Vast:
             token = data["next_token"]
             if token is None:
                 if totals - {repr(len(rows))}:
-                    stated = ", ".join(sorted(totals))
                     raise VastError(
-                        200, f"instance listing has {len(rows)} rows but states {stated}"
+                        200, f"instance listing has {len(rows)} rows but states a different total"
                     )
                 return rows
             if not isinstance(token, str) or not token or token in seen_tokens:
-                raise VastError(200, f"instance listing does not advance (token {token!r})")
+                raise VastError(200, "instance listing does not advance")
             seen_tokens.add(token)
             query["after_token"] = token
         raise VastError(200, f"instance listing has more than {MAX_PAGES} pages")
@@ -223,7 +214,7 @@ class Vast:
         """Set an instance's label. Raises unless the provider says it did."""
         data = self._call("PUT", f"/v0/instances/{instance_id}/", body={"label": label})
         if not isinstance(data, dict) or data.get("success") is not True:
-            raise VastError(200, f"relabel of instance {instance_id} refused: {str(data)[:200]}")
+            raise VastError(200, f"relabel of instance {instance_id} refused")
 
     def destroy(self, instance_id: int, **call) -> None:
         """Ask for destruction. An instance that is already gone is not an error."""
@@ -234,7 +225,7 @@ class Vast:
                 raise
             return
         if not isinstance(data, dict) or data.get("success", True) is not True:
-            raise VastError(200, f"destroy of instance {instance_id} refused: {str(data)[:200]}")
+            raise VastError(200, f"destroy of instance {instance_id} refused")
 
 
 def offer_query(spec) -> dict:
