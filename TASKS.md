@@ -151,3 +151,10 @@ Providers to add, in this order.
   or `root` with an SSH key registered through the API; the box runs the image with docker
   or runs in the VM; the lease is the provider's own expiry where it has one, else `down` and
   a scheduled `reap` (no account key on a box).
+
+## 13. First PyPI release
+
+- [x] Build and check the wheel and source distribution in CI; publish from a
+  matching tag with GitHub OIDC (DESIGN.md, section 16).
+- [ ] Register the Trusted Publishers, rehearse `0.1.0` on TestPyPI, and publish
+  the same tag to PyPI.

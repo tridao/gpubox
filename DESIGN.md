@@ -639,3 +639,35 @@ not be kept, and its OS images have neither docker nor NVIDIA's toolkit.
 The other VM clouds are to use the same box; what differs is their API, how their key gets on the VM
 (an API key pair, or the startup script), and whether they have an expiry
 of their own. Without one, `down` and a scheduled `reap` end their VMs.
+
+## 16. Package releases
+
+Hatchling builds the source distribution from the Python package, project
+metadata, README and license. The wheel is built from that source
+distribution, not directly from the checkout. CI and publishing use the
+same checks: validate the metadata, install each artifact separately, and
+check the CLI and API outside the checkout. The publishing job takes only
+the checked artifacts and gets a short-lived credential through GitHub OIDC.
+
+The one-time setup is a [pending Trusted Publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+for `gpubox` on each index. Use the GitHub repository owning this file,
+workflow `publish.yml`, and environment `testpypi` on TestPyPI or `pypi` on
+PyPI. Both GitHub environments allow only `v*` tags, and production requires
+maintainer approval. Neither environment needs a stored API token.
+
+For each release, set the version in `pyproject.toml`, wait for CI on `main`
+and push the matching `vVERSION` tag. Dispatch **Publish gpubox** on that
+tag, choosing TestPyPI first. After it succeeds, install from TestPyPI into
+a fresh environment:
+
+```bash
+gh workflow run publish.yml --ref vVERSION -f index=testpypi
+# After the run completes:
+python -m pip install --index-url https://test.pypi.org/simple/ --no-deps gpubox==VERSION
+gpubox --help
+python -c 'import gpubox.api'
+```
+
+Once the rehearsal passes, run `gh workflow run publish.yml --ref vVERSION -f index=pypi`
+and approve the deployment. A version cannot be overwritten on either
+index; use a new version if the artifacts need changing.

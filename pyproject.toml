@@ -5,15 +5,30 @@ build-backend = "hatchling.build"
 [project]
 name = "gpubox"
 version = "0.1.0"
-description = "Rent a verified GPU box from a marketplace, and make sure it is destroyed afterwards"
+description = "Rent and verify GPU dev boxes with automatic cleanup where supported"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Tri Dao" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+]
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/tridao/gpubox"
+Issues = "https://github.com/tridao/gpubox/issues"
 
 [project.scripts]
 gpubox = "gpubox.cli:main"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/gpubox", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpubox"]

@@ -2,26 +2,32 @@
 
 Rent a GPU box from [Vast.ai](https://vast.ai), [RunPod](https://runpod.io) or
 the VM clouds behind [Shadeform](https://shadeform.ai), or take one from a
-Slurm cluster, check that it works, and make sure it is destroyed afterwards.
+Slurm cluster. gpubox checks that it works and manages its teardown.
 For CI jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
 come up with a GPU that is already busy. gpubox rents two at once, keeps the
-first that passes a health check, and destroys the other. Every box carries
-a lease, and destroys itself when the lease ends even if nothing else is
-left to do it.
+first that passes a health check, and destroys the other. Run `gpubox down`
+when done and schedule `gpubox reap --namespace NS --destroy` as a fallback.
+Some providers enforce expiry, but others rely on the reaper, as do rentals
+whose own lease timer never starts or is stopped by preemption.
 
-Standard library only, Python 3.10+. `DESIGN.md` explains how it works, what
-it assumes, and what was measured.
+The controller runs on Linux or macOS with Python 3.10+ and OpenSSH (`ssh`
+and `ssh-keygen`). No third-party Python dependencies.
+[DESIGN.md](https://github.com/tridao/gpubox/blob/main/DESIGN.md) explains how
+it works, what it assumes, and what was measured.
 
 ## Install
 
 ```bash
-pip install git+https://github.com/tridao/gpubox@<commit>
+pip install gpubox
 export VASTAI_API_KEY=...
 ```
 
-In CI, pin a commit: the job that runs gpubox holds your Vast key.
+For a one-off CLI invocation, use `uvx gpubox --help`. In CI, pin a version
+(`pip install gpubox==0.1.0`): the job that runs gpubox holds your provider
+key. To install unreleased changes, pin a Git commit instead:
+`pip install 'git+https://github.com/tridao/gpubox@<commit>'`.
 
 Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`,
 `SHADEFORM_API_KEY`), else from lines `NAME=value` in
@@ -335,9 +341,10 @@ run, and `observations.jsonl`.
 - **Tag.** Every box is labelled `<namespace>.<name>.<random>.a<n>.<expiry>`
   when it is rented. Anything that knows the run id can find the run's boxes
   and destroy them.
-- **Lease.** `--ttl-min` after `up` started, a timer inside the box destroys
-  it. `reap` destroys boxes whose lease has ended, in case the timer could
-  not. `renew` moves the end.
+- **Lease.** The lease ends `--ttl-min` after `up` started. A timer on the
+  box or the provider enforces it where supported. A scheduled `reap`
+  destroys expired boxes when there is no timer or it could not run.
+  `renew` moves the end on providers that support it.
 - **Blocklist.** A machine that failed in a launch that succeeded is skipped for 2 hours to 14 days, depending on why
   (`observations.jsonl`; cache it between CI runs). A launch that failed
   blames nobody.
@@ -357,10 +364,10 @@ run, and `observations.jsonl`.
 - `down` exits 0 only when every box it knows of is confirmed gone by id and
   two listings in a row show nothing with the run's tag. Otherwise it exits
   75 and says what is left and what to do.
-- Not promised: a maximum lifetime. A box that `down` missed runs until its
-  lease ends. A box stuck pulling its image has no timer yet and waits for
-  the reaper. Nothing here finds a box that was renamed, or that the
-  provider does not list. There is no spending cap across runs.
+- Not promised: a maximum lifetime. With no working lease timer or
+  provider-enforced expiry, a box that `down` missed can keep billing until
+  the reaper removes it. Nothing here finds a box that was renamed, or that
+  the provider does not list. There is no spending cap across runs.
 
 `--account-id` (or `GPUBOX_ACCOUNT_ID`) makes every command refuse an API key
 that belongs to another account.
@@ -384,7 +391,8 @@ python3 tests/mutations.py # breaks each behaviour in turn; a test named for it 
 ```
 
 On PRs and pushes to `main`, GitHub Actions runs the hooks, tests Python 3.10
-and current Python 3, and checks the installed wheel's `gpubox` entry point.
+and current Python 3, and checks the metadata and installation of both the
+wheel and the source distribution.
 The current-Python job also tests the Worker and Python client against local D1.
 All jobs use GitHub-hosted Ubuntu runners; no GPUs or cloud credentials are
 needed. Mutation tests run weekly or on demand (Actions → Mutation tests).

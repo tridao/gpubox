@@ -2,7 +2,7 @@
 
     python3 tests/mutations.py [substring ...]
 
-Each entry breaks one behaviour in a scratch copy of the package and runs the
+Each entry breaks one behaviour in a scratch copy of the repository and runs the
 tests named for that behaviour. It counts as caught only if they ran (no
 collection error) and one of them failed. That shows a test notices, not that
 it fails for the intended reason. Run it after changing
@@ -1409,6 +1409,11 @@ MUTATIONS = [
      '"${{v//\\\\\\\'/$q}}"',
      '"$v"',
      'saves_the_containers_environment'),
+    ('a release ref need not match the version',
+     '.github/scripts/check-release-tag.sh',
+     '    exit 1',
+     '    exit 0',
+     'release_ref_must_match_version'),
 ]
 # fmt: on
 
@@ -1427,7 +1432,7 @@ def main(only) -> int:
                     ".git", "__pycache__", ".gpubox", "node_modules", ".cloudflare"
                 ),
             )
-            path = work / "src/gpubox" / fname
+            path = work / (fname if fname.startswith(".github/") else f"src/gpubox/{fname}")
             text = path.read_text()
             if text.count(old) != 1:
                 print(f"STALE   {name}: text found {text.count(old)} times")
