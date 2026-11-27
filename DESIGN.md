@@ -883,8 +883,8 @@ H200's 141 GB), and is not assumed where neither does.
 
 `--gpu` is read the same way, with a form or a memory only if they are said:
 `H100` is any H100, `H100-SXM` the SXM one. Each provider's search compares
-the model asked for with what it lists (`base.gpu_matches`, which passes on
-the memory a provider states apart). Vast's search takes only Vast's own
+the model asked for with what it lists (`gpus.matches`, given the memory a
+provider states apart). Vast's search takes only Vast's own
 names, so it is asked for the names in its list (`vast.GPU_NAMES`) that are
 the model, and the name as written in case it is a new one of Vast's; what
 comes back is checked again, form and memory included (`gpu_ram`). The gate

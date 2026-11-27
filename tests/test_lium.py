@@ -9,7 +9,8 @@ import shlex
 import time
 
 import pytest
-from fakes import FAST, FakeCheck
+from fakes import FAST
+from test_runpod import PodProber
 
 from gpubox import cli
 from gpubox import launch as L
@@ -520,30 +521,6 @@ def test_a_pod_is_running_for_us_once_lium_shows_how_root_gets_in_directly():
 
 
 # ------------------------------------------------------------------ a launch
-
-
-class PodProber:
-    pubkey = "ssh-ed25519 AAAA gpubox"
-    scoped = False
-
-    def __init__(self):
-        self.checks, self.ran = [], []
-
-    def kill_all(self):
-        for c in self.checks:
-            c.kill()
-
-    def start_ready(self, ep):
-        self.checks.append(FakeCheck(lambda: (True, "")))
-        return self.checks[-1]
-
-    def start_gate(self, ep, spec):
-        self.checks.append(FakeCheck(lambda: (True, None, "", {"gpus": ["RTX 4090"]})))
-        return self.checks[-1]
-
-    def run(self, ep, remote, timeout=60):
-        self.ran.append((ep, remote))
-        return 0
 
 
 def launch(tmp_path, api=None, expiry=EXPIRY, **kw):

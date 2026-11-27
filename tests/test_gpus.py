@@ -109,3 +109,15 @@ def test_what_is_asked_says_a_form_and_a_memory_only_if_said():
     assert gpus.asked("H200").form is None and gpus.identify("H200").form == "SXM"
     assert gpus.asked("A100 80GB").memory_gb == 80 and gpus.asked("A100").memory_gb is None
     assert gpus.asked("4090") is None  # not a model's name: matched word by word
+
+
+def test_a_model_is_matched_as_gpus_reads_it_and_otherwise_word_by_word():
+    assert gpus.matches("A100 40GB", "NVIDIA A100-SXM4-40GB")  # Verda's name, nvidia-smi's
+    assert gpus.matches("RTX 4090", "NVIDIA GeForce RTX 4090") and gpus.matches(
+        "rtx4090", "RTX 4090"
+    )
+    assert gpus.matches("H100 SXM", "NVIDIA H100 80GB HBM3")  # HBM3: the SXM one
+    assert not gpus.matches("H100 SXM", "NVIDIA H100 PCIe") and not gpus.matches("", "x")
+    # A model gpus.py does not know is matched word by word, in order.
+    assert gpus.matches("AMD MI300X", "AMD Instinct MI300X OAM")
+    assert not gpus.matches("OAM MI300X", "AMD Instinct MI300X OAM")

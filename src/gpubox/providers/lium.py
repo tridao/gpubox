@@ -35,9 +35,10 @@ backstop a rent carries, and the exact time is set twice: right after the rent, 
 covers a pod that never starts, and once it runs (`admit`, which the launcher calls
 before it probes the box). `renew` moves the removal time.
 
-A key whose pod visibility is `own` lists only the pods it rented, and nothing says which
-a key is: tag-only cleanup (`down --run-id`, `reap`) needs a key that sees the account's
-pods. The account is the user and its workspace.
+The key must see the account's pods (pod visibility `account`, the default): one that
+sees only its own would list nothing of another key's run, and nothing in the API says
+which a key is. A key acts in its workspace, so the account is the user and that
+workspace.
 
 A spot node's provider may close a rental at any time, without notice or credit: the pod
 turns BROKEN, its container and rental gone, billing stopped, and it does not come back.
@@ -60,7 +61,8 @@ import time
 
 from . import httpapi
 from . import base as prov
-from .base import gpu_matches
+from .base import number, rfc3339
+from .. import gpus
 from .container import classify_status
 from ..errors import ConfigError
 from ..onbox import CONTAINER_INIT
@@ -76,12 +78,12 @@ STARTING = ("PENDING", "START_PENDING", "REBOOT_PENDING")
 # The image's own ENTRYPOINT would otherwise run our command as its arguments; Lium takes
 # only a single executable here, and a start command only as `bash -c '...'`.
 ENTRYPOINT = "/usr/bin/env"
-# Refusals that do not mean nothing was rented: our own earlier request with this key may
-# still be running, or have rented.
-UNKNOWN = ("idempotency_in_progress", "idempotency_outcome_unknown", "own_rent_in_progress")
 RENT_TRIES = 3
 MAX_HOURS = 720  # the longest `termination_hours` Lium takes
 PRICE_SLACK = 0.01  # Lium rents at up to this much per GPU-hour above the expected price
+# Refusals that do not mean nothing was rented: our own earlier request with this key may
+# still be running, or have rented.
+UNKNOWN = ("idempotency_in_progress", "idempotency_outcome_unknown", "own_rent_in_progress")
 # Refusals that no other node would answer differently: the account, or the image.
 ACCOUNT = ("unauthorized", "api_key_inactive", "insufficient_balance", "account_unfunded",
            "email_not_verified", "forbidden", "transfer_hold", "API_KEY_BUDGET_EXCEEDED")  # fmt: skip
@@ -103,10 +105,6 @@ class LiumError(prov.ProviderError):
 def Client(key: str, base: str = API_BASE, timeout: float = 30):
     """Lium's REST API (httpapi.Client): its errors are LiumError."""
     return httpapi.Client(base, {"X-API-Key": key}, LiumError, timeout)
-
-
-def rfc3339(t: int) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 def gone(exc: LiumError) -> bool:
@@ -138,18 +136,6 @@ def same_time(shown, t: int) -> bool:
     """Does a time Lium shows name this instant? Lium shows UTC without an offset."""
     when = _instant(shown)
     return when is not None and abs(when - t) <= 1
-
-
-def _number(value) -> float | None:
-    if type(value) in (int, float) and math.isfinite(value):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            f = float(value)
-        except ValueError:
-            return None
-        return f if math.isfinite(f) else None
-    return None
 
 
 class Lium:
@@ -401,11 +387,11 @@ class Lium:
     def account(self) -> str:
         """The user and the workspace the key acts in: a key sees only its workspace's pods."""
         data = self.client.call("GET", "users/me")
-        space = data.get("workspace") if isinstance(data, dict) else None
-        space = space.get("id") if isinstance(space, dict) else None
-        if isinstance(data.get("id") if isinstance(data, dict) else None, str) and data["id"]:
-            if isinstance(space, str) and space:
-                return f"{data['id']}/{space}"
+        me = data if isinstance(data, dict) else {}
+        space = me.get("workspace") if isinstance(me.get("workspace"), dict) else {}
+        user, space = me.get("id"), space.get("id")
+        if isinstance(user, str) and user and isinstance(space, str) and space:
+            return f"{user}/{space}"
         raise LiumError(200, f"unexpected answer to the account lookup: {str(data)[:200]}")
 
     def view(self, row: dict) -> prov.View:
@@ -453,20 +439,16 @@ def _fit(x, spec, horizon: float) -> dict | None:
     name = x.get("gpu_class") or x.get("machine_name")
     if not isinstance(name, str) or not name:
         return None
-    details = (
-        (specs.get("gpu") or {}).get("details") if isinstance(specs.get("gpu"), dict) else None
-    )
-    first = (
-        details[0] if isinstance(details, list) and details and isinstance(details[0], dict) else {}
-    )
-    memory = _number(first.get("capacity"))  # MiB
-    memory = memory / 1024 if memory else None
+    gpu = specs.get("gpu") if isinstance(specs.get("gpu"), dict) else {}
+    details = gpu.get("details") if isinstance(gpu.get("details"), list) else []
+    vram = [number(d.get("capacity")) for d in details if isinstance(d, dict)]  # MiB each
+    memory = vram[0] / 1024 if vram and vram[0] else None
     if spec.gpus and not any(
-        gpu_matches(m, name, x.get("machine_name"), memory_gb=memory) for m in spec.gpus
+        gpus.matches(m, name, x.get("machine_name"), memory_gb=memory) for m in spec.gpus
     ):
         return None
     n = spec.num_gpus
-    price = _number(x.get("price_per_gpu"))
+    price = number(x.get("price_per_gpu"))
     # Lium may rent at up to a cent above the price offered (PRICE_SLACK): that cent too
     # is within the cap.
     if price is None or not 0 < price < 1e4:
@@ -505,15 +487,15 @@ def _fit(x, spec, horizon: float) -> dict | None:
     for when in (x.get("removal_at"), notice):
         if when is not None and not _after(when, horizon):
             return None
-    reliability = _number(x.get("reliability_score"))  # 0-100; none yet on a new node
+    reliability = number(x.get("reliability_score"))  # 0-100; none yet on a new node
     if spec.min_reliability and (
         reliability < spec.min_reliability * 100 if reliability is not None else not spot
     ):
         return None  # a spot node may have none: it is not held to one
-    down = _number(x.get("effective_download_speed_mbps"))
+    down = number(x.get("effective_download_speed_mbps"))
     if down is None or down < spec.min_inet_down_mbps:
         return None
-    cuda = _number(x.get("max_cuda_version"))
+    cuda = number(x.get("max_cuda_version"))
     if cuda is None or (spec.min_cuda and cuda < spec.min_cuda):
         return None
     loc = x.get("location") if isinstance(x.get("location"), dict) else {}
@@ -525,10 +507,10 @@ def _fit(x, spec, horizon: float) -> dict | None:
     # CPUs, memory (less what the node keeps back) and disk go with the share of GPUs.
     share = n / total
     cpu, ram, disk = specs.get("cpu"), specs.get("ram"), specs.get("hard_disk")
-    cpus = _number((cpu or {}).get("count")) if isinstance(cpu, dict) else None
-    mem = _number((ram or {}).get("total")) if isinstance(ram, dict) else None
-    keep = _number((ram or {}).get("pod_reserve")) if isinstance(ram, dict) else 0.0
-    room = _number((disk or {}).get("free")) if isinstance(disk, dict) else None
+    cpus = number(cpu.get("count")) if isinstance(cpu, dict) else None
+    mem = number(ram.get("total")) if isinstance(ram, dict) else None
+    keep = number(ram.get("pod_reserve")) if isinstance(ram, dict) else None
+    room = number(disk.get("free")) if isinstance(disk, dict) else None
     if cpus is None or mem is None or room is None:
         return None
     cpus, ram_gb, disk_gb = (
@@ -538,9 +520,6 @@ def _fit(x, spec, horizon: float) -> dict | None:
     )
     if cpus < spec.box_cpus or ram_gb < spec.box_ram_gb or disk_gb < spec.disk_gb:
         return None
-    gpu = specs.get("gpu") if isinstance(specs.get("gpu"), dict) else {}
-    details = gpu.get("details") if isinstance(gpu.get("details"), list) else []
-    vram = [_number(d.get("capacity")) for d in details if isinstance(d, dict)]
     if spec.min_vram_mib and (not vram or any(v is None or v < spec.min_vram_mib for v in vram)):
         return None
     city = loc.get("city") if isinstance(loc.get("city"), str) else ""

@@ -31,6 +31,22 @@ from ..gate import READY_TIMEOUT, Prober, read_ready
 CONTAINER = "gpubox"
 PULL_ERROR = "/var/lib/gpubox/pull-error"
 BOOT_LOG = "/var/lib/gpubox/boot.log"  # what the startup script said; the probe shows its end
+PLACEHOLDER = "gpubox-placeholder"
+
+
+def placeholder_key() -> str:
+    """A fresh public key whose private half is deleted at once: for a cloud that wants a
+    key at the create (Hyperstack, Verda), while the run's key goes in with the script.
+    An earlier run's key would let that run's holder into later VMs."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        key = Path(d) / "k"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", PLACEHOLDER,
+                        "-f", str(key)], check=True)  # fmt: skip
+        return key.with_suffix(".pub").read_text().strip()
 
 
 def startup_script(pubkey: str, image: str) -> str:

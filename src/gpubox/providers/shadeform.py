@@ -37,9 +37,10 @@ import time
 
 from . import httpapi
 from . import base as prov
+from .base import rfc3339
+from .. import gpus
 from . import vmbox
 from ..errors import ConfigError
-from .base import gpu_matches
 from ..state import parse_tag
 
 API_BASE = "https://api.shadeform.ai/v1"
@@ -78,10 +79,6 @@ def best_os(options) -> tuple[str, float] | None:
 def _gb(c: dict) -> float | None:
     vram = c.get("vram_per_gpu_in_gb")
     return float(vram) if type(vram) in (int, float) and vram > 0 else None
-
-
-def rfc3339(t: int) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 def short_name(label: str) -> str:
@@ -141,7 +138,7 @@ class Shadeform:
             if c.get("num_gpus", t.get("num_gpus")) != spec.num_gpus or not isinstance(gpu, str):
                 continue
             if spec.gpus and not any(
-                gpu_matches(m, gpu, t.get("shade_instance_type"), memory_gb=_gb(c))
+                gpus.matches(m, gpu, t.get("shade_instance_type"), memory_gb=_gb(c))
                 for m in spec.gpus
             ):
                 continue

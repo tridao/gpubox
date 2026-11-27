@@ -33,7 +33,7 @@ import time
 
 from . import httpapi
 from . import base as prov
-from .base import gpu_matches
+from .. import gpus
 from ..onbox import set_expiry_command
 from . import container
 from ..errors import ConfigError
@@ -137,18 +137,18 @@ class RunPod:
             query["minCudaVersion"] = f"{spec.min_cuda:.1f}"
         query.update(self._placement(spec))
         data = self.client.call("GET", "catalog/gpus", query=query)
-        gpus = data.get("gpus") if isinstance(data, dict) else None
-        if not isinstance(gpus, list):
+        listed = data.get("gpus") if isinstance(data, dict) else None
+        if not isinstance(listed, list):
             raise RunpodError(200, f"unexpected answer to the GPU catalog: {str(data)[:200]}")
         tier = cloud.lower()
         cap = spec.max_dph_per_gpu * n + 1e-9
         found = []
-        for g in gpus:
+        for g in listed:
             if not isinstance(g, dict) or not isinstance(g.get("id"), str):
                 continue
             memory = g.get("memory") if type(g.get("memory")) in (int, float) else None
             if spec.gpus and not any(
-                gpu_matches(m, g["id"], g.get("name"), memory_gb=memory) for m in spec.gpus
+                gpus.matches(m, g["id"], g.get("name"), memory_gb=memory) for m in spec.gpus
             ):
                 continue
             # A MIG slice is part of a GPU: only for whoever names it.

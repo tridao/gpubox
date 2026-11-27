@@ -26,8 +26,8 @@ import re
 
 from . import httpapi
 from . import base as prov
+from .. import gpus
 from ..errors import ConfigError
-from .base import gpu_matches
 
 API_BASE = "https://api.lyceum.technology/api/v2/external"
 GONE = ("terminated", "deleted")
@@ -102,7 +102,7 @@ class Lyceum:
                     continue
                 if n not in (pr.get("available_gpus_per_instance") or []):
                     continue
-                if spec.gpus and not any(gpu_matches(m, gpu, name) for m in spec.gpus):
+                if spec.gpus and not any(gpus.matches(m, gpu, name) for m in spec.gpus):
                     continue
                 found.append((unit * n, name, gpu))
         found.sort()

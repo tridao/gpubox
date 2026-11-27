@@ -39,9 +39,10 @@ import time
 
 from . import httpapi
 from . import base as prov
+from .. import gpus
 from . import vmbox
+from .vmbox import placeholder_key
 from ..errors import ConfigError
-from .base import gpu_matches
 from ..state import parse_tag
 
 API_BASE = "https://infrahub-api.nexgencloud.com/v1"
@@ -62,19 +63,6 @@ class HyperstackError(prov.ProviderError):
 
 def Client(key: str, base: str = API_BASE, timeout: float = 30):
     return httpapi.Client(base, {"api_key": key}, HyperstackError, timeout)
-
-
-def placeholder_key() -> str:
-    """A fresh public key whose private half is deleted at once."""
-    import subprocess
-    import tempfile
-    from pathlib import Path
-
-    with tempfile.TemporaryDirectory() as d:
-        key = Path(d) / "k"
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpubox-placeholder",
-                        "-f", str(key)], check=True)  # fmt: skip
-        return key.with_suffix(".pub").read_text().strip()
 
 
 def image_cuda(name: str) -> float | None:
@@ -183,7 +171,7 @@ class Hyperstack:
                 spot = "spot" in f["name"].lower() or "spot" in gpu.lower()
                 if spot and not spec.interruptible:
                     continue  # Hyperstack may delete it at any time
-                if spec.gpus and not any(gpu_matches(m, gpu, f["name"]) for m in spec.gpus):
+                if spec.gpus and not any(gpus.matches(m, gpu, f["name"]) for m in spec.gpus):
                     continue
                 unit = prices.get(gpu.lower())
                 if unit is None or not 0 < unit < 1e4 or unit * n > cap:

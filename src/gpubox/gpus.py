@@ -20,6 +20,7 @@ file is sent with it (gate.py), so it is plain Python that runs as far back as 3
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 # Families whose form factor makes a different chip, and the forms each comes in.
 FORMS = {
@@ -49,29 +50,18 @@ _DATACENTER = [
 ]  # fmt: skip
 
 
+@dataclass(frozen=True)
 class Model:
     """A GPU model: its family, its form (None: not said), and the memory a name states
     (None: not said), in GB."""
 
-    __slots__ = ("family", "form", "memory_gb")
-
-    def __init__(self, family: str, form: str | None = None, memory_gb: float | None = None):
-        self.family, self.form, self.memory_gb = family, form, memory_gb
+    family: str
+    form: str | None = None
+    memory_gb: float | None = None
 
     @property
     def name(self) -> str:
         return self.family if self.form is None else f"{self.family}-{self.form}"
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, Model) and (self.family, self.form, self.memory_gb) == (
-            other.family,
-            other.form,
-            other.memory_gb,
-        )
-
-    def __repr__(self) -> str:
-        memory = f", {self.memory_gb:g} GB" if self.memory_gb else ""
-        return f"Model({self.name}{memory})"
 
 
 def _spaced(text: str) -> str:

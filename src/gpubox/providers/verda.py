@@ -40,8 +40,10 @@ import time
 
 from . import httpapi
 from . import base as prov
+from .base import number
+from .. import gpus
 from . import vmbox
-from .base import gpu_matches
+from .vmbox import placeholder_key
 from ..errors import ConfigError
 from ..state import parse_tag
 
@@ -49,7 +51,7 @@ API_BASE = "https://api.verda.com/v1"
 USER = "ubuntu"  # root refuses keys; the startup script keys every login user
 BOOT_S = 120  # seen: running 17 s after the create, SSH 50 s
 TAG_KEY = "gpubox"
-KEY_NAME = "gpubox-placeholder"
+KEY_NAME = vmbox.PLACEHOLDER
 MIN_OS_GB = 50  # Verda refuses 40 ("Specified storage size is too low"); 50 was taken
 # discontinued: a spot VM deleted or evicted (it stays readable for minutes, unlisted).
 GONE = ("discontinued", "notfound")
@@ -72,7 +74,6 @@ class Client:
         self._api = httpapi.Client(base, {}, VerdaError, timeout)
         self._auth = httpapi.Client(base, {}, VerdaError, timeout)
         self._until = 0.0
-        self.headers = self._api.headers
 
     def _token(self) -> str:
         if time.monotonic() >= self._until:
@@ -117,19 +118,6 @@ class Client:
         raise VerdaError(200, "the token names no project")
 
 
-def placeholder_key() -> str:
-    """A fresh public key whose private half is deleted at once."""
-    import subprocess
-    import tempfile
-    from pathlib import Path
-
-    with tempfile.TemporaryDirectory() as d:
-        key = Path(d) / "k"
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", KEY_NAME,
-                        "-f", str(key)], check=True)  # fmt: skip
-        return key.with_suffix(".pub").read_text().strip()
-
-
 def best_image(supported, advertised: set[str]) -> tuple[str, float] | None:
     """The image to boot: one of Verda's "+ Docker", advertised and supported by the type,
     with the newest CUDA; at a tie, the older Ubuntu, which is the one seen to work."""
@@ -145,12 +133,15 @@ def best_image(supported, advertised: set[str]) -> tuple[str, float] | None:
     return name, cuda
 
 
-def _number(value) -> float | None:
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    return f if f == f and f not in (float("inf"), float("-inf")) else None
+def _size(t: dict, field: str, key: str) -> float | None:
+    v = t.get(field)
+    return number(v.get(key)) if isinstance(v, dict) else None
+
+
+def _vram(t: dict, n: int) -> float | None:
+    """GB of each GPU: a type states the memory of all its GPUs together."""
+    total = _size(t, "gpu_memory", "size_in_gigabytes")
+    return total / n if total else None
 
 
 def short_name(label: str) -> str:
@@ -237,11 +228,9 @@ class Verda:
                 continue
             if model.endswith(" CC"):
                 continue  # confidential computing: images of its own
-            held = t.get("gpu_memory") if isinstance(t.get("gpu_memory"), dict) else {}
-            total = _number(held.get("size_in_gigabytes"))
-            vram = total / n if total else None
+            vram = _vram(t, n)
             if spec.gpus and not any(
-                gpu_matches(m, model, t.get("name"), gpu.get("description"), memory_gb=vram)
+                gpus.matches(m, model, t.get("name"), gpu.get("description"), memory_gb=vram)
                 for m in spec.gpus
             ):
                 continue
@@ -258,7 +247,7 @@ class Verda:
                 if spec.exclude_countries and cc.upper() in skip:
                     continue
                 for spot in tiers:
-                    price = _number(lp.get("spot_price" if spot else "price_per_hour"))
+                    price = number(lp.get("spot_price" if spot else "price_per_hour"))
                     if price is None or not 0 < price < 1e5 or price > cap:
                         continue
                     if (loc, t["instance_type"]) in stock[spot]:
@@ -283,16 +272,12 @@ class Verda:
 
     @staticmethod
     def _fits(spec, t: dict) -> bool:
-        def size(field, key):
-            v = t.get(field)
-            return _number(v.get(key)) if isinstance(v, dict) else None
-
-        cpus, ram = size("cpu", "number_of_cores"), size("memory", "size_in_gigabytes")
-        vram = size("gpu_memory", "size_in_gigabytes")
+        cpus, ram = _size(t, "cpu", "number_of_cores"), _size(t, "memory", "size_in_gigabytes")
         if cpus is None or ram is None or cpus < spec.box_cpus or ram < spec.box_ram_gb:
             return False  # a size that is not stated does not meet a minimum
-        if spec.min_vram_mib:  # the type states the VRAM of all its GPUs
-            return vram is not None and vram * 1024 / spec.num_gpus >= spec.min_vram_mib
+        if spec.min_vram_mib:
+            vram = _vram(t, spec.num_gpus)
+            return vram is not None and vram * 1024 >= spec.min_vram_mib
         return True
 
     # ------------------------------------------------------------------ boxes

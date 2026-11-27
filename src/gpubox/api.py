@@ -327,7 +327,7 @@ def up(
     countries_given = tuple(spec.exclude_countries) != Spec.__dataclass_fields__[
         "exclude_countries"].default  # fmt: skip
     providers.check_spec(kind, spec, ssh_config=ssh_config, countries_given=countries_given)
-    note_unknown_models(spec)
+    _note_unknown_models(spec)
     provider = s.named_provider()
     begun: list[str] = []  # the run id, once its state is begun: from then on, it is ours
     try:
@@ -482,7 +482,7 @@ def reap(namespace: str, *, destroy: bool = False, policy: Policy | None = None,
     return L.reap(provider, policy or Policy(), namespace, destroy=destroy)
 
 
-def note_unknown_models(spec: Spec) -> None:
+def _note_unknown_models(spec: Spec) -> None:
     """Say which of the models asked for gpus.py does not know: those are matched word by
     word, as a provider or nvidia-smi writes them."""
     for model in spec.gpus:
@@ -493,7 +493,7 @@ def note_unknown_models(spec: Spec) -> None:
 
 def search(spec: Spec, *, want: int = 2, state_dir=None, **settings):
     """(offers `up` would try, in order; the blocked machines). Rents nothing."""
-    note_unknown_models(spec)
+    _note_unknown_models(spec)
     s = _settings(state_dir, **settings)
     kind = providers.kind(s.provider)
     if not kind.searchable:

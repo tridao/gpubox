@@ -49,9 +49,10 @@ see only this:
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass
 
-from .. import gpus
 from ..errors import ConfigError, InfraError
 
 __all__ = ["ConfigError", "CreateRefused", "CreateUnknown", "ProviderError", "View"]
@@ -104,8 +105,16 @@ class View:
     machine: object = None
 
 
-def gpu_matches(asked: str, *names, memory_gb: float | None = None) -> bool:
-    """A model asked for (`--gpu`: "H100", "H100-SXM", "A100 80GB") against a provider's
-    names for a GPU, most telling first, and its memory where the provider states it
-    apart (gpus.matches). The gate checks what nvidia-smi says the same way."""
-    return gpus.matches(asked, *names, memory_gb=memory_gb)
+def number(value) -> float | None:
+    """A finite number, from a number or from text that is one (APIs send both)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def rfc3339(t: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))

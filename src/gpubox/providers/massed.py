@@ -33,9 +33,9 @@ import urllib.request
 
 from . import httpapi
 from . import base as prov
+from .. import gpus
 from . import vmbox
 from ..errors import ConfigError
-from .base import gpu_matches
 
 URL = "https://vm.massedcompute.com/api/mcp"
 # Massed's Cloudflare policy turns away urllib's own user agent.
@@ -179,7 +179,7 @@ class Massed:
             if m is None or int(m.group(1)) != spec.num_gpus:
                 continue
             desc = str(t.get("description") or "")
-            if spec.gpus and not any(gpu_matches(g, product, desc) for g in spec.gpus):
+            if spec.gpus and not any(gpus.matches(g, product, desc) for g in spec.gpus):
                 continue
             cents = t.get("price_cents_per_hour")
             if type(cents) not in (int, float) or not 0 < cents < 1e7 or cents / 100 > cap:

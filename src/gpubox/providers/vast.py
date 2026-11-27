@@ -16,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .. import gpus
 from .. import policy as pol
 from ..onbox import set_expiry_command
 from . import base as prov
@@ -51,7 +52,7 @@ def search_names(asked) -> list[str]:
     written."""
     out = []
     for model in asked:
-        for name in [*(n for n in GPU_NAMES if prov.gpu_matches(model, n)), model]:
+        for name in [*(n for n in GPU_NAMES if gpus.matches(model, n)), model]:
             if name not in out:
                 out.append(name)
     return out
@@ -409,7 +410,7 @@ def candidates(vast, spec, blocked: dict[int, dict], want: int):
         if type(end := o.get("end_date")) in (int, float)
         and min_end <= end < math.inf
         # The search took names; the model (its form, its memory) is checked here.
-        and any(prov.gpu_matches(m, o.get("gpu_name"), memory_gb=_gpu_gb(o)) for m in spec.gpus)
+        and any(gpus.matches(m, o.get("gpu_name"), memory_gb=_gpu_gb(o)) for m in spec.gpus)
     ]
     if spec.interruptible:
         found = priced_bids(vast, spec, found)
