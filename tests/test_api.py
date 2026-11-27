@@ -41,8 +41,13 @@ def world(tmp_path, monkeypatch):
     return vast
 
 
+# These boxes come up at once; the start-up limit is generous so that a slow machine (a
+# CI runner under load) does not run out of it before the first lookup.
+UP = gpubox.Policy(**{**FAST.__dict__, "startup_timeout": 10})
+
+
 def launch(tmp_path, **kw):
-    return gpubox.up(SPEC, namespace="lib", name="t", policy=FAST, state_dir=tmp_path, **kw)
+    return gpubox.up(SPEC, namespace="lib", name="t", policy=UP, state_dir=tmp_path, **kw)
 
 
 def test_a_run_in_a_with_block_is_destroyed_when_the_block_ends(world, tmp_path):
@@ -265,7 +270,7 @@ def test_a_start_that_fails_on_one_box_hands_back_the_others(world, tmp_path):
 def test_a_death_is_told_as_it_is_recorded(world, tmp_path):
     told = []
     s = gpubox.Settings(state_dir=tmp_path, on_observation=lambda: told.append(1))
-    run = gpubox.up(SPEC, namespace="lib", name="t", policy=FAST, settings=s)
+    run = gpubox.up(SPEC, namespace="lib", name="t", policy=UP, settings=s)
     world.live[world.ours()[0]]["status"] = "exited"
     run.box()._record_if_died("exited")
     assert told == [1]
