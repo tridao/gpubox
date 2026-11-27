@@ -23,6 +23,7 @@ rule.
 
 ## Before committing
 
+- Do not change the package version unless explicitly asked to do so.
 - `ruff format src tests`, then commit: the pre-commit hooks (install them
   once per clone with `pre-commit install`) run ruff check and ruff format
   and fail on any change they make.
