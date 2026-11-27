@@ -115,17 +115,29 @@ def gone(exc: LiumError) -> bool:
     return exc.status == 404 and exc.code == "pod_not_found"
 
 
+_TIME = re.compile(
+    r"(?P<base>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(?P<frac>\d{1,9}))?(?P<zone>Z|[+-]\d\d:\d\d)?"
+)
+
+
+def _instant(text) -> float | None:
+    """The instant a time Lium shows names (UTC where it states no offset), or None. Read
+    by hand: Python 3.10's fromisoformat takes only 3 or 6 digits of a second."""
+    m = _TIME.fullmatch(text.strip()) if isinstance(text, str) else None
+    if m is None:
+        return None
+    zone = m["zone"] or "+00:00"
+    try:
+        t = datetime.datetime.fromisoformat(m["base"] + ("+00:00" if zone == "Z" else zone))
+    except ValueError:
+        return None
+    return t.timestamp() + float("0." + (m["frac"] or "0"))
+
+
 def same_time(shown, t: int) -> bool:
     """Does a time Lium shows name this instant? Lium shows UTC without an offset."""
-    if not isinstance(shown, str):
-        return False
-    try:
-        when = datetime.datetime.fromisoformat(shown.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=datetime.timezone.utc)
-    return abs(when.timestamp() - t) <= 1
+    when = _instant(shown)
+    return when is not None and abs(when - t) <= 1
 
 
 def _number(value) -> float | None:
@@ -536,13 +548,8 @@ def _fit(x, spec, horizon: float) -> dict | None:
 def _after(when, horizon: float) -> bool:
     """Is this time (Lium's, UTC when it states no offset) after the horizon? Not if it
     cannot be read."""
-    try:
-        t = datetime.datetime.fromisoformat(str(when).strip().replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=datetime.timezone.utc)
-    return t.timestamp() > horizon
+    t = _instant(when)
+    return t is not None and t > horizon
 
 
 def _operator(x: dict) -> str | None:

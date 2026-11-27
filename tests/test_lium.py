@@ -489,6 +489,12 @@ def test_liums_times_without_an_offset_are_utc(far_from_utc):
     assert lm.same_time("2026-11-24T08:40:00+02:00", t)
     assert not lm.same_time("2026-11-24T06:41:00", t) and not lm.same_time(None, t)
     assert lm._after("2026-11-24T06:40:01", t) and not lm._after("2026-11-24T06:39:59", t)
+    # Any number of digits of a second, which Python 3.10's fromisoformat does not take.
+    for frac in ("4", "45", "4545", "545999", "123456789"):
+        assert lm.same_time(f"2026-11-24T06:40:00.{frac}", t)
+    assert lm.same_time("2026-11-24T06:40:00.5Z", t)
+    for bad in ("2026-11-24", "2026-11-24T06:40:00 junk", "2026-13-24T06:40:00", 1795502400):
+        assert not lm.same_time(bad, t) and not lm._after(bad, 0)
 
 
 def test_a_pod_is_running_for_us_once_lium_shows_how_root_gets_in_directly():
