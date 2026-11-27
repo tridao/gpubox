@@ -25,7 +25,7 @@ export VASTAI_API_KEY=...
 ```
 
 For a one-off CLI invocation, use `uvx gpubox --help`. In CI, pin a version
-(`pip install gpubox==0.1.0`): the job that runs gpubox holds your provider
+(`pip install gpubox==0.2.2`): the job that runs gpubox holds your provider
 key. To install unreleased changes, pin a Git commit instead:
 `pip install 'git+https://github.com/tridao/gpubox@<commit>'`.
 

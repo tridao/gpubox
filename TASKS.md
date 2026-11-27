@@ -160,7 +160,7 @@ Providers to add, in this order.
 
 - [x] Build and check the wheel and source distribution in CI; publish from a
   matching tag with GitHub OIDC (DESIGN.md, section 16).
-- [ ] Register the Trusted Publishers, rehearse `0.1.0` on TestPyPI, and publish
+- [x] Register the Trusted Publishers, rehearse `0.1.0` on TestPyPI, and publish
   the same tag to PyPI.
 
 ## 14. Vast offer lifetime
