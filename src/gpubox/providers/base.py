@@ -46,7 +46,9 @@ __all__ = ["ConfigError", "CreateRefused", "CreateUnknown", "ProviderError", "Vi
 
 class ProviderError(InfraError):
     """A provider's answer could not be had or could not be read. Never evidence that a
-    box is gone."""
+    box is gone. `code` is the API's own name for the error, where it states one."""
+
+    code: str | None = None
 
     def __init__(self, status: int, msg: str):
         super().__init__(msg)

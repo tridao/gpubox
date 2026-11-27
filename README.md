@@ -1,8 +1,8 @@
 # gpubox
 
-Rent a GPU box from [Vast.ai](https://vast.ai), [RunPod](https://runpod.io) or
-the VM clouds behind [Shadeform](https://shadeform.ai), or take one from a
-Slurm cluster. gpubox checks that it works and manages its teardown.
+Rent a GPU box from [Vast.ai](https://vast.ai), [RunPod](https://runpod.io),
+[Lium](https://lium.io) or the VM clouds behind [Shadeform](https://shadeform.ai),
+or take one from a Slurm cluster. gpubox checks that it works and manages its teardown.
 For CI jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
@@ -30,7 +30,7 @@ key. To install unreleased changes, pin a Git commit instead:
 `pip install 'git+https://github.com/tridao/gpubox@<commit>'`.
 
 Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`,
-`SHADEFORM_API_KEY`), else from lines `NAME=value` in
+`LIUM_API_KEY`, `SHADEFORM_API_KEY`), else from lines `NAME=value` in
 `~/.config/gpu-cloud-query/keys.env`.
 
 ## A dev box
@@ -168,6 +168,31 @@ Not yet on RunPod: `--interruptible`, `--registry-user` (private images) and
 `--exclude-country`; and machines are not recorded (RunPod's API does not
 name them), so the blocklist does not apply. An image that cannot be pulled
 is not recognised as such: each pod is given up on after `--stall-timeout`.
+
+## Lium
+
+```bash
+gpubox search --provider lium --gpu "RTX 4090" --max-dph-per-gpu 0.60
+gpubox up --provider lium --gpu "RTX 4090" --max-dph-per-gpu 0.60 --image my/image:tag \
+    --namespace dev --name mybox --ttl-min 240 --ssh-config
+```
+
+Lium (`LIUM_API_KEY`) is a marketplace like Vast: an offer is one node (one
+machine's GPUs) at its own price per GPU, and a box is a pod on it, your image
+under gpubox's command. A node's CPUs, memory and disk are shared out in
+proportion to the GPUs rented, so `--min-cpus`, `--min-ram-gb` and `--disk-gb`
+are judged against that share; a node that rents only whole is offered only
+when `--num-gpus` is all its free GPUs. Spot nodes are left out.
+
+The sshd is Lium's, which it adds to the image if it has none, with the run's
+key and no other. The lease is Lium's own: each pod is given a removal time at
+the end of the lease, which `renew` moves; a pod cannot delete itself, so
+`run --destroy-after` is refused. Lium answers a repeated rent with the first
+one's answer, so a rent whose answer was lost is sent again rather than given
+up on. The pod's `/root` is its volume, with the image's files in it.
+
+Not yet on Lium: `--interruptible` (spot nodes), `--registry-user` (private
+images), and machines are not recorded, so the blocklist does not apply.
 
 ## Shadeform (VM clouds)
 

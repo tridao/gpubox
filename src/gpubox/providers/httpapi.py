@@ -2,11 +2,13 @@
 
 One client, configured per provider with its base URL, its authentication headers and
 the error class its calls raise (a provider.ProviderError with the HTTP status; 0 when
-there was no answer). Answers are parsed, never trusted: callers check their shape.
+there was no answer; and `code`, the API's own name for the error where its body states
+one). Answers are parsed, never trusted: callers check their shape.
 
-`retries` is only for calls that can safely run twice: a create passes 0. A 429 or a
-5xx, a lost connection or an unreadable body is tried again; any other status is the
-answer.
+`retries` is only for calls that can safely run twice: a create passes 0, unless the
+API collapses repeats of it (an idempotency key in `headers`). A 429 or a 5xx, a lost
+connection or an unreadable body is tried again, with the same body; any other status
+is the answer.
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ def describe_error(text: str) -> str:
         err = json.loads(text)
     except ValueError:
         err = None
+    if isinstance(err, dict) and isinstance(err.get("error"), dict):
+        # {"error": {"code": ..., "message": ...}}: its message, then its code.
+        err = {**err, **err["error"], "error": err["error"].get("code")}
     if isinstance(err, dict):
         parts = [
             str(err[k]) for k in ("title", "detail", "message", "error", "error_reason")
@@ -37,6 +42,19 @@ def describe_error(text: str) -> str:
         if parts:
             return " ".join(": ".join(parts).split())[:300]
     return " ".join(text.split())[:300] or "no details"
+
+
+def error_code(text: str) -> str | None:
+    """The API's own name for an error (`{"error": {"code": ...}}` or `{"code": ...}`), or
+    None where the body states none."""
+    try:
+        err = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(err, dict):
+        return None
+    code = err["error"].get("code") if isinstance(err.get("error"), dict) else err.get("code")
+    return code if isinstance(code, str) and code else None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -58,13 +76,16 @@ class Client:
             timeout,
         )
 
-    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None):
-        """The parsed JSON answer (None for an empty one), or `error(status, message)`."""
+    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None, headers=None):
+        """The parsed JSON answer (None for an empty one), or `error(status, message)`.
+        `headers` are added to this call's (an idempotency key)."""
         timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
         url = f"{self.base}/{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query, doseq=True)
-        headers = {"Accept": "application/json", "User-Agent": "gpubox", **self.headers}
+        headers = {
+            "Accept": "application/json", "User-Agent": "gpubox", **self.headers, **(headers or {})
+        }  # fmt: skip
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -84,7 +105,9 @@ class Client:
                     time.sleep(2**attempt)
                     continue
                 msg = f"{method} /{path}: HTTP {exc.code}: {describe_error(text)}"
-                raise self.error(exc.code, msg) from None
+                err = self.error(exc.code, msg)
+                err.code = error_code(text)
+                raise err from None
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 if attempt < retries:
                     time.sleep(2**attempt)

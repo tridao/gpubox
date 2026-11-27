@@ -453,7 +453,9 @@ The code follows that line. Everything that knows a provider is in
 registry (`__init__.py`), the HTTP client they share (`httpapi.py`), and the
 two kinds of box: a container the provider runs with our command as its
 entrypoint (`container.py`; Vast, RunPod) and a VM that runs the image as a
-container (`vmbox.py`; Shadeform, Hyperstack, Massed, Lyceum). The rest
+container (`vmbox.py`; Shadeform, Hyperstack, Massed, Lyceum). Lium's pods
+are containers whose sshd is Lium's: they run the VM box's container command
+(save the environment, then wait) and are reached as Vast's are. The rest
 (`launch.py`, `state.py`, `gate.py`, `job.py`, `api.py`, `cli.py`) knows
 none of them by name except to pick one, and `onbox.py` holds what every box
 has whatever its provider: the expiry file, the saved environment, the
@@ -704,3 +706,66 @@ python -c 'import gpubox.api'
 Once the rehearsal passes, run `gh workflow run publish.yml --ref vVERSION -f index=pypi`
 and approve the deployment. A version cannot be overwritten on either
 index; use a new version if the artifacts need changing.
+
+## 17. Lium
+
+Lium is a marketplace of independent hosts, as Vast is: a node is one
+machine's GPUs, listed at its provider's price per GPU (`/executors`, which
+needs no key), and a pod is a container on a node. Its CPUs, memory (less
+what the node keeps back, `pod_reserve`) and disk are shared out in
+proportion to the GPUs rented, which is what `--min-cpus`, `--min-ram-gb`
+and `--disk-gb` are judged against; seen live, a pod got exactly that
+memory and the node's listed CPUs. A node listed with no minimum GPU count
+rents only whole. Spot nodes, which can be taken back, are left out. A
+node is offered once per box it can hold, every node once before any
+again: the spares of a race hedge against a bad machine, which two boxes
+on one node would not. Nodes with frequent rent failures, a bad disk, a
+removal or maintenance notice within the lease, a reliability under
+`min_reliability`, or a download under the minimum are left out; a size or
+a time that is not stated does not meet a minimum.
+
+**The box.** A rent names a template: an image, an entrypoint and a start
+command. Each attempt makes a private one-time template, which Lium
+deletes with the pod (and gpubox deletes if the rent is refused). Lium
+takes only one executable as the entrypoint and a start command only in
+the form `bash -c '...'`, so the entrypoint is `/usr/bin/env` (which keeps
+the image's own ENTRYPOINT from running our command as its arguments) and
+the command is `bash -c` with the VM box's container command: save the
+environment, then wait. Lium's validator then puts an sshd in the
+container (installing one if the image has none) with the rent's keys:
+the run's key and, with `skip_add_agent_ssh_key`, no other. It adopts an
+sshd the image starts itself, so ours would race it; gpubox starts none.
+The pod shows `ssh root@HOST -p PORT` once running; anything else (a
+gateway's `-J`, another user) is not how gpubox gets in, and the box is
+given up on. The volume is `/root`, as Lium advises; the image's files in
+`/root` were seen in it.
+
+**The rent.** The rent carries an `Idempotency-Key`, the tag: within a day,
+Lium answers the same key and body with the first answer (seen live,
+`Idempotent-Replayed: true`). So unlike every other create, it is retried
+after a lost answer or a 5xx; a refusal that says our own earlier request
+may still be running (`idempotency_in_progress`, `own_rent_in_progress`)
+is an unknown outcome, not a no. Errors carry a stable `error.code`, which
+is what is read: one about the account or the image stops the launch,
+since no other node would answer otherwise. The rent states the price
+offered, and Lium refuses it if the node now asks more.
+
+**The lease** is Lium's: a pod's `removal_scheduled_at`. The rent's own
+`termination_hours` is not used: it is whole hours from when the pod
+starts running, and it overwrote a removal time set while the pod was
+pending (seen live). Instead the removal time is set right after the
+rent, while the pod is pending, and it holds. A pod whose removal time
+cannot be set is deleted, and the attempt counts as unanswered, so the
+sweep looks for it by its tag. `renew` sets the removal time, then the
+name, and believes it once both read back. Lium shows times in UTC
+without an offset. A deleted pod is DELETING for some 40 s, then 404;
+billing stops at the delete request, so DELETING counts as gone.
+
+**Measured**, November 2026, `python:3.12-slim` (sshd installed by Lium):
+a P40 pod healthy 49 s after the create, an RTX 4090 46 s; jobs, `ssh` and
+`renew` worked; a renewal to one minute was deleted by Lium within about
+60 s of the lease's end; an interrupt mid-launch rolled back in 6 s;
+`down --run-id` from an empty directory found the run's pod by its name;
+nothing was left after any of them, and the one-time templates were gone
+with their pods.
+

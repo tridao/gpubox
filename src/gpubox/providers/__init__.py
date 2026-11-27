@@ -37,14 +37,14 @@ that every class declares the above.
 
 from __future__ import annotations
 
-from . import hyperstack, lyceum, massed, runpod, shadeform, slurm, vast
+from . import hyperstack, lium, lyceum, massed, runpod, shadeform, slurm, vast
 from ..errors import ConfigError
 
 KINDS = {
     k.name: k
     for k in (
         vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform, hyperstack.Hyperstack,
-        massed.Massed, lyceum.Lyceum,
+        massed.Massed, lyceum.Lyceum, lium.Lium,
     )
 }  # fmt: skip
 

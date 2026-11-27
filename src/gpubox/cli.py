@@ -25,6 +25,7 @@ pins the provider account: the commands then refuse to act with a key that
 belongs to another one.
 
 `--provider runpod` rents RunPod pods instead (RUNPOD_API_KEY, providers/runpod.py),
+`--provider lium` pods on Lium's nodes (LIUM_API_KEY, providers/lium.py),
 `--provider shadeform` VMs on Shadeform's clouds (SHADEFORM_API_KEY,
 providers/shadeform.py and vmbox.py), and `--provider slurm --login HOST` takes boxes from a Slurm cluster: a batch job
 holding an allocation, reached with `ssh HOST srun --jobid ...` (providers/slurm.py), whose
@@ -560,7 +561,7 @@ def main(argv=None) -> int:
             "--provider",
             choices=tuple(providers.KINDS),
             default="vast",
-            help="where boxes come from: vast (default), runpod, or slurm (a cluster over SSH)",
+            help="where boxes come from (default vast); slurm is a cluster over SSH",
         )
         s.add_argument(
             "--runpod-cloud",
