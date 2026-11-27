@@ -21,7 +21,8 @@ see only this:
                               lease. An id only from an explicit yes, CreateRefused
                               only on an explicit no, CreateUnknown when a box may
                               or may not exist; a configuration that no offer can
-                              satisfy is a ConfigError. Sent once, unless the API
+                              satisfy is a ConfigError, raised only where nothing was
+                              rented (the launch records it as refused). Sent once, unless the API
                               collapses repeats of it (Lium's idempotency key): then
                               it may be sent again, and once an answer was lost,
                               only an id settles it

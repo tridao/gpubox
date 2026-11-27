@@ -78,10 +78,10 @@ class Client:
 
     def call(
         self, method, path, *, body=None, query=None, retries=2, timeout=None, headers=None,
-        text=False,
+        as_text=False,
     ):  # fmt: skip
         """The parsed JSON answer (None for an empty one), or `error(status, message)`.
-        `headers` are added to this call's (an idempotency key). `text`: the answer as
+        `headers` are added to this call's (an idempotency key). `as_text`: the answer as
         text, for an API that answers some calls with a bare value (Verda's ids)."""
         timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
         url = f"{self.base}/{path}"
@@ -99,20 +99,20 @@ class Client:
             try:
                 with OPENER.open(req, timeout=timeout) as resp:
                     raw = resp.read()
-                    if text:
+                    if as_text:
                         return raw.decode()
                     return json.loads(raw) if raw.strip() else None
             except urllib.error.HTTPError as exc:
                 try:
-                    text = exc.read().decode(errors="replace")
+                    body_text = exc.read().decode(errors="replace")
                 except Exception:
-                    text = ""
+                    body_text = ""
                 if (exc.code == 429 or exc.code >= 500) and attempt < retries:
                     time.sleep(2**attempt)
                     continue
-                msg = f"{method} /{path}: HTTP {exc.code}: {describe_error(text)}"
+                msg = f"{method} /{path}: HTTP {exc.code}: {describe_error(body_text)}"
                 err = self.error(exc.code, msg)
-                err.code = error_code(text)
+                err.code = error_code(body_text)
                 raise err from None
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 if attempt < retries:

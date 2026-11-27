@@ -881,7 +881,7 @@ class BoxWatch:
             log(f"WARNING: could not ask the provider about the box: {exc}")
             return None
         if inst is None:
-            self.status = "gone"
+            self.status, self.over = "gone", True
             return False
         view = provider.view(inst)
         self.status = inst.get("actual_status")

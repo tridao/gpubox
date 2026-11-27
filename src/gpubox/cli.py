@@ -804,7 +804,9 @@ def main(argv=None) -> int:
     spec_args(s)
     provider_args(s)
     s.add_argument(
-        "--ttl-min", type=number(int, 1), help="Vast only: minimum offer lifetime (default 90 min)"
+        "--ttl-min",
+        type=number(int, 1),
+        help="the lease the offers must outlast (Vast, Lium; default 90 min)",
     )
     s.set_defaults(fn=cmd_search)
 

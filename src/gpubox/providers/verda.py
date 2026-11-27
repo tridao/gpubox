@@ -65,6 +65,12 @@ class VerdaError(prov.ProviderError):
     pass
 
 
+def gone(exc: VerdaError) -> bool:
+    """Is this Verda saying there is no such instance? A 404 from anything else (a
+    gateway, a route that moved) is not."""
+    return exc.status == 404 and exc.code == "not_found"
+
+
 class Client:
     """Verda's API (httpapi.Client) with a token from the client credentials, renewed
     before it runs out, and once more if a call is refused as unauthorized."""
@@ -75,11 +81,20 @@ class Client:
         self._auth = httpapi.Client(base, {}, VerdaError, timeout)
         self._until = 0.0
 
-    def _token(self) -> str:
+    def _token(self, timeout=None, retries=2) -> str:
+        """The token, renewed if it runs out. Its failure is the token's, never an answer
+        about what the call was for: an error with no status, or a refusal of the
+        credentials (ConfigError)."""
         if time.monotonic() >= self._until:
-            data = self._auth.call(
-                "POST", "oauth2/token", body={"grant_type": "client_credentials", **self._creds}
-            )
+            try:
+                data = self._auth.call(
+                    "POST", "oauth2/token", timeout=timeout, retries=retries,
+                    body={"grant_type": "client_credentials", **self._creds},
+                )  # fmt: skip
+            except VerdaError as exc:
+                if exc.status in (400, 401, 403):
+                    raise ConfigError(f"Verda refused the client credentials: {exc}") from None
+                raise VerdaError(0, f"no token: {exc}") from None
             token = data.get("access_token") if isinstance(data, dict) else None
             life = data.get("expires_in") if isinstance(data, dict) else None
             if not isinstance(token, str) or not token or type(life) not in (int, float):
@@ -89,19 +104,15 @@ class Client:
         return self._api.headers["Authorization"][len("Bearer ") :]
 
     def call(self, method, path, **kw):
-        try:
-            self._token()
-        except VerdaError as exc:
-            if exc.status in (400, 401, 403):
-                raise ConfigError(f"Verda refused the client credentials: {exc}") from None
-            raise
+        budget = {"timeout": kw.get("timeout"), "retries": kw.get("retries", 2)}
+        self._token(**budget)
         try:
             return self._api.call(method, path, **kw)
         except VerdaError as exc:
             if exc.status != 401:
                 raise
             self._until = 0.0  # refused before anything was done: once more, renewed
-            self._token()
+            self._token(**budget)
             return self._api.call(method, path, **kw)
 
     def project(self) -> str:
@@ -241,11 +252,11 @@ class Verda:
                 continue
             for lp in t.get("location_prices") or []:
                 loc = lp.get("location_code") if isinstance(lp, dict) else None
-                cc = country.get(loc)
-                if not isinstance(loc, str) or not isinstance(cc, str):
+                if not isinstance(loc, str):
                     continue
-                if spec.exclude_countries and cc.upper() in skip:
-                    continue
+                cc = country.get(loc) if isinstance(country.get(loc), str) else ""
+                if spec.exclude_countries and (not cc or cc.upper() in skip):
+                    continue  # a country not stated is not known to be allowed
                 for spot in tiers:
                     price = number(lp.get("spot_price" if spot else "price_per_hour"))
                     if price is None or not 0 < price < 1e5 or price > cap:
@@ -264,6 +275,8 @@ class Verda:
                     "gpu_name": model, "cuda_max_good": cuda, "boot_s": BOOT_S,
                     "_type": itype, "_location": loc, "_image": image, "_spot": spot,
                 })  # fmt: skip
+        # Cheapest first, each place once before repeats at its price (a stable sort).
+        offers.sort(key=lambda o: (o["dph_total"], o["_spot"]))
         note = (
             f"{len(found)} instance type(s) and location(s) for {spec.gpu_text} on Verda "
             f"within ${spec.max_dph_per_gpu:g}/GPU/hr, CUDA {spec.min_cuda:g}+"
@@ -291,7 +304,7 @@ class Verda:
                 return k["id"]
         answer = self.client.call(
             "POST", "ssh-keys", body={"name": KEY_NAME, "key": placeholder_key()},
-            retries=0, text=True,
+            retries=0, as_text=True,
         )  # fmt: skip
         kid = answer.strip().strip('"') if isinstance(answer, str) else None
         if not kid or not _ID.fullmatch(kid):
@@ -322,7 +335,7 @@ class Verda:
             # for an on-demand VM, whose delete names the volume)
             body["os_volume"]["on_spot_discontinue"] = "delete_permanently"
         try:
-            answer = self.client.call("POST", "instances", body=body, retries=0, text=True)
+            answer = self.client.call("POST", "instances", body=body, retries=0, as_text=True)
         except VerdaError as exc:
             if exc.code in ("unauthorized_request", "insufficient_funds", "forbidden_action"):
                 raise ConfigError(f"Verda refused the create for this account: {exc}") from None
@@ -341,7 +354,7 @@ class Verda:
                 "GET", f"instances/{instance_id}", timeout=timeout, retries=retries
             )
         except VerdaError as exc:
-            if exc.status == 404:
+            if gone(exc):
                 return None
             raise
         row = _row(data)
@@ -384,7 +397,7 @@ class Verda:
         try:
             data = self.client.call("PUT", "instances", body=body, timeout=timeout, retries=retries)
         except VerdaError as exc:
-            if exc.status == 404:
+            if gone(exc):
                 return
             raise
         for r in data if isinstance(data, list) else []:  # None: already in that state
@@ -396,23 +409,28 @@ class Verda:
                     )
 
     def relabel(self, instance_id, label: str) -> None:
-        """The new tag, then the old one removed, then read back. In between the instance
-        carries two of our tags, which makes its row unreadable (a listing fails) rather
-        than untagged (a box the reaper cannot see)."""
+        """The new tag, read back, and only then the old ones removed, then read back:
+        a renewal cut short leaves both tags, which the row reads as the earlier lease
+        (`_row`), never none. A renewal again settles it."""
         if parse_tag(label) is None:
             raise ValueError(f"not a tag: {label!r}")
         row = self.instance(instance_id)
         if row is None:
             raise VerdaError(404, f"instance {instance_id} is gone")
-        if row["label"] != label:
+        if label not in _ours(row):
             self.client.call(
                 "POST", f"instances/{instance_id}/tags", body={"key": TAG_KEY, "value": label}
             )
+            row = self.instance(instance_id)
+            if row is None or label not in _ours(row):
+                raise VerdaError(200, f"retag of instance {instance_id} not confirmed")
         for t in row.get("tags") or []:
-            if t.get("key") == TAG_KEY and t.get("value") != label and t.get("id"):
+            if t["key"] == TAG_KEY and t["value"] != label and parse_tag(t["value"]):
+                if not isinstance(t.get("id"), str):
+                    raise VerdaError(200, f"a tag of instance {instance_id} has no id")
                 self.client.call("DELETE", f"instances/{instance_id}/tags/{t['id']}")
         row = self.instance(instance_id)
-        if row is None or row["label"] != label:
+        if row is None or _ours(row) != [label]:
             raise VerdaError(200, f"retag of instance {instance_id} not confirmed")
 
     def account(self) -> str:
@@ -444,9 +462,17 @@ class Verda:
         return f"${a.dph:.2f}/hr, {a.gpu}, {a.geo}"
 
 
+def _ours(row: dict) -> list[str]:
+    return [
+        t["value"] for t in row.get("tags") or [] if t["key"] == TAG_KEY and parse_tag(t["value"])
+    ]
+
+
 def _row(raw) -> dict | None:
-    """An instance as the launcher reads rows: `label` (the value of its one tag of ours,
-    or None) and `actual_status`; None if it cannot be read or carries two of our tags."""
+    """An instance as the launcher reads rows: `label` (its tag of ours, or None) and
+    `actual_status`; None if it cannot be read. Several tags of ours of one attempt (a
+    renewal cut short) read as the one that ends first; of two attempts, as unreadable.
+    A tag without a string key and value is unreadable, not someone else's."""
     if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
         return None
     if not _ID.fullmatch(raw["id"]) or "tags" not in raw:  # not told: not the same as none
@@ -454,12 +480,14 @@ def _row(raw) -> dict | None:
     status, tags = raw.get("status"), raw["tags"]
     if not isinstance(status, str) or not status or not (tags is None or isinstance(tags, list)):
         return None
-    if not all(isinstance(t, dict) for t in tags or []):
+    for t in tags or []:
+        if not (isinstance(t, dict) and isinstance(t.get("key"), str)):
+            return None
+        if not isinstance(t.get("value"), str):
+            return None
+    ours = [parse_tag(v) for v in _ours({"tags": tags or []})]
+    if len({(t.run, t.attempt) for t in ours}) > 1:
         return None
-    ours = [
-        t.get("value") for t in tags or []
-        if t.get("key") == TAG_KEY and parse_tag(t.get("value")) is not None
-    ]  # fmt: skip
-    if len(ours) > 1:
-        return None
-    return {**raw, "label": ours[0] if ours else None, "actual_status": status.lower()}
+    values = _ours({"tags": tags or []})
+    label = min(values, key=lambda v: parse_tag(v).expiry) if values else None
+    return {**raw, "tags": tags or [], "label": label, "actual_status": status.lower()}

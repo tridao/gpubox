@@ -485,3 +485,9 @@ def test_the_model_is_matched_as_the_searches_match_it(tmp_path):
         assert (ok, reason) == (True, None), detail
     ok, reason, _, _ = real_gate(tmp_path / "x", want={**WANT, "gpus": ["5090 RTX"]})
     assert reason == "wrong_hardware"
+
+
+def test_the_gate_script_is_python_an_old_image_can_run():
+    import ast
+
+    ast.parse(gate.GATE_SCRIPT, feature_version=(3, 7))  # no walrus, no match, no 3.8+ syntax

@@ -768,7 +768,7 @@ seen in it.
 **The rent.** The rent carries an `Idempotency-Key`, the tag: within a day,
 Lium answers the same key and body with the first answer (seen live,
 `Idempotent-Replayed: true`). So unlike every other create, it is sent
-again, the same body, while there is no answer (no reply, a 5xx, a
+again, the same body, while there is no answer (no reply, a 5xx, a 408, a
 redirect) or the first is still running (`idempotency_in_progress`,
 `own_rent_in_progress`), and after a 429. Once an answer was lost, only a
 pod id settles the rent: a refusal that follows may be Lium's answer to the
@@ -776,7 +776,11 @@ repeat, not to the request that rented, so the attempt stays unanswered
 and keeps its slot. Errors carry a stable `error.code`, which is what is
 read: one about the account or the image stops the launch, since no other
 node would answer otherwise. A pod id is taken only from a successful
-answer, and not if a lookup shows that pod under another name.
+answer, and only once a lookup shows that pod under our name: until then
+nothing is done to it (not even its removal time), and the attempt counts
+as unanswered, so the sweep finds it by its tag. A configuration error from
+any provider's create means nothing was rented (`base.py`), so the launch
+records the attempt as refused and `down` can close the run.
 
 **The lease** is Lium's: a pod's `removal_scheduled_at`. The rent carries
 `termination_hours`, the lease rounded up to whole hours, as its backstop:
@@ -843,10 +847,15 @@ account (insufficient funds) stops the launch. The OS volume is at least
 50 GB (Verda refused 40). A spot VM's volume is created to be deleted when
 the VM is discontinued (Verda refuses that policy for an on-demand VM).
 
-The tag is a tag, key `gpubox`; renewing adds the new one before it removes
-the old, so a renewal cut short leaves a row with two of our tags, which is
-unreadable and fails a listing, rather than an untagged VM the reaper cannot
-see. A delete names the OS volume, to be deleted permanently. A deleted VM,
+The tag is a tag, key `gpubox`. Renewing adds the new one, reads it back,
+and only then removes the old, so a renewal that did not take leaves the old
+tag, never none, and one cut short leaves two tags of one attempt, which the
+row reads as the one that ends first (early, not late), and which the next
+renewal settles. Tags of two attempts, or a tag without a string key and
+value, make the row unreadable, which fails a listing rather than taking a
+VM for someone else's. Only Verda's own `not_found` is a missing VM; a token
+that cannot be had is no answer about anything (and is renewed within the
+call's own time and retries). A delete names the OS volume, to be deleted permanently. A deleted VM,
 spot or not, and an evicted spot VM, become `discontinued`: the listing no
 longer shows them, and a lookup does for minutes after, so `discontinued`
 counts as gone; the volume follows within about a minute. Verda keeps no
@@ -875,7 +884,13 @@ or Max-Q. An SXM part has more SMs or clocks, more power and NVLink, so it is
 not taken for the PCIe one. What a name does not say is not assumed, with
 one exception that nvidia-smi forces: an H200 without a form is the SXM one
 ("NVIDIA H200" against "NVIDIA H200 NVL"), and HBM3 on an H100 or H200 is SXM.
-GeForce suffixes (Ti, SUPER, D) and laptop chips are other cards. A memory a
+GeForce suffixes (Ti, SUPER, D) and laptop chips are other cards, and so is
+the A10G. A name is read as words split into letters and numbers ("L40S" is
+"l 40 s"), so Hyperstack's "L40-spot" is an L40, not an L40S, and a model's
+number does not run into a memory after it ("L4 24GB"). A MIG slice is part of
+a GPU: it matches only a request that names MIG, and the slice if named. A
+form a family does not come in ("H200-PCIe") matches nothing, rather than
+any form. A memory a
 name states ("80GB", "80G") is kept; memory is not part of the model's name,
 as in gpuhunt and dstack, and a memory asked for must agree within 5% with
 what a name or the provider's own field states (nvidia-smi's 143771 MiB is an
@@ -890,7 +905,7 @@ the model, and the name as written in case it is a new one of Vast's; what
 comes back is checked again, form and memory included (`gpu_ram`). The gate
 reads what nvidia-smi says on the box with the same code: `gpus.py` is sent
 ahead of the gate script, so it is plain Python that runs as far back as
-3.7. A name `gpus.py` does not know is matched word by word, in order, as it
+3.7 (a test parses the whole script as 3.7's grammar). A name `gpus.py` does not know is matched word by word, in order, as it
 was before, and `up` and `search` say so; SkyPilot instead refuses an
 unknown or ambiguous name, which would hold up a new GPU until the table has
 it.

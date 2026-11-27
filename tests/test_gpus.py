@@ -48,6 +48,10 @@ NAMES = [
     ("RTX 4080S", "RTX4080S"), ("NVIDIA GeForce RTX 4080 SUPER", "RTX4080S"),
     ("RTX 3060 laptop", "RTX3060Laptop"), ("GTX 1660 S", "GTX1660S"),
     ("NVIDIA GeForce GTX 1660 Ti", "GTX1660Ti"), ("RTX 5090", "RTX5090"),
+    # boundaries: Hyperstack's "L40-spot" is an L40, a memory after a model is memory
+    ("L40-spot", "L40"), ("L40S", "L40S"), ("L4 24GB", "L4"), ("A40 48GB", "A40"),
+    ("Tesla T4 16GB", "T4"), ("A10G", "A10G"), ("NVIDIA A10", "A10"),
+    ("RTX A5000 Laptop GPU", "A5000Laptop"),
 ]  # fmt: skip
 
 
@@ -56,8 +60,15 @@ def test_every_providers_name_and_nvidia_smis_are_read_as_one_model(name, model)
     assert gpus.identify(name).name == model
 
 
+def test_every_model_reads_back_from_its_own_name():
+    for name, _ in NAMES:
+        m = gpus.identify(name)
+        assert gpus.identify(m.name, implied=False).name == m.name, (name, m.name)
+
+
 @pytest.mark.parametrize(
-    "name", ["CMP 170HX", "AMD Instinct MI300X OAM", "NVIDIA Graphics Device", "", "x"]
+    "name",
+    ["Quadro P1000", "CMP 170HX", "AMD Instinct MI300X OAM", "NVIDIA Graphics Device", "", "x"],
 )
 def test_a_name_that_is_no_known_model_is_none(name):
     assert gpus.identify(name) is None
@@ -99,6 +110,19 @@ def test_several_names_for_one_gpu_are_read_together_the_first_naming_the_family
         ("V100", "Tesla V100S", None, False),
         ("MI300X", "AMD Instinct MI300X OAM", None, True),  # unknown: word by word
         ("", "NVIDIA H100 PCIe", None, False),
+        ("L40S", "L40-spot", None, False),
+        ("L4", "NVIDIA L4", 23.0, True),
+        ("A10", "A10G", None, False),
+        ("RTX 4060 Ti 8GB", "NVIDIA GeForce RTX 4060 Ti", 16.0, False),
+        ("RTX4070TiS", "NVIDIA GeForce RTX 4070 Ti SUPER", None, True),
+        ("RTX4070TiS", "NVIDIA GeForce RTX 4070", None, False),
+        ("RTX A5000", "RTX A5000 Laptop GPU", None, False),
+        ("H200-PCIe", "NVIDIA H200", None, False),  # no such chip: nothing, not any H200
+        # a MIG slice only for whoever names it, and the slice named
+        ("RTX PRO 6000", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", None, False),
+        ("RTX PRO 6000 MIG", "NVIDIA RTX PRO 6000 Blackwell Server Edition", None, False),
+        ("RTX PRO 6000 MIG", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", None, True),
+        ("RTX PRO 6000 MIG 2g", "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb", None, False),
     ],
 )  # fmt: skip
 def test_what_a_gpu_asked_for_matches(asked, name, memory, yes):

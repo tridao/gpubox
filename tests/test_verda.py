@@ -76,8 +76,8 @@ class FakeApi:
         self.instances, self.keys, self.calls, self.fail = {}, [], [], {}
         self.n = 0
 
-    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None, text=False):
-        self.calls.append((method, path, body, query, retries, text))
+    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None, as_text=False):
+        self.calls.append((method, path, body, query, retries, as_text))
         parts = path.split("/")
         key = f"{method} {parts[0]}" + (f" {parts[-1]}" if len(parts) > 2 else "")
         if self.fail.get(key):
@@ -203,6 +203,20 @@ def test_the_models_asked_for_the_count_the_cap_and_the_countries():
     assert p.candidates(cheap, {}, L.Policy())[0] == []
     away = L.Spec(image="i", gpus=(), max_dph_per_gpu=3.0, exclude_countries=("FI",))
     assert p.candidates(away, {}, L.Policy())[0] == []
+    LOCATIONS[0]["country_code"] = ""  # not stated: not known to be allowed
+    try:
+        some = L.Spec(image="i", gpus=(), max_dph_per_gpu=3.0, exclude_countries=("US",))
+        assert {o["_location"] for o in p.candidates(some, {}, L.Policy())[0]} == {"FIN-02"}
+        anywhere = L.Spec(image="i", gpus=(), max_dph_per_gpu=3.0, exclude_countries=())
+        assert {o["_location"] for o in p.candidates(anywhere, {}, L.Policy())[0]} >= {"FIN-01"}
+    finally:
+        LOCATIONS[0]["country_code"] = "FI"
+
+
+def test_offers_are_cheapest_first_across_the_slots_of_a_race():
+    p, _ = make()
+    offers = p.candidates(SPEC, {}, L.Policy(spare=1))[0]
+    assert [o["dph_total"] for o in offers] == [2.02, 2.02, 2.41, 2.41]
 
 
 def test_a_type_that_does_not_state_a_size_does_not_meet_a_minimum():
@@ -220,8 +234,8 @@ def test_a_vm_is_created_once_with_our_tag_the_box_script_and_a_volume_that_goes
     offer = p.candidates(spot, {}, L.Policy())[0][0]
     tag = make_tag(RUN_ID, 1, EXPIRY)
     iid = p.create(offer, spot, tag, "ssh-ed25519 AAAA run-key", EXPIRY)
-    ((_, _, body, _, retries, text),) = creates(api)
-    assert (retries, text) == (0, True) and iid in api.instances  # the answer is the bare id
+    ((_, _, body, _, retries, as_text),) = creates(api)
+    assert (retries, as_text) == (0, True) and iid in api.instances  # the answer is the bare id
     assert body["tags"] == [{"key": "gpubox", "value": tag}] and body["description"] == tag
     assert body["is_spot"] is True and body["instance_type"] == "1A100.22V"
     assert body["image"] == "24.04.cuda13.4.docker" and body["location_code"] == "FIN-01"
@@ -352,6 +366,59 @@ def test_a_retag_adds_the_new_tag_before_it_removes_the_old_and_is_read_back():
         p.relabel(uid(1), make_tag(RUN_ID, 1, EXPIRY + 900))
 
 
+def test_a_retag_that_did_not_take_leaves_the_old_tag():
+    p, api = make()
+    api.instances[uid(1)] = row(1)
+    old = api.instances[uid(1)]["tags"][0]["value"]
+    api.fail["POST instances tags"] = [{}]  # said yes, did nothing
+    with pytest.raises(vd.VerdaError, match="not confirmed"):
+        p.relabel(uid(1), make_tag(RUN_ID, 1, EXPIRY + 900))
+    assert [t["value"] for t in api.instances[uid(1)]["tags"]] == [old]
+
+
+def test_a_retag_cut_short_reads_as_the_earlier_lease_and_a_retag_settles_it():
+    p, api = make()
+    early, late = make_tag(RUN_ID, 1, EXPIRY), make_tag(RUN_ID, 1, EXPIRY + 600)
+    api.instances[uid(1)] = row(1, tags=[{"id": "a", "key": "gpubox", "value": late},
+                                         {"id": "b", "key": "gpubox", "value": early}])  # fmt: skip
+    assert p.instance(uid(1))["label"] == early and [r["id"] for r in p.instances()] == [uid(1)]
+    p.relabel(uid(1), late)
+    assert [t["value"] for t in api.instances[uid(1)]["tags"]] == [late]
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        [{"id": "a", "key": "gpubox", "value": make_tag(RUN_ID, 1, EXPIRY)},
+         {"id": "b", "key": "gpubox", "value": make_tag(RUN_ID, 2, EXPIRY)}],  # two attempts
+        [{}], [{"key": "gpubox"}], [{"id": "a", "value": "x"}], ["gpubox"],
+    ],
+)  # fmt: skip
+def test_tags_that_do_not_say_whose_it_is_make_the_row_unreadable(tags):
+    assert vd._row(row(1, tags=tags)) is None
+    assert vd._row(row(1, tags=[{"id": "a", "key": "team", "value": ""}]))["label"] is None
+
+
+def test_only_verdas_word_that_there_is_no_such_vm_is_gone():
+    p, api = make()
+    for answer in (vd.VerdaError(404, "<html>"), err(404, "server_error")):
+        api.fail["GET instances"] = [answer]
+        with pytest.raises(vd.VerdaError):
+            p.instance(uid(1))
+
+
+def test_a_token_that_cannot_be_had_is_no_answer_about_the_call(monkeypatch):
+    monkeypatch.setattr(vd.httpapi, "Client", FakeHttp)
+    FakeHttp.log, FakeHttp.n, FakeHttp.life, FakeHttp.expired = [], 0, 600, False
+    FakeHttp.token_error = vd.VerdaError(404, "no such route")
+    try:
+        with pytest.raises(vd.VerdaError) as exc:
+            vd.Verda(vd.Client("id", "s")).instance(uid(1))
+        assert exc.value.status == 0 and [p for p, _ in FakeHttp.log] == ["oauth2/token"]
+    finally:
+        FakeHttp.token_error = None
+
+
 def test_a_vm_is_running_for_us_once_it_has_a_public_ip_reached_as_ubuntu():
     p, _ = make()
     r = vd._row(row(1))
@@ -373,6 +440,7 @@ class FakeHttp:
     """httpapi.Client, as the token client and the API client both see it."""
 
     log = []
+    token_error = None
 
     def __init__(self, base, headers, error, timeout=30):
         self.headers = headers
@@ -380,6 +448,8 @@ class FakeHttp:
     def call(self, method, path, **kw):
         FakeHttp.log.append((path, self.headers.get("Authorization")))
         if path == "oauth2/token":
+            if FakeHttp.token_error:
+                raise FakeHttp.token_error
             if kw["body"]["client_secret"] != "s":
                 raise vd.VerdaError(401, "unauthorized")
             FakeHttp.n += 1

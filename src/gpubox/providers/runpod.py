@@ -151,8 +151,8 @@ class RunPod:
                 gpus.matches(m, g["id"], g.get("name"), memory_gb=memory) for m in spec.gpus
             ):
                 continue
-            # A MIG slice is part of a GPU: only for whoever names it.
-            if "MIG" in g["id"] and not any("mig" in m.lower() for m in spec.gpus):
+            # A MIG slice is part of a GPU: only for whoever names it (gpus.matches).
+            if "MIG" in g["id"] and not spec.gpus:
                 continue
             price = (g.get("price") or {}).get(tier)
             most = (g.get("maxCount") or {}).get(tier)

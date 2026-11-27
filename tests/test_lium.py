@@ -74,6 +74,7 @@ NODES = [
     node(12, price=0.20, cpu={"count": 8}),  # too few CPUs for the default 16
     node(13, price=0.20, effective_download_speed_mbps=None),
     node(14, price=0.20, scheduled_notice={"starting_at": "2026-01-01T00:00:00Z"}),
+    node(24, price=0.20, scheduled_notice={"starting_at": None}),  # a start not said: now
     node(15, price=0.20, free_port_count=0),
     node(16, price=0.20, ram={"total": 36 * KIB, "pod_reserve": 8 * KIB}),
     node(17, price=0.20, available_gpu_count=0),
@@ -334,6 +335,7 @@ def test_once_an_answer_was_lost_a_refusal_does_not_show_that_nothing_was_rented
         (err(500, "internal_error"), prov.CreateUnknown),
         (lm.LiumError(302, "redirect refused"), prov.CreateUnknown),
         (lm.LiumError(0, "timed out"), prov.CreateUnknown),
+        (err(408, None), prov.CreateUnknown),  # a timeout is no answer
         (err(401, "unauthorized"), ConfigError),
         (err(402, "account_unfunded"), ConfigError),
         (err(403, "insufficient_balance"), ConfigError),
@@ -364,6 +366,31 @@ def test_a_rent_that_names_another_pod_is_not_taken_and_that_pod_is_not_touched(
     with pytest.raises(prov.CreateUnknown, match="someone-else"):
         p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
     assert api.pods[uid(7)]["removal_scheduled_at"] is None
+
+
+@pytest.mark.parametrize("lookup", [err(500, "internal_error"), None])
+def test_a_rented_pod_not_seen_under_our_name_is_left_alone(lookup, monkeypatch):
+    p, api = make()
+
+    def instance(pod_id, **kw):
+        if lookup is None:
+            return None
+        raise lookup
+
+    monkeypatch.setattr(p, "instance", instance)
+    offer = p.candidates(SPEC, {}, L.Policy())[0][0]
+    with pytest.raises(prov.CreateUnknown, match="unseen|not listed"):
+        p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
+    (pod,) = api.pods.values()
+    assert pod["removal_scheduled_at"] is None  # nothing done to it: the sweep finds its tag
+
+
+def test_the_backstop_is_the_lease_rounded_up_to_whole_hours():
+    p, api = make()
+    offer = p.candidates(SPEC, {}, L.Policy())[0][0]
+    soon = int(time.time()) + 61 * 60
+    p.create(offer, SPEC, make_tag(RUN_ID, 1, soon), "k", soon)
+    assert rents(api)[0][2]["termination_hours"] == 2
 
 
 def test_a_removal_time_refused_at_the_rent_leaves_the_backstop():
@@ -564,7 +591,10 @@ def test_the_advice_after_a_failed_teardown_says_how_late_liums_lease_may_end_a_
     capsys.readouterr()
     L.explain_leftovers(p, state, [w.instance_id])
     out = capsys.readouterr().out
-    assert "lium deletes each box when its lease ends" in out and "up to 60 min later" in out
+    assert (
+        "lium deletes each box when its lease ends" in out
+        and "up to 60 min after it started running" in out
+    )
 
 
 def test_an_interruptible_pod_closed_by_its_provider_is_replaced_and_not_blamed(tmp_path):
@@ -582,14 +612,16 @@ def test_an_interruptible_pod_closed_by_its_provider_is_replaced_and_not_blamed(
     assert [x["status"] for x in api.pods.values() if x["node"] == uid(5)] == ["DELETING"]
 
 
+@pytest.mark.parametrize("closed", ["BROKEN", None])  # None: gone from the listing
 def test_a_box_lost_to_its_provider_closing_it_says_it_was_most_likely_interrupted(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, closed
 ):
     from gpubox import api as gapi
 
     fake = FakeApi()
-    fake.pods[uid(1)] = {"id": uid(1), "pod_name": make_tag(RUN_ID, 1, EXPIRY),
-                         "status": "BROKEN", "node": uid(5), "gets": 0}  # fmt: skip
+    if closed:
+        fake.pods[uid(1)] = {"id": uid(1), "pod_name": make_tag(RUN_ID, 1, EXPIRY),
+                             "status": closed, "node": uid(5), "gets": 0}  # fmt: skip
     monkeypatch.setenv("LIUM_API_KEY", "k")
     monkeypatch.setattr(lm, "Client", lambda key: fake)
     state = State.begin(tmp_path, RUN_ID, EXPIRY, None,
@@ -597,7 +629,7 @@ def test_a_box_lost_to_its_provider_closing_it_says_it_was_most_likely_interrupt
     state.publish([{"id": uid(1), "attempt": 1, "host": "203.0.113.9", "port": 20001}])
     (box,) = gapi.attach(state_dir=tmp_path).boxes
     lost = box._lost()
-    assert "most likely interrupted" in str(lost) and "BROKEN" in str(lost)
+    assert "most likely interrupted" in str(lost) and (closed or "gone") in str(lost)
 
 
 def test_down_deletes_by_id_and_by_tag(tmp_path):

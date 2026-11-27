@@ -230,13 +230,17 @@ class Lium:
             raise prov.CreateUnknown(
                 200, f"rent on {offer['id']}: unusable answer {str(data)[:300]}"
             )
+        # The pod is ours only once it is seen under our name: until then nothing is done
+        # to it, and the attempt counts as unanswered (the sweep looks for its tag).
         try:
             row = self.instance(pod)
-        except LiumError:
-            return pod  # the launcher looks it up, and sets its lease once it runs
-        if row is not None and row["label"] != label:
-            # Not the pod we asked for, as far as we know: nothing is done to it.
-            raise prov.CreateUnknown(200, f"rent answered pod {pod}, named {row['label']!r}")
+        except LiumError as exc:
+            raise prov.CreateUnknown(
+                exc.status, f"rent answered pod {pod}, unseen: {exc}"
+            ) from None
+        if row is None or row["label"] != label:
+            named = repr(row["label"]) if row else "not listed"
+            raise prov.CreateUnknown(200, f"rent answered pod {pod}, {named}")
         try:
             # Covers a pod that never starts; once it runs, Lium replaces it (see `admit`).
             self._schedule(pod, expiry)
@@ -256,7 +260,9 @@ class Lium:
                     headers={"Idempotency-Key": label},
                 )  # fmt: skip
             except LiumError as exc:
-                answered = 400 <= exc.status < 500 and exc.code not in UNKNOWN
+                # 408 is a timeout, not an answer; the UNKNOWN codes say ours may yet rent.
+                answered = 400 <= exc.status < 500 and exc.status != 408
+                answered = answered and exc.code not in UNKNOWN
                 if not answered:
                     lost = exc
                 again = not answered or exc.status == 429
@@ -483,7 +489,7 @@ def _fit(x, spec, horizon: float) -> dict | None:
     # whose start cannot be read is taken to start now.
     notice = x.get("scheduled_notice")
     if notice is not None:
-        notice = notice.get("starting_at", "") if isinstance(notice, dict) else ""
+        notice = (notice.get("starting_at") if isinstance(notice, dict) else None) or ""
     for when in (x.get("removal_at"), notice):
         if when is not None and not _after(when, horizon):
             return None

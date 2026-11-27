@@ -747,7 +747,7 @@ class Launch:
                 # It restarted somewhere else (an interruptible box resumed): what passed
                 # the gate is not what would be handed over. Admit it again.
                 log(f"  {a.tag_name} moved to {ep[0]}:{ep[1]}; checking it again")
-                a.phase, a.endpoint, a.check = "booting", None, None
+                a.phase, a.endpoint, a.check, a.admitted = "booting", None, None, False
             else:
                 chosen.append(a)
                 if len(chosen) == count:
@@ -800,6 +800,11 @@ class Launch:
                 iid = self.provider.create(
                     o, spec, a.tag, self.prober.pubkey, state.expiry, frozenset(self.avoid)
                 )
+            except ConfigError:
+                # A provider says so only for a request no offer could meet, before or
+                # instead of renting (base.py): nothing was rented.
+                state.record(a.tag, outcome="refused")
+                raise
             except prov.CreateRefused as exc:
                 state.record(a.tag, outcome="refused")
                 # Usually a stale offer (rented between search and create).
@@ -992,7 +997,11 @@ def explain_leftovers(provider, state: State, left: list[int] | None) -> None:
             else f"{provider.name} deletes each box"
         )
         slack = getattr(provider, "lease_slack", 0)
-        late = f" (one never admitted, up to {slack / 60:.0f} min later)" if slack else ""
+        late = (
+            f" (one never admitted: up to {slack / 60:.0f} min after it started running)"
+            if slack
+            else ""
+        )
         log(f"  If nothing is done, {who} when its lease ends, at {when}{late}.")
         stopped = "an interruptible box that was outbid" if state.meta.get("interruptible") else (
             "one stuck before it ran")  # fmt: skip

@@ -73,3 +73,32 @@ def test_an_authenticated_call_is_not_redirected():
         assert exc.value.status == 302  # never read as anything, least of all a 404
     finally:
         server.shutdown()
+
+
+def test_a_retry_after_an_error_with_a_body_still_answers_json(monkeypatch):
+    import http.server
+    import threading
+
+    from gpubox.providers import httpapi
+
+    answers = [(503, b'{"message": "busy"}'), (200, b'{"ok": true}')]
+
+    class Flaky(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            status, body = answers.pop(0)
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Flaky)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = httpapi.Client(f"http://127.0.0.1:{server.server_port}", {}, rp.RunpodError)
+        monkeypatch.setattr(httpapi.time, "sleep", lambda s: None)
+        assert client.call("GET", "x", retries=1) == {"ok": True}  # not the error's text
+    finally:
+        server.shutdown()

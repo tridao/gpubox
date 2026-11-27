@@ -36,28 +36,31 @@ FORMS = {
 # an H200 SXM "NVIDIA H200", and its NVL "NVIDIA H200 NVL".
 IMPLIED = {"H200": "SXM"}
 
-# Data-center parts, looked for in the name with everything but letters and digits
-# removed, in this order (a longer name before one it contains).
+# Data-center parts, as words of a name split into letters and numbers ("L40S" is
+# "l 40 s", "L40-spot" is "l 40 spot"), in this order. A "gb" after a number is memory.
 _DATACENTER = [
-    ("GH200", r"gh200"), ("GB300", r"gb300"), ("GB200", r"gb200"), ("GB10", r"gb10(?!\d)"),
-    ("B300", r"b300"), ("B200", r"b200"), ("B100", r"b100"),
-    ("H200", r"h200"), ("H100", r"h100"), ("H800", r"h800"), ("H20", r"h20(?!\d)"),
-    ("A100X", r"a100x"), ("A100", r"a100"), ("A800", r"a800"),
-    ("A40", r"a40(?!\d)"), ("A30", r"a30(?!\d)"), ("A16", r"a16(?!\d)"), ("A10", r"a10(?!\d)"),
-    ("L40S", r"l40s"), ("L40", r"l40(?!\d)"), ("L20", r"l20(?!\d)"), ("L4", r"l4(?!\d)"),
-    ("V100S", r"v100s(?!xm)"), ("V100", r"v100"), ("P100", r"p100"), ("P40", r"p40(?!\d)"),
-    ("T4", r"(?:^|tesla|nvidia)t4(?!\d)"),
+    ("GH200", r"(?<!\d) gh 200 "), ("GB300", r"(?<!\d) gb 300 "),
+    ("GB200", r"(?<!\d) gb 200 "), ("GB10", r"(?<!\d) gb 10 "),
+    ("B300", r" b 300 "), ("B200", r" b 200 "), ("B100", r" b 100 "),
+    ("H200", r" h 200 "), ("H100", r" h 100 "), ("H800", r" h 800 "), ("H20", r" h 20 "),
+    ("A100X", r" a 100 x "), ("A100", r" a 100 "), ("A800", r" a 800 "),
+    ("A40", r" a 40 "), ("A30", r" a 30 "), ("A16", r" a 16 "),
+    ("A10G", r" a 10 g "), ("A10", r" a 10 "),
+    ("L40S", r" l 40 s "), ("L40", r" l 40 "), ("L20", r" l 20 "), ("L4", r" l 4 "),
+    ("V100S", r" v 100 s "), ("V100", r" v 100 "), ("P100", r" p 100 "), ("P40", r" p 40 "),
+    ("T4", r" t 4 "),
 ]  # fmt: skip
 
 
 @dataclass(frozen=True)
 class Model:
-    """A GPU model: its family, its form (None: not said), and the memory a name states
-    (None: not said), in GB."""
+    """A GPU model: its family, its form (None: not said), the memory a name states
+    (None: not said), in GB, and its MIG slice (None: a whole GPU; "": any slice)."""
 
     family: str
     form: str | None = None
     memory_gb: float | None = None
+    mig: str | None = None
 
     @property
     def name(self) -> str:
@@ -72,39 +75,50 @@ def _spaced(text: str) -> str:
     return " " + " ".join(t.split()) + " "
 
 
-def _family(text: str) -> str | None:
-    t, c = _spaced(text), re.sub(r"[^a-z0-9]+", "", str(text).lower())
-    m = re.search(r"rtxpro(\d{4})", c)
+def _split_mig(t: str) -> tuple[str, str | None]:
+    """A spaced name, and its MIG slice ("1 g 24 gb"; "" for none said; None: whole)."""
+    if " mig " not in t:
+        return t, None
+    gpu, _, slice_ = t.partition(" mig ")
+    return gpu + " ", slice_.strip()
+
+
+def _laptop(t: str) -> str:
+    return "Laptop" if re.search(r" (?:laptop|mobile) ", t) else ""
+
+
+def _family(t: str) -> str | None:
+    m = re.search(r" rtx ?pro (\d{4}) ", t)
     if m:
         return "RTXPRO" + m.group(1)
     m = re.search(r" (?:rtx )?(\d{4}) ada ", t)
     if m:
         return f"RTX{m.group(1)}Ada"
-    m = re.search(r" (?:quadro|q) rtx (\d{4}) ", t)
+    m = re.search(r" (?:quadro ?|q )rtx (\d{4}) ", t)
     if m:
         return "QuadroRTX" + m.group(1)
-    if " titan rtx " in t:
+    if re.search(r" titan ?rtx ", t):
         return "TitanRTX"
-    if re.search(r" titan x ", t):
+    if re.search(r" titan ?x ", t):
         return "TitanX"
     m = re.search(r" a (\d{4}) ", t)  # the RTX A-series: "RTX A6000", "A6000"
     if m:
-        return "A" + m.group(1)
-    m = re.search(r" (rtx|gtx) (\d{4})((?: (?:ti|super|s|d))*) ", t)
+        return "A" + m.group(1) + _laptop(t)
+    m = re.search(r" (rtx|gtx) (\d{4})((?: (?:ti|super|s|d|tis))*) ", t)
     if m:
-        suffix = m.group(3).split()
+        suffix = " ".join(m.group(3).split()).replace("tis", "ti s").split()
         name = m.group(1).upper() + m.group(2)
         name += "Ti" * ("ti" in suffix) + "S" * bool({"s", "super"} & set(suffix))
-        name += "D" * ("d" in suffix)
-        return name + "Laptop" * bool(re.search(r" (?:laptop|mobile) ", t))
+        return name + "D" * ("d" in suffix) + _laptop(t)
     for family, pattern in _DATACENTER:
-        if re.search(pattern, c):
+        if re.search(pattern, t):
             return family
     return None
 
 
-def _form(family: str, text: str) -> str | None:
-    t = _spaced(text)
+def _form(family: str, t: str) -> str | None:
+    """The form a name says, for a family whose forms are other chips. A form the family
+    does not come in is kept, so that asking for it matches nothing."""
     if family == "RTXPRO6000":
         if re.search(r" max ?q ", t):
             return "MaxQ"
@@ -113,18 +127,20 @@ def _form(family: str, text: str) -> str | None:
         if re.search(r" ws | workstation ", t):
             return "WS"
         return None
-    forms = FORMS.get(family, ())
-    if "NVL" in forms and " nvl " in t:
+    if family not in FORMS:
+        return None
+    if " nvl " in t:
         return "NVL"
-    if re.search(r" pcie ", t):
-        return "PCIe" if "PCIe" in forms else None
-    if " sxm " in t or (family in ("H100", "H200") and re.search(r" hbm 3 ", t)):
-        return "SXM" if "SXM" in forms else None
+    if " pcie " in t:
+        return "PCIe"
+    if " sxm " in t or (family in ("H100", "H200") and " hbm 3 " in t):
+        return "SXM"
     return None
 
 
-def _memory(text: str) -> float | None:
-    m = re.search(r" (\d{2,3}) g(?:b|ib)? ", _spaced(text))
+def _memory(t: str) -> float | None:
+    # "80 gb", "80 g", "8 gb"; not a model's own number ("a 10 g" is the A10G).
+    m = re.search(r"(?<! [a-z]) (\d{1,3}) g(?:i?b)? ", t)
     return float(m.group(1)) if m else None
 
 
@@ -132,15 +148,17 @@ def identify(*texts, implied: bool = True) -> Model | None:
     """The model these names (a provider's several names for one GPU, most telling
     first) say, or None if none is known. `implied`: a form the names leave out but
     always mean (IMPLIED); not for what a person asks, where none means any."""
-    family = next((f for f in (_family(t) for t in texts if t) if f), None)
+    split = [_split_mig(_spaced(t)) for t in texts if t]
+    family = next((f for f in (_family(t) for t, _ in split) if f), None)
     if family is None:
         return None
-    named = [t for t in texts if t and _family(t) in (family, None)]
-    form = next((f for f in (_form(family, t) for t in named) if f), None)
+    named = [(t, mig) for t, mig in split if _family(t) in (family, None)]
+    form = next((f for f in (_form(family, t) for t, _ in named) if f), None)
     if form is None and implied:
         form = IMPLIED.get(family)
-    memory = next((m for m in (_memory(t) for t in named) if m), None)
-    return Model(family, form, memory)
+    memory = next((m for m in (_memory(t) for t, _ in named) if m), None)
+    mig = next((mig for _, mig in named if mig is not None), None)
+    return Model(family, form, memory, mig)
 
 
 def asked(text: str) -> Model | None:
@@ -174,5 +192,10 @@ def matches(asked_text: str, *names, memory_gb: float | None = None) -> bool:
     if have is None or have.family != want.family:
         return False
     if want.form is not None and have.form != want.form:
+        return False
+    # A MIG slice is part of a GPU: only for whoever names it, and the one named.
+    if (want.mig is None) != (have.mig is None):
+        return False
+    if want.mig and f" {want.mig} " not in f" {have.mig} ":
         return False
     return same_memory(want.memory_gb, have.memory_gb) and same_memory(want.memory_gb, memory_gb)

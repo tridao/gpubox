@@ -1241,9 +1241,26 @@ def test_a_healthy_box_that_moved_before_the_hand_off_is_checked_again(tmp_path)
             vast.release = True
 
     vast.hooks["gate_poll"] = gate_poll
+    admitted = []
+    launch.provider.admit = lambda iid, label: admitted.append(iid)
     result = launch.run({})
     assert {w.machine_id for w in result.winners} == {1, 2}
     assert on_disk(state).winners[[w.machine_id for w in result.winners].index(1)]["port"] == 4444
+    one = next(w.instance_id for w in result.winners if w.machine_id == 1)
+    assert admitted.count(one) == 2  # what it was admitted as is not what it is now
+
+
+def test_a_create_that_is_a_configuration_error_rented_nothing_and_down_closes(tmp_path):
+    launch, vast, state = start(tmp_path, {1: "ok"}, spare=0)
+
+    def create(*a, **k):
+        raise L.ConfigError("no offer could meet this")
+
+    launch.provider.create = create
+    with pytest.raises(L.ConfigError):
+        launch.run({})
+    assert [r["outcome"] for r in on_disk(state).data["attempts"].values()] == ["refused"]
+    assert L.down(launch.provider, on_disk(state), FAST) == [] and on_disk(state).closed
 
 
 def test_leftovers_are_explained_with_the_reaper_that_destroys(capsys):
