@@ -148,8 +148,18 @@ an offer is a GPU type in a data center that has it in stock, at RunPod's
 list price, and `--gpu` matches its names ("RTX 4090" matches "NVIDIA GeForce
 RTX 4090"; without `--gpu`, any model under the price cap). A pod deletes
 itself when its lease ends, with the key RunPod gives each pod.
-`--runpod-cloud community` rents community hosts instead of RunPod's own
-data centers.
+By default, `search` and `up` consider both Secure and Community Cloud,
+cheapest first; ties prefer Secure. Use `--runpod-cloud secure` to avoid
+Community hosts, or `--runpod-cloud community` to restrict to them. Stock
+can change between search and launch. RunPod's API cannot require a public
+IP at launch, so gpubox waits for a usable direct SSH endpoint and does not
+hand over a pod without one. RunPod's basic SSH proxy is not a substitute
+for direct SSH and file transfer.
+
+RunPod does not advertise a Vast-style contract end date. `--ttl-min` sets
+gpubox's cleanup timer, not a minimum uptime. The default disk is the pod's
+container disk; copy out anything you want to keep before stopping or
+deleting the pod. Use `down` to confirm teardown.
 
 As everywhere, `--min-cpus` and `--min-ram-gb` default to max(16, 8 per GPU)
 CPUs and 32 GB per GPU: pass smaller ones to admit RunPod's smaller pods.

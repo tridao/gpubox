@@ -76,17 +76,18 @@ class RunPod:
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})
     searchable = True
 
-    def __init__(self, client, *, cloud: str = "SECURE"):
-        if cloud not in CLOUDS:
+    def __init__(self, client, *, cloud: str | None = None):
+        if cloud is not None and cloud not in CLOUDS:
             raise ConfigError(f"RunPod's cloud is SECURE or COMMUNITY, not {cloud!r}")
         self.client, self.cloud = client, cloud
 
     @classmethod
     def from_options(cls, options: dict, key: str) -> RunPod:
-        return cls(Client(key), cloud=str((options or {}).get("cloud") or "SECURE").upper())
+        cloud = (options or {}).get("cloud")
+        return cls(Client(key), cloud=str(cloud).upper() if cloud else None)
 
     def options(self) -> dict:
-        return {"cloud": self.cloud}
+        return {"cloud": self.cloud} if self.cloud else {}
 
     # ------------------------------------------------------------------ offers
 
@@ -102,8 +103,34 @@ class RunPod:
         """GPU types in stock, in each data center that has them, cheapest first, within
         the price cap. Each is offered `policy.max_live` times: a data center can hold
         several boxes, and a try that finds it full costs nothing (it is refused)."""
+        clouds = (self.cloud,) if self.cloud else CLOUDS
+        found = [
+            (price, cloud, gid, dc)
+            for cloud in clouds
+            for price, gid, dc in self._stock(spec, cloud)
+        ]
+        found.sort(key=lambda f: (f[0], f[1] != "SECURE", f[2], f[3] or ""))
+        offers = []
+        for k in range(policy.max_live):
+            for price, cloud, gid, dc in found:
+                tier = cloud.lower()
+                offers.append({
+                    "id": f"{gid}@{tier}/{dc or 'any'}#{k}", "machine_id": None, "host_id": None,
+                    "dph_total": price, "geolocation": f"{tier}/{dc}" if dc else tier,
+                    "gpu_name": gid, "_gpu": gid, "_dc": dc, "_cloud": cloud,
+                })  # fmt: skip
+        offers.sort(key=lambda o: o["dph_total"])  # stable: each place once before repeats
+        tiers = " and ".join(cloud.lower() for cloud in clouds)
+        note = (
+            f"{len(found)} GPU type(s) and place(s) in stock for {spec.gpu_text} on RunPod "
+            f"({tiers}) within ${spec.max_dph_per_gpu:g}/GPU/hr"
+        )
+        return offers, note
+
+    def _stock(self, spec, cloud: str) -> list[tuple[float, str, str | None]]:
+        """Price and placement for GPU types in stock on one tier."""
         n = spec.num_gpus
-        query = {"include": "AVAILABILITY", "product": "POD", "count": n, "cloud": self.cloud}
+        query = {"include": "AVAILABILITY", "product": "POD", "count": n, "cloud": cloud}
         if spec.min_cuda:
             query["minCudaVersion"] = f"{spec.min_cuda:.1f}"
         query.update(self._placement(spec))
@@ -111,7 +138,7 @@ class RunPod:
         gpus = data.get("gpus") if isinstance(data, dict) else None
         if not isinstance(gpus, list):
             raise RunpodError(200, f"unexpected answer to the GPU catalog: {str(data)[:200]}")
-        tier = self.cloud.lower()
+        tier = cloud.lower()
         cap = spec.max_dph_per_gpu * n + 1e-9
         found = []
         for g in gpus:
@@ -137,21 +164,7 @@ class RunPod:
             ]  # fmt: skip
             for dc in places or [None]:  # no data centers listed: let RunPod choose
                 found.append((price * n, g["id"], dc))
-        found.sort(key=lambda f: (f[0], f[1], f[2] or ""))
-        offers = []
-        for k in range(policy.max_live):
-            for price, gid, dc in found:
-                offers.append({
-                    "id": f"{gid}@{dc or 'any'}#{k}", "machine_id": None, "host_id": None,
-                    "dph_total": price, "geolocation": dc or self.cloud.lower(),
-                    "gpu_name": gid, "_gpu": gid, "_dc": dc,
-                })  # fmt: skip
-        offers.sort(key=lambda o: o["dph_total"])  # stable: each place once before repeats
-        note = (
-            f"{len(found)} GPU type(s) and place(s) in stock for {spec.gpu_text} on RunPod's "
-            f"{tier} cloud within ${spec.max_dph_per_gpu:g}/GPU/hr"
-        )
-        return offers, note
+        return found
 
     # ------------------------------------------------------------------ boxes
 
@@ -164,7 +177,7 @@ class RunPod:
             gpu["minCudaVersion"] = f"{spec.min_cuda:.1f}"
         body = {
             "name": label,
-            "cloud": self.cloud,
+            "cloud": offer["_cloud"],
             "image": spec.image,
             "gpu": gpu,
             "disk": spec.disk_gb,

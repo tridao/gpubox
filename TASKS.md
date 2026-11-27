@@ -134,6 +134,8 @@ Providers to add, in this order.
   environment or that file; ids that are tokens.
 - [x] RunPod (REST API v2): pods as boxes, the same bootstrap as Vast, self-deletion with the
   pod's own key. Checked live (DESIGN.md, section 14).
+- [x] Include both Secure and Community RunPod offers by default, with a direct SSH gate
+  for both tiers. Keep single-tier restrictions for callers that need them.
 - [ ] RunPod: private images (a registry credential per run), interruptible pods (GraphQL),
   the machine id (GraphQL) for the blocklist.
 - [x] Shadeform: an aggregator of VM clouds (Hyperstack, Massed Compute, ...), with a lease it

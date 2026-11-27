@@ -40,7 +40,8 @@ CATALOG = [
 class FakeApi:
     def __init__(self, behaviour=None):
         self.pods, self.calls, self.fail = {}, [], {}
-        self.behaviour = behaviour or {}  # data center -> "ok" | "full" | "noaddr"
+        self.behaviour = behaviour or {}  # tier or data center -> "ok" | "full" | "noaddr"
+        self.catalogs = {}  # per-tier overrides of the catalog snapshot
         self.next = 0
         self.page = 1000
 
@@ -53,12 +54,12 @@ class FakeApi:
                 raise answer
             return answer
         if path == "catalog/gpus":
-            return {"gpus": CATALOG}
+            return {"gpus": self.catalogs.get(query["cloud"], CATALOG)}
         if path == "account":
             return {"id": "acct1", "email": None}
         if method == "POST" and path == "pods":
             dc = (body.get("dataCenterIds") or ["any"])[0]
-            if self.behaviour.get(dc) == "full":
+            if self.behaviour.get(body["cloud"], self.behaviour.get(dc)) == "full":
                 raise rp.RunpodError(
                     400, "POST /pods: HTTP 400: Bad Request: no longer any instances available"
                 )
@@ -79,7 +80,8 @@ class FakeApi:
             raise rp.RunpodError(404, f"{method} /{path}: HTTP 404: Not Found: pod not found")
         pod = self.pods[pid]
         if method == "GET":
-            if self.behaviour.get(pod.get("dc")) != "noaddr":
+            cloud = pod.get("body", {}).get("cloud")
+            if self.behaviour.get(cloud, self.behaviour.get(pod.get("dc"))) != "noaddr":
                 n = int(pid[3:7]) if pid.startswith("pod") else 1
                 pod["ssh"] = {"direct": {"host": f"10.0.0.{n}", "port": 40000 + n}}
             return dict(pod)
@@ -101,7 +103,7 @@ def make(api=None, **kw):
 
 
 def test_offers_are_gpu_types_in_stock_per_data_center_cheapest_first_within_the_cap():
-    p, api = make()
+    p, api = make(cloud="SECURE")
     spec = L.Spec(image="i", gpus=(), max_dph_per_gpu=3.0, num_gpus=2, min_cpus=16, min_ram_gb=100)
     offers, note = p.candidates(spec, {}, L.Policy(spare=1))
     _, path, _, query, _ = api.calls[-1]
@@ -109,7 +111,7 @@ def test_offers_are_gpu_types_in_stock_per_data_center_cheapest_first_within_the
     assert query["minCudaVersion"] == "13.0"
     assert (query["minVcpuCountPerGpu"], query["minRamPerGpu"]) == (8, 50)
     places = [(o["_gpu"], o["_dc"], o["dph_total"]) for o in offers]
-    # A6000 is out of stock; CA-MTL-1 has none; the H100 is above 2 x 3.0? no: 5.98 <= 6.
+    # A6000 and CA-MTL-1 are out of stock. H100 is within the cap.
     assert places[:2] == [("NVIDIA GeForce RTX 4090", "EU-RO-1", 1.38),
                           ("NVIDIA GeForce RTX 4090", "US-TX-3", 1.38)]  # fmt: skip
     assert ("NVIDIA H100 80GB HBM3", "US-KS-2", 5.98) in places
@@ -128,10 +130,35 @@ def test_only_the_models_asked_for_and_never_above_the_cap():
     assert p.candidates(cheap, {}, L.Policy())[0] == []
 
 
-def test_the_community_tier_is_priced_as_such():
-    p, _ = make(cloud="COMMUNITY")
+def test_the_default_pool_combines_both_tiers_cheapest_first():
+    p, api = make()
+    offers, note = p.candidates(SPEC, {}, L.Policy(spare=0))
+    assert [c[3]["cloud"] for c in api.calls] == ["SECURE", "COMMUNITY"]
+    assert [(o["_cloud"], o["dph_total"]) for o in offers] == [
+        ("COMMUNITY", 0.34), ("COMMUNITY", 0.34), ("SECURE", 0.69), ("SECURE", 0.69),
+    ]  # fmt: skip
+    assert len({o["id"] for o in offers}) == 4  # A place may appear in both tiers.
+    assert "secure and community" in note
+
+
+def test_availability_is_specific_to_each_tier():
+    p, api = make()
+    api.catalogs["COMMUNITY"] = [{**CATALOG[0], "availability": "NONE"}]
     offers, _ = p.candidates(SPEC, {}, L.Policy(spare=0))
-    assert offers and all(o["dph_total"] == 0.34 for o in offers)
+    assert [o["_cloud"] for o in offers] == ["SECURE", "SECURE"]
+
+    api.catalogs["COMMUNITY"] = [{**CATALOG[0], "dataCenters": []}]
+    api.catalogs["SECURE"] = [{**CATALOG[0], "availability": "NONE"}]
+    offers, _ = p.candidates(SPEC, {}, L.Policy(spare=0))
+    assert [(o["_cloud"], o["_dc"], o["dph_total"]) for o in offers] == [("COMMUNITY", None, 0.34)]
+
+
+def test_secure_is_tried_first_when_prices_tie():
+    p, api = make()
+    gpu = {**CATALOG[0], "price": {"secure": 0.69, "community": 0.69}, "dataCenters": []}
+    api.catalogs = {cloud: [gpu] for cloud in rp.CLOUDS}
+    offers, _ = p.candidates(SPEC, {}, L.Policy(spare=0))
+    assert [o["_cloud"] for o in offers] == ["SECURE", "COMMUNITY"]
 
 
 # ------------------------------------------------------------------ calls
@@ -144,6 +171,7 @@ def test_a_pod_is_created_once_with_our_start_up_command_and_its_tag_as_name():
     pid = p.create(offer, SPEC, tag, "ssh-ed25519 AAAA gpubox", EXPIRY)
     method, path, body, _, retries = api.calls[-1]
     assert (method, path, retries) == ("POST", "pods", 0)
+    assert body["cloud"] == "COMMUNITY" and offer["_cloud"] == "COMMUNITY"
     assert body["name"] == tag and body["image"] == "img:1" and body["ports"] == ["22/tcp"]
     assert body["gpu"] == {
         "id": "NVIDIA GeForce RTX 4090",
@@ -176,7 +204,7 @@ def test_a_pod_is_created_once_with_our_start_up_command_and_its_tag_as_name():
 def test_a_pod_id_only_from_an_explicit_yes(answer, outcome):
     p, api = make()
     api.fail["POST pods"] = [answer]
-    offer = {"id": "x", "_gpu": "NVIDIA GeForce RTX 4090", "_dc": None}
+    offer = {"id": "x", "_gpu": "NVIDIA GeForce RTX 4090", "_dc": None, "_cloud": "SECURE"}
     if isinstance(outcome, str):
         assert p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY) == outcome
     else:
@@ -295,10 +323,22 @@ def test_a_launch_rents_a_pod_skips_a_full_data_center_and_keeps_the_winner(tmp_
     assert on_disk.winners[0]["port"] == 40000 + int(w.instance_id[3:7])
 
 
+def test_a_launch_falls_back_to_secure_when_community_has_no_direct_ssh(tmp_path):
+    run, _, api, _ = launch(tmp_path, {"COMMUNITY": "noaddr"}, spare=0)
+    api.catalogs["COMMUNITY"] = [{**CATALOG[0], "dataCenters": []}]
+    result = run.run({})
+    (winner,) = result.winners
+    assert list(api.pods) == [winner.instance_id]
+    assert [body["cloud"] for m, p, body, _, _ in api.calls if (m, p) == ("POST", "pods")] == [
+        "COMMUNITY",
+        "SECURE",
+    ]
+
+
 def test_down_terminates_by_id_and_by_tag_with_string_ids(tmp_path):
     run, p, api, state = launch(tmp_path)
     run.run({})
-    offer = {"id": "x", "_gpu": "NVIDIA GeForce RTX 4090", "_dc": "US-TX-3"}
+    offer = {"id": "x", "_gpu": "NVIDIA GeForce RTX 4090", "_dc": "US-TX-3", "_cloud": "SECURE"}
     stray = p.create(offer, SPEC, make_tag(RUN_ID, 9, EXPIRY), "k", EXPIRY)
     other = p.create(offer, SPEC, make_tag("dev.other.0123456789ab", 1, EXPIRY), "k", EXPIRY)
     assert L.down(p, state, FAST) == []
@@ -317,6 +357,26 @@ def test_renew_moves_the_pods_own_timer_and_its_name(tmp_path):
 
 
 # ------------------------------------------------------------------ the command line
+
+
+@pytest.mark.parametrize("cloud, expected", [(None, rp.CLOUDS), ("secure", ("SECURE",)),
+                                             ("community", ("COMMUNITY",))])  # fmt: skip
+def test_runpod_search_shows_both_tiers_unless_restricted(
+    tmp_path, capsys, monkeypatch, cloud, expected
+):
+    api = FakeApi()
+    monkeypatch.setenv("RUNPOD_API_KEY", "k")
+    monkeypatch.setattr(rp, "Client", lambda key: api)
+    argv = ["search", "--provider", "runpod", "--gpu", "RTX 4090", "--max-dph-per-gpu", "1",
+            "--state-dir", str(tmp_path)]  # fmt: skip
+    if cloud:
+        argv += ["--runpod-cloud", cloud]
+    assert cli.main(argv) == 0
+    assert tuple(c[3]["cloud"] for c in api.calls) == expected
+    lines = capsys.readouterr().out.splitlines()[1:]
+    assert [line.split("@")[-1].split("/")[0] for line in lines] == [
+        tier.lower() for tier in reversed(expected) for _ in range(2)
+    ]
 
 
 def test_runpod_needs_an_image_and_a_price_and_refuses_what_it_cannot_do(tmp_path, capsys):

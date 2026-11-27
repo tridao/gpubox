@@ -549,12 +549,15 @@ plain ubuntu image), so the timer deletes the pod by itself
 key.
 
 There are no machines to choose. The catalog lists GPU types with a list
-price and, per data center, a stock level; an offer is a GPU type in a data
-center that has it, offered once per slot of the race, since one data
-center can hold several boxes. A data center that turns out full answers
-400 ("no longer any instances available"): the explicit no of a stale
-offer, which costs no attempt. A MIG slice is offered only to whoever names
-it.
+price and stock; an offer is a GPU type in a cloud tier and, when reported,
+a data center. `up` and `search` query Secure and Community separately by
+default, since stock is tier-specific. The combined pool is sorted by price,
+with Secure first at equal prices. Create uses the offer's exact tier so
+it cannot rent a different tier at a different price. An offer is repeated
+once per slot of the race because it can hold several boxes. A data center
+that turns out full answers 400 ("no longer any instances available"): the
+explicit no of a stale offer, which costs no attempt. A MIG slice is offered
+only to whoever names it.
 
 A pod says RUNNING before its container is up; it is running for gpubox
 once it has an SSH address. The v2 API names no machine and gives no
@@ -568,6 +571,17 @@ to 73 s after the create, once 233 s (a slow pull); a pod deleted itself
 within 30 s of `--destroy-after` and 85 s after a renewal to one minute; an
 interrupt mid-launch rolled back in 2.5 s; `down --run-id` from an empty
 directory found the run's pods by name.
+
+**Measured on Community Cloud**, November 2026, `python:3.12-slim`: four
+single-GPU launches (RTX 3070 and RTX 3080 Ti) were healthy in 27–46 s. The
+catalog gave overall stock but no data centers; placement selected by GPU
+type and cloud worked. Each pod had a public `22/tcp` mapping, and SCP over
+SFTP, rsync (once installed), and a detached job worked. Renewing one pod
+to a one-minute lease deleted it within about 75 s. The default container
+disk did not provide a `/workspace` mount. These samples do not establish
+long-term uptime or guarantee a public IP. REST v2 does not offer a public-IP
+placement filter; the direct SSH gate is required even when the pod reports
+`RUNNING`.
 
 Not yet: interruptible pods (v2 does not create them; its GraphQL API
 does), private images (a registry credential per run, deleted with it), and

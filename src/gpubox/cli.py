@@ -73,8 +73,8 @@ def settings(args) -> api.Settings:
             "login": args.login, "partition": args.partition, "account": args.slurm_account,
             "qos": args.qos, "constraint": args.constraint, "sbatch_args": list(args.sbatch_arg),
         }  # fmt: skip
-    elif getattr(args, "provider", None) == "runpod":
-        options = {"cloud": (args.runpod_cloud or "secure").upper()}
+    elif getattr(args, "provider", None) == "runpod" and args.runpod_cloud:
+        options = {"cloud": args.runpod_cloud.upper()}
     return api.Settings(
         state_dir=Path(getattr(args, "state_dir", ".gpubox")),
         account_id=getattr(args, "account_id", None),
@@ -565,7 +565,7 @@ def main(argv=None) -> int:
         s.add_argument(
             "--runpod-cloud",
             choices=("secure", "community"),
-            help="RunPod's tier: its own data centers (secure, the default) or community hosts",
+            help="restrict RunPod to one tier (default: consider both)",
         )
         g = s.add_argument_group("Slurm (with --provider slurm)")
         g.add_argument(
