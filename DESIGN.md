@@ -859,8 +859,47 @@ create and answered SSH at about 50 s. Jobs, `ssh`, `renew` and `down`
 worked, as did `down --run-id` from an empty directory; nothing was left,
 instances or volumes.
 
-`--gpu` matches a model word by word, in order, wherever the words fall in
-the name (`base.gpu_matches`, and the gate the same way): "A100 40GB", as
-Verda names a type, is the "NVIDIA A100-SXM4-40GB" that nvidia-smi then
-shows. Seen live: the gate refused that box while it matched as one string.
+Seen live: the gate refused a box asked for as "A100 40GB", Verda's own
+name, because nvidia-smi calls it "NVIDIA A100-SXM4-40GB" and the model was
+matched as one string. GPU names are now read as models (section 19).
+
+## 19. GPU models
+
+Every provider names a GPU its own way, and nvidia-smi another: "H100 SXM"
+(Vast), "NVIDIA H100 80GB HBM3" (RunPod, Lium, nvidia-smi), "1x H100 SXM5
+80GB" (Verda), "H100-80G-SXM5" (Hyperstack). `gpus.py` reads any of them as
+one model: a family ("H100", "RTX4090", "RTXPRO6000") and, where the form
+factor makes another chip, a form: H100 SXM, PCIe or NVL; H200 SXM or NVL;
+A100, A800, H800 and V100 SXM or PCIe; the RTX PRO 6000 Server, Workstation
+or Max-Q. An SXM part has more SMs or clocks, more power and NVLink, so it is
+not taken for the PCIe one. What a name does not say is not assumed, with
+one exception that nvidia-smi forces: an H200 without a form is the SXM one
+("NVIDIA H200" against "NVIDIA H200 NVL"), and HBM3 on an H100 or H200 is SXM.
+GeForce suffixes (Ti, SUPER, D) and laptop chips are other cards. A memory a
+name states ("80GB", "80G") is kept; memory is not part of the model's name,
+as in gpuhunt and dstack, and a memory asked for must agree within 5% with
+what a name or the provider's own field states (nvidia-smi's 143771 MiB is an
+H200's 141 GB), and is not assumed where neither does.
+
+`--gpu` is read the same way, with a form or a memory only if they are said:
+`H100` is any H100, `H100-SXM` the SXM one. Each provider's search compares
+the model asked for with what it lists (`base.gpu_matches`, which passes on
+the memory a provider states apart). Vast's search takes only Vast's own
+names, so it is asked for the names in its list (`vast.GPU_NAMES`) that are
+the model, and the name as written in case it is a new one of Vast's; what
+comes back is checked again, form and memory included (`gpu_ram`). The gate
+reads what nvidia-smi says on the box with the same code: `gpus.py` is sent
+ahead of the gate script, so it is plain Python that runs as far back as
+3.7. A name `gpus.py` does not know is matched word by word, in order, as it
+was before, and `up` and `search` say so; SkyPilot instead refuses an
+unknown or ambiguous name, which would hold up a new GPU until the table has
+it.
+
+What the others do (their source, November 2026): gpuhunt keeps one list of
+accelerators with canonical names, memory apart, and per provider a table
+from its labels to them (Vast's "A100 PCIE" and "A100 SXM4" are both "A100":
+it does not tell the forms apart). dstack takes `gpu: A100:80GB:2` on top of
+it. SkyPilot keeps a list of canonical names (some with memory in them,
+"A100-80GB") and a catalog per cloud, canonicalizes what is asked without
+case, and refuses an ambiguous name.
 

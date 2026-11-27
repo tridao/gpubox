@@ -52,8 +52,16 @@ hours of remaining lifetime. Pass the same `--ttl-min` to `gpubox search` to
 preview those offers without renting. `renew` moves gpubox's cleanup timer,
 not Vast's contract end time.
 
-`--gpu` can be repeated to accept any of several models (the cheapest offer
-goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
+`--gpu` names a GPU model the same way on every provider, whatever the
+provider calls it: `H100` is any H100, `H100-SXM`, `H100-PCIe` and `H100-NVL`
+one form of it (a different chip: other SMs, clocks, power and NVLink), and a
+memory can be added (`A100 80GB`). The same goes for `A100-SXM`/`A100-PCIe`,
+`H200-SXM`/`H200-NVL`, `V100-SXM`/`V100-PCIe` and `RTXPRO6000-Server`,
+`-WS`, `-MaxQ`; GeForce cards are `RTX 4090` (not the 4090 D, nor the laptop
+chip), `RTX 4070 Ti SUPER`, and so on. The health gate checks the GPU the box
+has the same way. A name gpubox does not know (`gpus.py`) is matched word by
+word against each provider's names, and `up` says so. `--gpu` can be
+repeated to accept any of several models (the cheapest offer goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
 default it gets max(16, 8 per GPU) CPUs and 32 GB of RAM per GPU.
 `--min-cuda` (default 13.0) is the lowest CUDA version the host's driver must
 support: a CUDA 13.x image runs on any 13.x driver but not on a 12.x one.
@@ -147,8 +155,8 @@ gpubox up --provider runpod --gpu "RTX 4090" --max-dph-per-gpu 0.80 --image my/i
 The same as on Vast, with RunPod's pods: the race, the gate, jobs, `ssh`,
 `renew` and the lease all work as they do there. RunPod chooses the machine:
 an offer is a GPU type in a data center that has it in stock, at RunPod's
-list price, and `--gpu` matches its names ("RTX 4090" matches "NVIDIA GeForce
-RTX 4090"; without `--gpu`, any model under the price cap). A pod deletes
+list price, and `--gpu` is read as everywhere (`H100-SXM` is RunPod's "NVIDIA
+H100 80GB HBM3"; without `--gpu`, any model under the price cap). A pod deletes
 itself when its lease ends, with the key RunPod gives each pod.
 By default, `search` and `up` consider both Secure and Community Cloud,
 cheapest first; ties prefer Secure. Use `--runpod-cloud secure` to avoid

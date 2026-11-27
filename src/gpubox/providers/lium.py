@@ -453,7 +453,17 @@ def _fit(x, spec, horizon: float) -> dict | None:
     name = x.get("gpu_class") or x.get("machine_name")
     if not isinstance(name, str) or not name:
         return None
-    if spec.gpus and not any(gpu_matches(m, name, x.get("machine_name")) for m in spec.gpus):
+    details = (
+        (specs.get("gpu") or {}).get("details") if isinstance(specs.get("gpu"), dict) else None
+    )
+    first = (
+        details[0] if isinstance(details, list) and details and isinstance(details[0], dict) else {}
+    )
+    memory = _number(first.get("capacity"))  # MiB
+    memory = memory / 1024 if memory else None
+    if spec.gpus and not any(
+        gpu_matches(m, name, x.get("machine_name"), memory_gb=memory) for m in spec.gpus
+    ):
         return None
     n = spec.num_gpus
     price = _number(x.get("price_per_gpu"))

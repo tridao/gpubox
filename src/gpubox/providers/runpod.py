@@ -146,7 +146,10 @@ class RunPod:
         for g in gpus:
             if not isinstance(g, dict) or not isinstance(g.get("id"), str):
                 continue
-            if spec.gpus and not any(gpu_matches(m, g["id"], g.get("name")) for m in spec.gpus):
+            memory = g.get("memory") if type(g.get("memory")) in (int, float) else None
+            if spec.gpus and not any(
+                gpu_matches(m, g["id"], g.get("name"), memory_gb=memory) for m in spec.gpus
+            ):
                 continue
             # A MIG slice is part of a GPU: only for whoever names it.
             if "MIG" in g["id"] and not any("mig" in m.lower() for m in spec.gpus):

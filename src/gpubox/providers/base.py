@@ -49,9 +49,9 @@ see only this:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
+from .. import gpus
 from ..errors import ConfigError, InfraError
 
 __all__ = ["ConfigError", "CreateRefused", "CreateUnknown", "ProviderError", "View"]
@@ -104,15 +104,8 @@ class View:
     machine: object = None
 
 
-def _compact(text) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
-
-
-def gpu_matches(asked: str, *names) -> bool:
-    """A model asked for, as a person writes it ("RTX 4090", "A100 40GB"), against a
-    provider's names ("NVIDIA GeForce RTX 4090", "NVIDIA A100-SXM4-40GB"): every word of
-    it is in the name, in order, whatever lies between them. The gate (gate.py) matches
-    what nvidia-smi says the same way."""
-    words = re.findall(r"[a-z0-9]+", str(asked).lower())
-    pattern = re.compile(".*".join(map(re.escape, words)))
-    return bool(words) and any(pattern.search(_compact(n)) for n in names if n)
+def gpu_matches(asked: str, *names, memory_gb: float | None = None) -> bool:
+    """A model asked for (`--gpu`: "H100", "H100-SXM", "A100 80GB") against a provider's
+    names for a GPU, most telling first, and its memory where the provider states it
+    apart (gpus.matches). The gate checks what nvidia-smi says the same way."""
+    return gpus.matches(asked, *names, memory_gb=memory_gb)

@@ -237,8 +237,12 @@ class Verda:
                 continue
             if model.endswith(" CC"):
                 continue  # confidential computing: images of its own
+            held = t.get("gpu_memory") if isinstance(t.get("gpu_memory"), dict) else {}
+            total = _number(held.get("size_in_gigabytes"))
+            vram = total / n if total else None
             if spec.gpus and not any(
-                gpu_matches(m, model, t.get("name"), gpu.get("description")) for m in spec.gpus
+                gpu_matches(m, model, t.get("name"), gpu.get("description"), memory_gb=vram)
+                for m in spec.gpus
             ):
                 continue
             if not self._fits(spec, t):

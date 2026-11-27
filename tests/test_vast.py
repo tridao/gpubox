@@ -489,11 +489,31 @@ def test_offer_query_scales_with_gpu_count():
     assert q["cpu_cores_effective"] == {"gte": 32} and q["cpu_ram"] == {"gte": 4 * 32 * 1024}
 
 
+def test_a_model_is_searched_as_vasts_names_for_it_and_as_written():
+    assert v.search_names(["H100"]) == ["H100 NVL", "H100 PCIE", "H100 SXM", "H100"]
+    assert v.search_names(["H100-SXM", "RTX 5090"]) == ["H100 SXM", "H100-SXM", "RTX 5090"]
+    assert v.search_names(["RTX 4090"]) == ["RTX 4090"]  # not the 4090 D, not the laptop
+    q = v.offer_query(Spec(image="i", gpus=("A100",), max_dph_per_gpu=1))
+    assert q["gpu_name"] == {"in": ["A100 PCIE", "A100 SXM4", "A100"]}
+
+
+def test_an_offer_whose_gpu_is_not_what_was_asked_is_dropped(wire, monkeypatch):
+    now = 1795400000
+    monkeypatch.setattr(v.time, "time", lambda: now)
+    spec = Spec(image="i", gpus=("A100-SXM 80GB",), max_dph_per_gpu=2, ttl_min=60)
+    base = {"machine_id": 2, "dph_total": 0.5, "end_date": now + 7200}
+    good = {**base, "id": 1, "gpu_name": "A100 SXM4", "gpu_ram": 81920}
+    small = {**base, "id": 2, "gpu_name": "A100 SXM4", "gpu_ram": 40960}
+    pcie = {**base, "id": 3, "gpu_name": "A100 PCIE", "gpu_ram": 81920}
+    wire({"offers": [good, small, pcie]})
+    assert v.candidates(v.Vast("k"), spec, {}, want=3)[1] == [good]
+
+
 @pytest.mark.parametrize("end_date", [None, True, "1795500000", float("nan"), float("inf")])
 def test_offers_without_a_usable_end_date_are_skipped(wire, monkeypatch, end_date):
     now = 1795400000
     monkeypatch.setattr(v.time, "time", lambda: now)
-    base = {"machine_id": 2, "dph_total": 0.5}
+    base = {"machine_id": 2, "dph_total": 0.5, "gpu_name": SPEC.gpus[0]}
     good = {**base, "id": 1, "end_date": now + 3600}
     bad = {**base, "id": 2, "end_date": end_date}
     missing = {**base, "id": 3}

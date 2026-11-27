@@ -592,8 +592,9 @@ def main(argv=None) -> int:
         s.add_argument(
             "--gpu",
             action="append",
-            help='GPU model, e.g. "RTX 5090" (Vast: required; Slurm: checked by the gate); '
-            "repeat to accept any of several models",
+            help='GPU model: "H100" (any form), "H100-SXM", "A100 80GB", "RTX 5090" '
+            "(gpus.py; Vast: required; Slurm: checked by the gate); repeat to accept any "
+            "of several models",
         )
         s.add_argument("--num-gpus", type=number(int, 1), default=1)
         s.add_argument(

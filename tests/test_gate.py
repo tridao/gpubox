@@ -314,13 +314,13 @@ WANT = {
 }
 
 
-def real_gate(tmp_path, torch_source=None, want=WANT, driver_cuda="12.8"):
+def real_gate(tmp_path, torch_source=None, want=WANT, driver_cuda="12.8", smi=None):
     """Run the real gate script against a stand-in nvidia-smi and, if given, a stand-in
     PyTorch package; the interpreter's own packages are out of reach (-S)."""
     bin_dir, lib = tmp_path / "bin", tmp_path / "lib"
     bin_dir.mkdir(parents=True)
     lib.mkdir()
-    (bin_dir / "nvidia-smi").write_text(SMI)
+    (bin_dir / "nvidia-smi").write_text(smi or SMI)
     (bin_dir / "nvidia-smi").chmod(0o755)
     if torch_source is not None:
         (lib / "torch").mkdir()
@@ -459,6 +459,23 @@ def test_the_remote_side_runs_the_script_by_its_interpreter_with_no_stdin(script
                        text=True, timeout=30)  # fmt: skip
     assert (r.returncode, r.stdout.splitlines()[0]) == expect
     assert "stdin was readable" not in r.stdout
+
+
+@pytest.mark.parametrize(
+    "gpu, mib, asked, ok",
+    [
+        ("NVIDIA H100 80GB HBM3", 81559, "H100-SXM", True),
+        ("NVIDIA H100 PCIe", 81559, "H100-SXM", False),  # another chip
+        ("NVIDIA H100 PCIe", 81559, "H100", True),
+        ("NVIDIA A100-SXM4-40GB", 40960, "A100 80GB", False),
+        ("NVIDIA H200", 143771, "H200 141GB", True),
+        ("NVIDIA GeForce RTX 4090", 49140, "RTX 4090 24GB", False),  # a 48 GB one
+    ],
+)  # fmt: skip
+def test_the_box_reads_its_gpu_as_the_searches_read_the_offer(tmp_path, gpu, mib, asked, ok):
+    smi = SMI.replace("NVIDIA GeForce RTX 5090, 32607", f"{gpu}, {mib}")
+    got, reason, detail, _ = real_gate(tmp_path, want={**WANT, "gpus": [asked]}, smi=smi)
+    assert (got, reason) == ((True, None) if ok else (False, "wrong_hardware")), detail
 
 
 def test_the_model_is_matched_as_the_searches_match_it(tmp_path):

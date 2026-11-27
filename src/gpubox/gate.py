@@ -21,11 +21,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import gpus
 from .policy import REASONS
 from .onbox import LOAD_ENV
 
-GATE_VERSION = 4  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old;
-# 4: the model compared without case or punctuation, as the providers' searches compare it
+GATE_VERSION = 5  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: driver_too_old;
+# 4: the model compared without case or punctuation, as the providers' searches compare it;
+# 5: the model compared as gpus.py reads it, form factor and memory included
 
 # Verdicts the gate gives that are about the caller's choice, not the machine: the box
 # fails, nobody is blamed. driver_too_old: the host's driver supports an older CUDA major
@@ -33,7 +35,10 @@ GATE_VERSION = 4  # 2: CUDA checks skipped without a CUDA build of PyTorch; 3: d
 # 13.x driver runs a 13.x build).
 NO_BLAME = ("driver_too_old",)
 
-GATE_SCRIPT = r"""
+# The script, with gpus.py before it: the model is read on the box as the searches read it.
+GATE_SCRIPT = (
+    Path(gpus.__file__).read_text()
+    + r"""
 import json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request, warnings
 
 want = json.loads(sys.argv[1])
@@ -71,16 +76,6 @@ def driver_cuda():
     except Exception:
         return None
 
-def compact(name):
-    return re.sub(r"[^a-z0-9]+", "", name.lower())
-
-def matches(model, name):
-    # As the providers' searches match names (base.gpu_matches): every word of the model
-    # in the name, in order: "rtx4090" is "NVIDIA GeForce RTX 4090", and "A100 40GB" is
-    # "NVIDIA A100-SXM4-40GB".
-    words = re.findall(r"[a-z0-9]+", model.lower())
-    return bool(words) and re.search(".*".join(map(re.escape, words)), compact(name)) is not None
-
 rows = smi()
 out["gpus"] = [r[1] for r in rows]
 out["driver"] = rows[0][6] if rows else None
@@ -90,7 +85,8 @@ out["disk_free_gb"] = shutil.disk_usage("/").free >> 30
 if len(rows) != want["num_gpus"]:
     done("wrong_hardware", "expected %d GPUs, nvidia-smi lists %d" % (want["num_gpus"], len(rows)))
 for r in rows:
-    if want["gpus"] and not any(matches(model, r[1]) for model in want["gpus"]):
+    # As the searches match them (gpus.matches): "H100-SXM" is "NVIDIA H100 80GB HBM3".
+    if want["gpus"] and not any(matches(m, r[1], memory_gb=int(r[2]) / 1024) for m in want["gpus"]):
         done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], " or ".join(want["gpus"])))
     if int(r[2]) < want["min_vram_mib"]:
         done("wrong_hardware", "GPU %s has %s MiB, need %d" % (r[0], r[2], want["min_vram_mib"]))
@@ -189,6 +185,7 @@ except Exception as exc:
     done("runtime_error", "%s: %s" % (type(exc).__name__, str(exc)[:300]))
 done()
 """
+)
 
 
 def _clean_report(raw: dict) -> dict:

@@ -75,6 +75,11 @@ def best_os(options) -> tuple[str, float] | None:
     return name, cuda
 
 
+def _gb(c: dict) -> float | None:
+    vram = c.get("vram_per_gpu_in_gb")
+    return float(vram) if type(vram) in (int, float) and vram > 0 else None
+
+
 def rfc3339(t: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
@@ -136,7 +141,8 @@ class Shadeform:
             if c.get("num_gpus", t.get("num_gpus")) != spec.num_gpus or not isinstance(gpu, str):
                 continue
             if spec.gpus and not any(
-                gpu_matches(m, gpu, t.get("shade_instance_type")) for m in spec.gpus
+                gpu_matches(m, gpu, t.get("shade_instance_type"), memory_gb=_gb(c))
+                for m in spec.gpus
             ):
                 continue
             cents = t.get("hourly_price")
