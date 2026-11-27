@@ -528,7 +528,10 @@ class Launch:
             # was most likely outbid, which is the market, not the machine.
             answered, inst = self._lookup(a.instance_id)
             if not answered or inst is None or self.provider.view(inst).state != "running":
-                reason, detail = None, f"{detail} (stopped: most likely outbid)"
+                reason, detail = (
+                    None,
+                    f"{detail} (stopped: most likely interrupted: outbid, or taken back)",
+                )
         a.phase, a.reason, a.detail = "failed", reason, detail
         a.failed_at = time.monotonic()
         if reason and a.machine_id is not None:
@@ -677,7 +680,7 @@ class Launch:
         blame = None if spec.interruptible else "unreachable"
         if view.state == "exited":
             # Our container command ends only when sshd could not be started.
-            why = "outbid, or " if spec.interruptible else ""
+            why = "interrupted (outbid, or taken back), or " if spec.interruptible else ""
             self._fail(a, blame, f"container exited during bootstrap ({why}{a.msg[:120]})")
             return None
         if view.state != "running":

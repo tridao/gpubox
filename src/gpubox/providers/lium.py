@@ -10,7 +10,8 @@ What it maps to:
   offers     /executors: a node with enough free GPUs and ports, within the price cap,
              its share of CPUs, memory and disk large enough, its driver's CUDA new
              enough. A node that takes several boxes is offered once per slot of the
-             race. Spot nodes (interruptible) are left out.
+             race. Spot nodes, whose provider may close a rental at any time, only
+             with `--interruptible`.
   rent       a one-time template of the image and our command (/templates; deleted
              with the pod), then /executors/{node}/rent with the run's key, the tag as
              the pod's name, and the tag as its `Idempotency-Key`: Lium answers a repeat
@@ -38,7 +39,13 @@ A key whose pod visibility is `own` lists only the pods it rented, and nothing s
 a key is: tag-only cleanup (`down --run-id`, `reap`) needs a key that sees the account's
 pods. The account is the user and its workspace.
 
-Not yet: spot nodes (`--interruptible`), private images (a Docker credential per run),
+A spot node's provider may close a rental at any time, without notice or credit: the pod
+turns BROKEN, its container and rental gone, billing stopped, and it does not come back.
+`--interruptible` accepts that: spot nodes are offered beside the others, cheapest
+first (a tie goes to the other), and a spot node is not held to a reliability score it
+does not have yet (most have none). There is no bidding.
+
+Not yet: private images (a Docker credential per run),
 the machine ids for the blocklist (a node's id is stable; its meaning across runs is not
 yet observed).
 """
@@ -152,7 +159,9 @@ class Lium:
     default_spare = 1
     renewable = True
     requires = frozenset({"image", "price_cap"})
-    features = frozenset({"image", "price_cap", "exclude_country", "ssh_config", "any_gpu"})
+    features = frozenset(
+        {"image", "price_cap", "interruptible", "exclude_country", "ssh_config", "any_gpu"}
+    )
     searchable = True
 
     def __init__(self, client):
@@ -176,7 +185,7 @@ class Lium:
             raise LiumError(200, f"unexpected answer to the node listing: {str(data)[:200]}")
         horizon = time.time() + spec.ttl_min * 60
         found = [f for f in (_fit(x, spec, horizon) for x in data) if f is not None]
-        found.sort(key=lambda f: (f["dph_total"], f["_node"]))
+        found.sort(key=lambda f: (f["dph_total"], f["_spot"], f["_node"]))
         offers = []
         for k in range(policy.max_live):
             for f in found:
@@ -395,6 +404,8 @@ class Lium:
         msg = str(progress.get("message") or row.get("phase") or "")
         if status in STARTING:
             return prov.View("loading", status, msg, classify_status(msg))
+        if status == "BROKEN":  # closed by the node's provider: on a spot node, at will
+            return prov.View("exited", status, msg or "closed by the node's provider")
         if status != "RUNNING":
             return prov.View("exited", status, msg, classify_status(msg))
         cmd = row.get("ssh_connect_cmd")
@@ -440,8 +451,9 @@ def _fit(x, spec, horizon: float) -> dict | None:
         return None
     if (price + PRICE_SLACK) * n > spec.max_dph_per_gpu * n + 1e-9:
         return None
-    if x.get("tier") == "spot" or specs.get("is_spot") is not False:
-        return None  # interruptible
+    spot = x.get("tier") == "spot" or specs.get("is_spot") is not False
+    if spot and not spec.interruptible:
+        return None  # its provider may close the rental at any time
     total, free = x.get("gpu_count"), x.get("available_gpu_count")
     if type(total) is not int or type(free) is not int or not 0 < n <= free <= total:
         return None
@@ -472,8 +484,10 @@ def _fit(x, spec, horizon: float) -> dict | None:
         if when is not None and not _after(when, horizon):
             return None
     reliability = _number(x.get("reliability_score"))  # 0-100; none yet on a new node
-    if spec.min_reliability and (reliability is None or reliability < spec.min_reliability * 100):
-        return None
+    if spec.min_reliability and (
+        reliability < spec.min_reliability * 100 if reliability is not None else not spot
+    ):
+        return None  # a spot node may have none: it is not held to one
     down = _number(x.get("effective_download_speed_mbps"))
     if down is None or down < spec.min_inet_down_mbps:
         return None
@@ -511,10 +525,11 @@ def _fit(x, spec, horizon: float) -> dict | None:
     return {
         # A provider's nodes may fail together: one witness against an image (launch.py).
         "machine_id": x["id"], "failure_domain": _operator(x),
-        "dph_total": round(price * n, 6), "geolocation": ", ".join(w for w in (city, country) if w),
+        "dph_total": round(price * n, 6),
+        "geolocation": ", ".join(w for w in (city, country) if w) + (" (spot)" if spot else ""),
         "gpu_name": name, "cuda_max_good": cuda,
         "cpu_cores_effective": cpus, "cpu_ram": ram_gb * 1024,
-        "_node": x["id"], "_price": price, "_slots": slots,
+        "_node": x["id"], "_price": price, "_slots": slots, "_spot": spot,
     }  # fmt: skip
 
 

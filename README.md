@@ -65,7 +65,8 @@ A private image: `--registry-user USER` with the token in
 the host's docker daemon see the token, so make it a read-only pull token.
 Private pull reports omit the provider's raw status message and error body.
 
-`--interruptible` rents interruptible boxes, bidding `--bid-markup` (1.25)
+`--interruptible` rents interruptible boxes: cheaper, but they can end at any
+time. On Vast it bids `--bid-markup` (1.25)
 times each offer's minimum bid; the price cap applies to the bid with the
 disk. An outbid box is stopped: its job dies, and the box keeps billing its
 disk, with its lease timer stopped too, until something destroys it. So run
@@ -75,6 +76,7 @@ bid on one machine at the same moment: the account's boxes are looked at
 once, when a launch starts. Machines
 the account already has a box on are skipped (our own bids would outbid each
 other), and a box that stops or never starts is not held against its machine.
+On Lium it also offers spot nodes (see below).
 
 A large image needs a longer `--startup-timeout` than the default 300 s,
 which counts from the rental and so includes the image pull.
@@ -182,8 +184,15 @@ machine's GPUs) at its own price per GPU, and a box is a pod on it, your image
 under gpubox's command. A node's CPUs, memory and disk are shared out in
 proportion to the GPUs rented, so `--min-cpus`, `--min-ram-gb` and `--disk-gb`
 are judged against that share; a node that rents only whole is offered only
-when `--num-gpus` is all its free GPUs. Spot nodes are left out, and so are
-nodes with no reliability score yet. Lium may rent at up to a cent per GPU-hour
+when `--num-gpus` is all its free GPUs. Nodes with no reliability score yet
+are left out. For a single consumer card, `--min-cpus 4 --min-ram-gb 16`
+admits many more nodes.
+
+Spot nodes are offered only with `--interruptible`, beside the others and
+cheapest first. A spot node's provider may close the rental at any time,
+with no credit: the pod is gone with its job and its files, and billing
+stops. There is no bid. A spot node needs no reliability score (most have
+none). Lium may rent at up to a cent per GPU-hour
 above the price offered, so that cent must fit under `--max-dph-per-gpu` too.
 
 The sshd is Lium's, which it adds to the image if it has none, with the run's
@@ -198,8 +207,7 @@ Use a key whose pod visibility is `account` (the default). A key with `own`
 visibility sees only the pods it rented, and nothing tells gpubox which kind a
 key is: `down --run-id` or `reap` with another such key would find nothing.
 
-Not yet on Lium: `--interruptible` (spot nodes), `--registry-user` (private
-images), and machines are not recorded, so the blocklist does not apply.
+Not yet on Lium: `--registry-user` (private images), and machines are not recorded, so the blocklist does not apply.
 
 ## Shadeform (VM clouds)
 

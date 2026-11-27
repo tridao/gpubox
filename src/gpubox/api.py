@@ -774,8 +774,10 @@ class Box:
         if not self.run.live():
             return BoxLost("the box was destroyed by `gpubox down` while the job ran", watch.status)
         msg = f"lost the SSH connection to the box (instance status: {watch.status or 'unknown'})"
-        if self.run.interruptible and watch.status in DEAD_STATUSES:
-            msg += "; it is interruptible, so it was most likely outbid"
+        if self.run.interruptible and (watch.status in DEAD_STATUSES or watch.over):
+            msg += (
+                "; it is interruptible, so it was most likely interrupted (outbid, or taken back)"
+            )
         if hint:
             log(hint)
         self._record_if_died(watch.status)
@@ -853,6 +855,7 @@ class BoxWatch:
 
     def __init__(self, box: Box):
         self.box, self.status = box, None
+        self.over = False  # the provider said the box is over
 
     def __call__(self) -> bool | None:
         """False if the box is over (gone, or in a terminal state); None if not known."""
@@ -869,7 +872,8 @@ class BoxWatch:
         self.status = inst.get("actual_status")
         if view.state == "running" and view.endpoint is not None:
             self.box._moved(*view.endpoint[:2])
-        return False if view.state == "exited" or self.status in DEAD_STATUSES else None
+        self.over = view.state == "exited" or self.status in DEAD_STATUSES
+        return False if self.over else None
 
 
 # --------------------------------------------------------------------- a job
@@ -915,7 +919,11 @@ class Job:
         if end.kind == "none":
             raise NoSuchJob(f"no job {self.id} on {self.box.name}")
         if end.kind == "lost":
-            why = " (it is interruptible: most likely outbid)" if self.box.run.interruptible else ""
+            why = (
+                " (it is interruptible: most likely interrupted)"
+                if self.box.run.interruptible
+                else ""
+            )
             raise JobLost(
                 f"job {self.id} on {self.box.name} ended without an exit code: its box "
                 f"restarted{why}, or it was killed"

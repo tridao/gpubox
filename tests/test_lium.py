@@ -90,6 +90,7 @@ class FakeApi:
         self.pods, self.templates, self.calls, self.fail = {}, {}, [], {}
         self.full = set()  # nodes that refuse a rent: rented since the listing
         self.stuck = set()  # nodes whose running pods refuse a removal time
+        self.closing = set()  # nodes whose provider closes a pod as it starts (a spot node's may)
         self.lose = 0  # rents that rent, then lose their answer
         self.n = 0
 
@@ -131,6 +132,8 @@ class FakeApi:
             return dict(pod)
         if method == "GET":
             pod["gets"] += 1
+            if pod["status"] == "PENDING" and pod["gets"] > 1 and pod["node"] in self.closing:
+                pod["status"] = "BROKEN"
             if pod["status"] == "PENDING" and pod["gets"] > 1:
                 # It starts after the rent's own lookup, and Lium sets its removal time then.
                 hours = pod["body"]["termination_hours"]
@@ -202,6 +205,25 @@ def test_offers_are_nodes_that_can_take_the_box_cheapest_first_each_once_per_slo
     assert o["geolocation"] == "Austin, US" and o["gpu_name"] == "NVIDIA GeForce RTX 4090"
     assert (o["cpu_cores_effective"], o["cpu_ram"] / 1024) == (24, 64)  # a quarter of the node
     assert o["failure_domain"] == "provider-2"  # the image rule's witness
+
+
+def test_spot_nodes_only_for_an_interruptible_box_and_then_beside_the_others():
+    spot = L.Spec(image="i", gpus=("RTX 4090",), max_dph_per_gpu=1.0, interruptible=True)
+    p, _ = make(FakeApi([*NODES, node(23, price=0.30, is_spot=True)]))
+    offers = p.candidates(spot, {}, L.Policy(spare=0))[0]
+    # The spot nodes 5 and 6 are cheapest; at a tie, the node that is not spot goes first.
+    assert [o["_node"] for o in offers] == [uid(5), uid(6), uid(2), uid(23), uid(1)]
+    assert offers[0]["geolocation"] == "Austin, US (spot)"
+    assert "(spot)" not in offers[2]["geolocation"]
+    assert uid(5) not in {o["_node"] for o in p.candidates(SPEC, {}, L.Policy())[0]}
+
+
+def test_a_spot_node_is_not_held_to_a_reliability_score_it_does_not_have():
+    spot = L.Spec(image="i", gpus=("RTX 4090",), max_dph_per_gpu=1.0, interruptible=True)
+    nodes = [node(1, is_spot=True, reliability_score=None), node(2, reliability_score=None),
+             node(3, is_spot=True, reliability_score=90.0)]  # fmt: skip
+    p, _ = make(FakeApi(nodes))
+    assert [o["_node"] for o in p.candidates(spot, {}, L.Policy(spare=0))[0]] == [uid(1)]
 
 
 def test_a_node_offers_no_more_boxes_than_it_has_free_ports():
@@ -562,6 +584,39 @@ def test_the_advice_after_a_failed_teardown_says_how_late_liums_lease_may_end_a_
     assert "lium deletes each box when its lease ends" in out and "up to 60 min later" in out
 
 
+def test_an_interruptible_pod_closed_by_its_provider_is_replaced_and_not_blamed(tmp_path):
+    api = FakeApi([node(5, price=0.20, is_spot=True), node(1, price=0.40)])
+    api.closing.add(uid(5))
+    p, _ = make(api)
+    state = State.begin(tmp_path, RUN_ID, EXPIRY, None, {"provider": "lium"})
+    spot = L.Spec(image="img:1", gpus=("RTX 4090",), max_dph_per_gpu=1.0, interruptible=True)
+    policy = L.Policy(**{**FAST.__dict__, "spare": 0})
+    result = L.Launch(p, spot, policy, state, PodProber()).run({})
+    (w,) = result.winners
+    assert api.pods[w.instance_id]["node"] == uid(1)
+    lost = result.attempts[0]
+    assert lost.reason is None and "closed by the node's provider" in lost.detail
+    assert [x["status"] for x in api.pods.values() if x["node"] == uid(5)] == ["DELETING"]
+
+
+def test_a_box_lost_to_its_provider_closing_it_says_it_was_most_likely_interrupted(
+    tmp_path, monkeypatch
+):
+    from gpubox import api as gapi
+
+    fake = FakeApi()
+    fake.pods[uid(1)] = {"id": uid(1), "pod_name": make_tag(RUN_ID, 1, EXPIRY),
+                         "status": "BROKEN", "node": uid(5), "gets": 0}  # fmt: skip
+    monkeypatch.setenv("LIUM_API_KEY", "k")
+    monkeypatch.setattr(lm, "Client", lambda key: fake)
+    state = State.begin(tmp_path, RUN_ID, EXPIRY, None,
+                        {"provider": "lium", "options": {}, "interruptible": True})  # fmt: skip
+    state.publish([{"id": uid(1), "attempt": 1, "host": "203.0.113.9", "port": 20001}])
+    (box,) = gapi.attach(state_dir=tmp_path).boxes
+    lost = box._lost()
+    assert "most likely interrupted" in str(lost) and "BROKEN" in str(lost)
+
+
 def test_down_deletes_by_id_and_by_tag(tmp_path):
     run, p, api, state = launch(tmp_path)
     run.run({})
@@ -592,7 +647,7 @@ def test_lium_needs_an_image_and_a_price_and_refuses_what_it_cannot_do(tmp_path,
             "--state-dir", str(tmp_path)]  # fmt: skip
     assert cli.main([*base, "--max-dph-per-gpu", "1"]) == cli.EXIT_CONFIG
     assert "lium needs --image" in capsys.readouterr().out
-    for extra in (["--interruptible"], ["--registry-user", "u"], ["--runpod-cloud", "secure"]):
+    for extra in (["--registry-user", "u"], ["--runpod-cloud", "secure"]):
         argv = [*base, "--image", "i", "--max-dph-per-gpu", "1", *extra]
         assert cli.main(argv) == cli.EXIT_CONFIG
         assert "not on lium" in (out := capsys.readouterr().out) or "not for lium" in out

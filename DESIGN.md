@@ -260,6 +260,14 @@ is not a candidate). `search` shows the same candidates. What changes:
   the bootstrap deletes any it finds when the container starts again, and a
   job directory that never got a wrapper is listed `lost` after a minute.
 
+On Lium there is no bid: `--interruptible` admits spot nodes, whose provider
+may close a rental at any time without notice or credit (section 17). It is
+the same flag because what the run accepts is the same: a box that can end
+at any time, which is not held against its machine, and a job that can be
+lost. What differs is easier: a closed pod is gone (BROKEN, then deleted),
+not stopped, so nothing bills and nothing resumes, and there are no bids of
+our own to collide.
+
 ## 6. Teardown
 
 `down` works in rounds for up to a minute: a short delete-and-lookup round
@@ -724,13 +732,16 @@ what the node keeps back, `pod_reserve`) and disk are shared out in
 proportion to the GPUs rented, which is what `--min-cpus`, `--min-ram-gb`
 and `--disk-gb` are judged against; seen live, a pod got exactly that
 memory and the node's listed CPUs. A node listed with no minimum GPU count
-rents only whole. Spot nodes, which can be taken back, are left out. A
+rents only whole. Spot nodes, which their provider may take back at any
+time, are offered only with `--interruptible`, beside the others (cheapest
+first, a tie to the node that is not spot), and are not held to a
+reliability score they do not have yet; most have none. A
 node is offered once per box it can hold (its free GPUs, and its free
 ports: each pod takes one), every node once before any again: the spares
 of a race hedge against a bad machine, which two boxes on one node would
 not. Nodes with frequent rent failures, a bad disk, a removal or
 maintenance that starts within the lease, a reliability under
-`min_reliability` or none yet, a download under the minimum, or no country
+`min_reliability` or none yet (spot nodes aside), a download under the minimum, or no country
 when countries are excluded are left out: a size or a time that is not
 stated does not meet a minimum. The rent states the price offered, and
 Lium refuses it only if the node now asks more than a cent above that; so
@@ -782,6 +793,11 @@ time, then the name, and believes it once both read back. Lium shows times
 in UTC without an offset. Lium takes `termination_hours` up to 720, so a
 longer lease is refused.
 
+**Closed.** A pod its node's provider closes is BROKEN: its container and
+rental are gone and billing has stopped; on a spot node there is no credit.
+It is read as exited, and deleted like any failed box. With
+`--interruptible`, nobody is blamed for it.
+
 **Gone.** A deleted pod is DELETING for some 40 s, then 404 with the code
 `pod_not_found`; billing stops at the delete request, so DELETING counts as
 gone. A 404 without that code (a gateway's, a route's) is an error, not
@@ -800,4 +816,5 @@ a P40 pod healthy 49 s after the create, an RTX 4090 46 s; jobs, `ssh` and
 60 s of the lease's end; an interrupt mid-launch rolled back in 6 s;
 `down --run-id` from an empty directory found the run's pod by its name;
 nothing was left after any of them, and the one-time templates were gone
-with their pods.
+with their pods. With `--interruptible`, a pod on a spot node (an RTX 5060
+Ti) was healthy 59 s after the create, its removal time exact.

@@ -619,14 +619,14 @@ def main(argv=None) -> int:
         s.add_argument(
             "--interruptible",
             action="store_true",
-            help="bid for interruptible boxes: cheaper, but stopped when outbid "
-            "(run `reap --destroy` on a schedule)",
+            help="rent interruptible boxes: cheaper, but stopped or taken back at any time "
+            "(Vast: a bid; Lium: spot nodes too; run `reap --destroy` on a schedule)",
         )
         s.add_argument(
             "--bid-markup",
             type=number(float, 1),
             default=1.25,
-            help="bid this times the offer's minimum bid (default 1.25)",
+            help="Vast: bid this times the offer's minimum bid (default 1.25)",
         )
         s.add_argument(
             "--exclude-country",

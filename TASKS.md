@@ -152,7 +152,9 @@ Providers to add, in this order.
   its idempotency key, the lease Lium's removal time. Checked live (DESIGN.md, 17).
 - [ ] Lium: detect a key whose pod visibility is `own` (its listing is not the account's)
   once the API says which a key is; until then it is documented.
-- [ ] Lium: spot nodes (`--interruptible`), private images (a Docker credential per run),
+- [x] Lium: spot nodes with `--interruptible`, beside the others; a closed pod (BROKEN)
+  is interrupted, not the machine's fault.
+- [ ] Lium: private images (a Docker credential per run),
   node ids for the blocklist once they are seen to mean the same machine across runs.
 - [ ] Radiant (Ori): decided to keep a table of Ori's list prices (Oct 2026, per GPU-hour:
   H200 3.50, H100 SXM/PCIe 2.90, A100 2.74, L40S 1.55, V100S 0.95, L4 0.93, V100 0.83), since its
