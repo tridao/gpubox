@@ -1,9 +1,11 @@
 """What gpubox keeps on a box, whatever the provider: the end of its lease, the container's
-saved environment, and the helper with which a job ends its box. Shell snippets and
-paths shared by the boxes (providers/container.py, providers/vmbox.py), the jobs
-(job.py) and the gate (gate.py)."""
+saved environment, the command of a container that only waits, and the helper with which
+a job ends its box. Shell snippets and paths shared by the boxes (providers/container.py,
+providers/vmbox.py, providers/lium.py), the jobs (job.py) and the gate (gate.py)."""
 
 from __future__ import annotations
+
+import shlex
 
 EXPIRY_FILE = "/etc/gpubox-expiry"
 
@@ -44,4 +46,18 @@ DESTROY_SELF_SCRIPT = (
     "# Ends this box: its lease timer destroys it within 30 s.",
     f"echo 1 > {EXPIRY_FILE}.tmp && mv {EXPIRY_FILE}.tmp {EXPIRY_FILE} &&",
     'echo "gpubox: this box will be destroyed within 30 s" >&2',
+)
+# The command of a box's container where gpubox starts no sshd (a VM box, vmbox.py; Lium's
+# pods, whose sshd is Lium's): its environment saved for what runs over `docker exec` or
+# SSH (which gets the image's ENV, but not what the entrypoint would have set), the
+# variables of a job cut short by a restart removed, then nothing. Run by bash (SAVE_ENV
+# needs it, and so do jobs); no `sleep infinity`, which busybox lacks.
+CONTAINER_INIT = "; ".join(
+    [
+        "mkdir -p /etc/gpubox /etc/profile.d",
+        SAVE_ENV,
+        'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
+        f"echo {shlex.quote(f'[ -r {ENV_FILE} ] && . {ENV_FILE}')} > /etc/profile.d/gpubox-env.sh",
+        "while :; do sleep 3600; done",
+    ]
 )

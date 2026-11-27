@@ -196,7 +196,7 @@ class Attempt:
     status: str = ""
     msg: str = ""
     ssh_err: str = ""
-    lease_set: bool = False  # the provider's expiry, set again once the box ran (lease_on_start)
+    admitted: bool = False  # the provider's `admit` was done, once the box ran
 
     @property
     def tag_name(self) -> str:
@@ -690,15 +690,15 @@ class Launch:
         ep = view.endpoint
         if ep is None:
             return None
-        if getattr(self.provider, "lease_on_start", False) and not a.lease_set:
-            # The provider resets a box's expiry when it starts (Lium): set it again
-            # before the box is admitted, and give up on a box whose lease is not confirmed.
+        if not a.admitted:
+            # What the provider must do before a box is handed over, now that it runs
+            # (Lium sets its lease again): a box it cannot do that for is given up on.
             try:
-                self.provider.relabel(a.instance_id, a.tag)
+                self.provider.admit(a.instance_id, a.tag)
             except (prov.ProviderError, ValueError) as exc:
-                self._fail(a, None, f"its lease could not be set once it ran: {exc}")
+                self._fail(a, None, f"could not be admitted once it ran: {exc}")
                 return None
-            a.lease_set = True
+            a.admitted = True
         a.timings.setdefault("running", self._elapsed(a))
         a.endpoint = ep
         a.check = self.prober.start_ready(ep)
@@ -983,7 +983,9 @@ def explain_leftovers(provider, state: State, left: list[int] | None) -> None:
             if lease == "box"
             else f"{provider.name} deletes each box"
         )
-        log(f"  If nothing is done, {who} when its lease ends, at {when}.")
+        slack = getattr(provider, "lease_slack", 0)
+        late = f" (one never admitted, up to {slack / 60:.0f} min later)" if slack else ""
+        log(f"  If nothing is done, {who} when its lease ends, at {when}{late}.")
         stopped = "an interruptible box that was outbid" if state.meta.get("interruptible") else (
             "one stuck before it ran")  # fmt: skip
         log(f"  A box that is not running ({stopped}) cannot: after the lease, run")

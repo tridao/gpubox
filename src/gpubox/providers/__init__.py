@@ -26,9 +26,9 @@ Each provider class (base.py describes the calls) also says, as class attributes
     requires          which of those it cannot do without ("image", "price_cap")
     renewable         its lease can be moved: `relabel` works (else `renew` is refused)
     searchable        `search` can show what `up` would try
-    lease_on_start    (optional) the provider resets a box's expiry when the box starts,
-                      so the launcher relabels it once it runs, before admitting it
-    searches_lease    (optional) its offers depend on the lease (`search --ttl-min`)
+    lease_slack       seconds past the lease its own lease may leave a box that was never
+                      admitted (`admit`); 0 where the lease is exact from the create
+    searches_lease    its offers depend on the lease, so `search --ttl-min` means something
 
 and `from_options(options, key)` builds one from the options a run keeps in its state
 file (`options()`; never a secret) and its API key.

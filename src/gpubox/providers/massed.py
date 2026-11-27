@@ -137,6 +137,8 @@ class Massed:
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True
+    searches_lease = False
+    lease_slack = 0  # its lease ends a box at the tag's expiry
 
     def __init__(self, client):
         self.client = client
@@ -299,6 +301,9 @@ class Massed:
         ):
             return prov.View("running", status, "", None, (ip, 22, user))
         return prov.View("loading", status, "" if low != "running" else "booting")
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         return "true"

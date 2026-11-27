@@ -5,7 +5,7 @@ Massed Compute directly) rent virtual machines with an OS of theirs, not contain
 box there is still the caller's image: the VM's startup script, which the cloud runs as
 root once the VM is up (`startup_script`), puts the run's key on the VM and starts the
 image as a container named `gpubox`, with the VM's GPUs, network and IPC, under a
-command of ours (`CONTAINER_INIT`) that saves its environment and then just waits.
+command of ours (`onbox.CONTAINER_INIT`) that saves its environment and then just waits.
 
 Everything gpubox runs on such a box runs in that container: SSH to the VM as the user
 the cloud names, with the run's key, then `sudo docker exec` (`VmProber`). No port is
@@ -31,19 +31,6 @@ from ..gate import READY_TIMEOUT, Prober, read_ready
 CONTAINER = "gpubox"
 PULL_ERROR = "/var/lib/gpubox/pull-error"
 BOOT_LOG = "/var/lib/gpubox/boot.log"  # what the startup script said; the probe shows its end
-# The container's command: its environment saved for what `docker exec` runs (which gets
-# the image's ENV anyway, but not what the entrypoint would have set), the variables of a
-# job cut short by a restart removed, then nothing. Run by bash (SAVE_ENV needs it, and so
-# do jobs, as on Vast); no `sleep infinity`, which busybox lacks.
-CONTAINER_INIT = "; ".join(
-    [
-        "mkdir -p /etc/gpubox /etc/profile.d",
-        onbox.SAVE_ENV,
-        'rm -f "${GPUBOX_JOBS:-/var/lib/gpubox/jobs}"/*/env',
-        f"echo {shlex.quote(f'[ -r {onbox.ENV_FILE} ] && . {onbox.ENV_FILE}')} > /etc/profile.d/gpubox-env.sh",
-        "while :; do sleep 3600; done",
-    ]
-)
 
 
 def startup_script(pubkey: str, image: str) -> str:
@@ -57,7 +44,7 @@ def startup_script(pubkey: str, image: str) -> str:
     key, img = shlex.quote(pubkey), shlex.quote(image)
     run = (
         f"docker run -d --name {CONTAINER} --restart unless-stopped --gpus all --network host "
-        f"--ipc host --user 0:0 --entrypoint bash {img} -c {shlex.quote(CONTAINER_INIT)}"
+        f"--ipc host --user 0:0 --entrypoint bash {img} -c {shlex.quote(onbox.CONTAINER_INIT)}"
     )
     return f"""#!/bin/bash
 # gpubox: this VM is a box. The run's key, then the image as the container `{CONTAINER}`.

@@ -434,16 +434,20 @@ again its job was reported lost and the saved environment was there.
 ## 12. Providers
 
 The launcher, `down`, `renew` and the reaper talk to a provider through a
-small interface (`providers/base.py`): candidates to rent, a create sent once,
-lookups and a listing read strictly, a delete, a relabel that is also how a
-lease moves, and a way to read a row (`View`: queued, loading, running or
-exited; what the provider says; where SSH reaches it). What differs between
+small interface (`providers/base.py`): candidates to rent; a create that
+carries the box's lease and is sent once, or sent again only where the API
+collapses repeats, and whose outcome is a yes, a no, or unknown; an admission
+once the box runs (what must be done before it is handed over: on Lium, its
+lease set again); lookups and a listing read strictly, a delete, a relabel
+that is also how a lease moves, and a way to read a row (`View`: queued,
+loading, running or exited; what the provider says; where SSH reaches it). What differs between
 providers and is not a call is declared by each, as class attributes, and
 read through one table (`providers/__init__.py`): its API key's variable; how a box
 is reached (our sshd with the run's key, or a Slurm step); how a job is
 started; whether its machine ids mean the same machine from run to run, so
 that observations, the blocklist and the store apply; its default spare;
-and which parts of a Spec it can honour (an image, a price cap,
+how late its own lease may end a box that was never admitted; whether its
+offers depend on the lease (`search --ttl-min`); and which parts of a Spec it can honour (an image, a price cap,
 interruptible boxes, a registry login, countries to skip, an SSH
 configuration entry, any GPU model). `up` and the command line refuse what a
 provider cannot do, and insist on what it needs, before anything is rented.
@@ -454,12 +458,13 @@ registry (`__init__.py`), the HTTP client they share (`httpapi.py`), and the
 two kinds of box: a container the provider runs with our command as its
 entrypoint (`container.py`; Vast, RunPod) and a VM that runs the image as a
 container (`vmbox.py`; Shadeform, Hyperstack, Massed, Lyceum). Lium's pods
-are containers whose sshd is Lium's: they run the VM box's container command
-(save the environment, then wait) and are reached as Vast's are. The rest
+are a third kind: containers whose sshd is Lium's, which run the command a
+VM box's container runs (save the environment, then wait) and are reached
+as Vast's are. The rest
 (`launch.py`, `state.py`, `gate.py`, `job.py`, `api.py`, `cli.py`) knows
 none of them by name except to pick one, and `onbox.py` holds what every box
 has whatever its provider: the expiry file, the saved environment, the
-self-destroy helper. Adding a provider is a module in `providers/` and a
+command of a container that only waits, the self-destroy helper. Adding a provider is a module in `providers/` and a
 line in the registry.
 
 A run's state file names its provider and that provider's options (never a
@@ -764,11 +769,12 @@ answer, and not if a lookup shows that pod under another name.
 Lium counts it from when the pod starts running, and at that moment it
 replaces any removal time set before (seen live). So the exact time is set
 twice: right after the rent, which covers a pod that never starts, and
-again once the pod runs, before it is admitted (`lease_on_start`: the
-launcher relabels it as soon as it shows an SSH address). A pod whose time
-cannot be confirmed then is given up on and deleted, as a box that fails
-its gate is. A pod left behind by a launch that died ends at the backstop:
-an hour at most after the lease, plus its start. `renew` sets the removal
+again once the pod runs, in its admission (`admit`, which the launcher
+calls as soon as the pod shows an SSH address, before it probes it). A pod
+whose time cannot be confirmed then is given up on and deleted, as a box
+that fails its gate is. A pod left behind by a launch that died ends at the
+backstop: an hour at most after the lease, plus its start (`lease_slack`,
+which the advice after a failed teardown states). `renew` sets the removal
 time, then the name, and believes it once both read back. Lium shows times
 in UTC without an offset. Lium takes `termination_hours` up to 720, so a
 longer lease is refused.

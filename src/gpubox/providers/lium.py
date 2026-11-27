@@ -3,7 +3,7 @@
 Lium (lium.io) is a marketplace: providers list nodes (one machine's GPUs, with its CPUs,
 memory and disk shared out in proportion to the GPUs rented), each at its own price per
 GPU, and a pod is a container on a node. A box is such a pod, running the caller's image
-under a command of ours (vmbox.CONTAINER_INIT: save the container's environment, then
+under a command of ours (onbox.CONTAINER_INIT: save the container's environment, then
 wait), reached as root with SSH on the pod's published port 22.
 
 What it maps to:
@@ -31,8 +31,8 @@ The lease is Lium's: a pod's removal time. The rent carries `termination_hours`,
 lease rounded up to whole hours, which Lium counts from when the pod starts running, and
 which then replaces any removal time set before (seen live, 2026-11). So that is the
 backstop a rent carries, and the exact time is set twice: right after the rent, which
-covers a pod that never starts, and once it runs (`lease_on_start`: the launcher
-relabels it before admitting it). `renew` moves the removal time.
+covers a pod that never starts, and once it runs (`admit`, which the launcher calls
+before it probes the box). `renew` moves the removal time.
 
 A key whose pod visibility is `own` lists only the pods it rented, and nothing says which
 a key is: tag-only cleanup (`down --run-id`, `reap`) needs a key that sees the account's
@@ -55,8 +55,8 @@ from . import httpapi
 from . import base as prov
 from .base import gpu_matches
 from .container import classify_status
-from .vmbox import CONTAINER_INIT
 from ..errors import ConfigError
+from ..onbox import CONTAINER_INIT
 from ..state import parse_tag
 
 API_BASE = "https://lium.io/api"
@@ -144,7 +144,9 @@ class Lium:
     own_sshd = False
     self_destroy = False  # no key confined to the pod
     lease = "provider"  # the pod's removal time
-    lease_on_start = True  # set again once the pod runs: Lium resets it then
+    # A pod left behind before it was admitted ends at the rent's backstop: whole hours
+    # from when it ran, so up to an hour (and its start) after the lease.
+    lease_slack = 3600
     searches_lease = True  # a node's notices are read against the lease
     observes_machines = False
     default_spare = 1
@@ -229,7 +231,7 @@ class Lium:
             # Not the pod we asked for, as far as we know: nothing is done to it.
             raise prov.CreateUnknown(200, f"rent answered pod {pod}, named {row['label']!r}")
         try:
-            # Covers a pod that never starts; once it runs, Lium replaces it (lease_on_start).
+            # Covers a pod that never starts; once it runs, Lium replaces it (see `admit`).
             self._schedule(pod, expiry)
         except LiumError:
             pass  # the rent's own termination_hours bounds it
@@ -403,6 +405,11 @@ class Lium:
             # Through Lium's gateway (`ssh -J`), or as another user: not how gpubox gets in.
             return prov.View("exited", status, f"SSH only as {cmd[:120]!r}", "machine")
         return prov.View("loading", status, msg or "no SSH address yet")
+
+    def admit(self, pod_id, label: str) -> None:
+        """Set the pod's removal time again, now that it runs: Lium replaced it with the
+        rent's backstop when the pod started. Raises unless it is confirmed."""
+        self.relabel(pod_id, label)
 
     def expiry_command(self, expiry: int) -> str:
         return "true"  # no timer in the box: Lium keeps the lease (relabel)

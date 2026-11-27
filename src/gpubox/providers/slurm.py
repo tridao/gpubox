@@ -252,6 +252,8 @@ class Slurm:
     requires = frozenset(())
     features = frozenset({"any_gpu"})
     searchable = False  # Slurm chooses the node: there is nothing to show
+    searches_lease = False
+    lease_slack = 0  # its lease ends a box at the tag's expiry
 
     def __init__(
         self,
@@ -485,6 +487,9 @@ class Slurm:
             problem = "config" if status == "PENDING" and reason in NEVER else None
             return prov.View("queued", status, msg, problem)
         return prov.View("loading", status, msg)  # CONFIGURING, RESIZING, ...
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         if type(expiry) is not int or not 0 < expiry < 10**10:

@@ -101,6 +101,8 @@ class Shadeform:
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True
+    searches_lease = False
+    lease_slack = 0  # its lease ends a box at the tag's expiry
 
     def __init__(self, client):
         self.client = client
@@ -319,6 +321,9 @@ class Shadeform:
         if status in ("pending", "creating", "pending_provider"):
             return prov.View("loading", status, msg)
         return prov.View("exited", status, msg)  # an error state
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         return "true"  # no timer in the box: Shadeform keeps the lease (relabel)

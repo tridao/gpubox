@@ -497,7 +497,7 @@ def cmd_reap(args) -> int:
 
 def cmd_search(args) -> int:
     kind = providers.kind(args.provider)
-    if args.ttl_min is not None and not getattr(kind, "searches_lease", False):
+    if args.ttl_min is not None and not kind.searches_lease:
         raise ConfigError(f"search --ttl-min means nothing on {kind.name}")
     spec = spec_from(args)
     offers, blocked = api.search(spec, settings=settings(args))

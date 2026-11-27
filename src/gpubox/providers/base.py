@@ -1,9 +1,8 @@
 """What the launcher needs from a provider of boxes, whatever it is.
 
-Two providers implement it: Vast.ai (`vast.VastProvider`), a marketplace of
-containers, and a Slurm cluster reached over SSH (`slurm.Slurm`), where a box
-is one batch job holding an allocation. The launcher, `down`, `renew` and the
-reaper see only this:
+Every provider in providers/ implements it (the registry, `__init__.py`, lists them;
+Vast's `vast.VastProvider` is the model). The launcher, `down`, `renew` and the reaper
+see only this:
 
     name                      "vast" or "slurm"
     noun                      what one box is called there: "instance" or "job"
@@ -11,10 +10,17 @@ reaper see only this:
                               what may be rented, in the order to try it, and a
                               few words on how they were chosen
     create(offer, spec, label, pubkey, expiry, avoid) -> id
-                              rent one box, labelled with its tag. Sent once.
-                              CreateRefused only on an explicit no, CreateUnknown
-                              when a box may or may not exist; a configuration
-                              that no offer can satisfy is a ConfigError
+                              rent one box, labelled with its tag, carrying its
+                              lease. An id only from an explicit yes, CreateRefused
+                              only on an explicit no, CreateUnknown when a box may
+                              or may not exist; a configuration that no offer can
+                              satisfy is a ConfigError. Sent once, unless the API
+                              collapses repeats of it (Lium's idempotency key): then
+                              it may be sent again, and once an answer was lost,
+                              only an id settles it
+    admit(id, label)          what must be done before a box is handed over, once
+                              it runs (Lium: its lease set again); raises if it
+                              cannot be, and the box is given up on
     instance(id, **call) -> row | None
                               None only when the provider says the box does not
                               exist (holds nothing, bills nothing); an error is

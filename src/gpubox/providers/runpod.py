@@ -75,6 +75,8 @@ class RunPod:
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "ssh_config", "any_gpu"})
     searchable = True
+    searches_lease = False
+    lease_slack = 0  # its lease ends a box at the tag's expiry
 
     def __init__(self, client, *, cloud: str | None = None):
         if cloud is not None and cloud not in CLOUDS:
@@ -288,6 +290,9 @@ class RunPod:
             return prov.View("running", status, "", None, ep)
         # RUNNING before the container is up and has an address: still on its way.
         return prov.View("loading", status, "" if status != "RUNNING" else "no SSH address yet")
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         return set_expiry_command(expiry)

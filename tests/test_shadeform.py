@@ -12,7 +12,7 @@ import time
 import pytest
 from fakes import FAST, FakeCheck
 
-from gpubox import api, gate
+from gpubox import api, gate, onbox
 from gpubox import launch as L
 from gpubox.providers import base as prov
 from gpubox.providers import shadeform as sf
@@ -261,7 +261,7 @@ def test_the_startup_script_keys_every_login_and_starts_the_image_under_our_comm
     assert subprocess.run(["bash", "-n"], input=script.encode()).returncode == 0
     assert "docker run -d --name gpubox" in script and "--gpus all" in script
     assert "--entrypoint bash my/img:1 -c" in script and vmbox.PULL_ERROR in script
-    assert subprocess.run(["bash", "-n", "-c", vmbox.CONTAINER_INIT]).returncode == 0
+    assert subprocess.run(["bash", "-n", "-c", onbox.CONTAINER_INIT]).returncode == 0
     for bad in ("", "-v /:/x", "a b"):
         with pytest.raises(ValueError):
             vmbox.startup_script("ssh-ed25519 K", bad)

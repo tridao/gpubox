@@ -17,10 +17,13 @@ def test_every_provider_says_what_it_can_do(name):
     assert kind.lease != "box" or kind.self_destroy  # a timer in the box must be able to
     assert type(kind.self_destroy) is bool and type(kind.observes_machines) is bool
     assert type(kind.own_sshd) is bool and type(kind.searchable) is bool
+    assert type(kind.searches_lease) is bool and (kind.searchable or not kind.searches_lease)
+    assert type(kind.lease_slack) is int and kind.lease_slack >= 0
+    assert kind.lease == "provider" or kind.lease_slack == 0  # only a provider's lease lags
     assert kind.features <= set(providers.FEATURES) and kind.requires <= kind.features
     assert type(kind.default_spare) is int and kind.default_spare >= 0
     assert kind.credential is None or kind.credential.endswith("_KEY")
-    for call in ("candidates", "create", "instance", "instances", "view", "destroy",
+    for call in ("candidates", "create", "admit", "instance", "instances", "view", "destroy",
                  "relabel", "account", "expiry_command", "manual_hint", "describe",
                  "options", "from_options"):  # fmt: skip
         assert callable(getattr(kind, call)), call

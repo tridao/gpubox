@@ -17,7 +17,7 @@ from gpubox.errors import ConfigError
 from gpubox.providers import base as prov
 from gpubox.providers import httpapi
 from gpubox.providers import lium as lm
-from gpubox.providers.vmbox import CONTAINER_INIT
+from gpubox.onbox import CONTAINER_INIT
 from gpubox.state import State, make_tag, parse_tag
 
 RUN_ID = "dev.lium.0123456789ab"
@@ -549,6 +549,17 @@ def test_a_pod_whose_removal_time_cannot_be_set_once_it_runs_is_not_admitted(tmp
     assert api.pods[w.instance_id]["node"] == uid(1)
     (lost,) = [x for x in api.pods.values() if x["node"] == uid(2)]
     assert lost["status"] == "DELETING"
+
+
+def test_the_advice_after_a_failed_teardown_says_how_late_liums_lease_may_end_a_pod(
+    tmp_path, capsys
+):
+    run, p, api, state = launch(tmp_path, spare=0)
+    (w,) = run.run({}).winners
+    capsys.readouterr()
+    L.explain_leftovers(p, state, [w.instance_id])
+    out = capsys.readouterr().out
+    assert "lium deletes each box when its lease ends" in out and "up to 60 min later" in out
 
 
 def test_down_deletes_by_id_and_by_tag(tmp_path):

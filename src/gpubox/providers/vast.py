@@ -404,6 +404,7 @@ class VastProvider:
         {"image", "price_cap", "interruptible", "registry_login", "exclude_country", "ssh_config"}
     )
     searchable = True
+    lease_slack = 0  # its lease ends a box at the tag's expiry
     searches_lease = True  # an offer's contract must outlast the lease
 
     def __init__(self, client):
@@ -454,6 +455,9 @@ class VastProvider:
 
     def account(self) -> str:
         return self.client.account()
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         return set_expiry_command(expiry)

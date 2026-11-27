@@ -94,6 +94,8 @@ class Hyperstack:
     requires = frozenset({"image", "price_cap"})
     features = frozenset({"image", "price_cap", "any_gpu"})
     searchable = True
+    searches_lease = False
+    lease_slack = 0  # its lease ends a box at the tag's expiry
 
     def __init__(self, client):
         self.client = client
@@ -376,6 +378,9 @@ class Hyperstack:
         if status in ("ERROR", "SHUTOFF", "HIBERNATED", "STOPPED", "SUSPENDED"):
             return prov.View("exited", status, msg)
         return prov.View("loading", status, msg)  # CREATING, BUILD, ...
+
+    def admit(self, instance_id, label: str) -> None:
+        """Nothing to do before a box is handed over: its lease came with its create."""
 
     def expiry_command(self, expiry: int) -> str:
         return "true"  # no timer, and no expiry at Hyperstack: the tag is the lease
