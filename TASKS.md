@@ -150,8 +150,6 @@ Providers to add, in this order.
   Checked live.
 - [x] Lium: a marketplace of nodes, pods as boxes with Lium's sshd, the rent retried under
   its idempotency key, the lease Lium's removal time. Checked live (DESIGN.md, 17).
-- [ ] Lium: detect a key whose pod visibility is `own` (its listing is not the account's)
-  once the API says which a key is; until then it is documented.
 - [x] Lium: spot nodes with `--interruptible`, beside the others; a closed pod (BROKEN)
   is interrupted, not the machine's fault.
 - [ ] Lium: private images (a Docker credential per run),
@@ -162,6 +160,8 @@ Providers to add, in this order.
   it makes another chip (H100-SXM, -PCIe, -NVL) and a memory if asked; the gate reads
   nvidia-smi the same way (DESIGN.md, 19).
 - [x] Hyperstack: spot flavors with `--interruptible`. Not checked live (no credit).
+- [ ] Hyperstack: test spot live once the account has credit: a spot VM healthy, `renew`
+  and `down`, and what Hyperstack does to an evicted VM (deleted, or left to bill).
 - [ ] Radiant (Ori): decided to keep a table of Ori's list prices (Oct 2026, per GPU-hour:
   H200 3.50, H100 SXM/PCIe 2.90, A100 2.74, L40S 1.55, V100S 0.95, L4 0.93, V100 0.83), since its
   API has none. Blocked: every create answers HTTP 500 with no message, so its VM fields,
