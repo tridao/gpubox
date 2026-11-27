@@ -158,6 +158,7 @@ Providers to add, in this order.
   node ids for the blocklist once they are seen to mean the same machine across runs.
 - [x] Verda: VMs on the VM box, spot VMs with `--interruptible`, an OAuth client for a
   key, the tag as a tag. Checked live, spot and on demand (DESIGN.md, 18).
+- [x] Hyperstack: spot flavors with `--interruptible`. Not checked live (no credit).
 - [ ] Radiant (Ori): decided to keep a table of Ori's list prices (Oct 2026, per GPU-hour:
   H200 3.50, H100 SXM/PCIe 2.90, A100 2.74, L40S 1.55, V100S 0.95, L4 0.93, V100 0.83), since its
   API has none. Blocked: every create answers HTTP 500 with no message, so its VM fields,

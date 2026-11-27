@@ -21,9 +21,14 @@ startup script, so any key pair of the environment serves; if it has none, the r
 public key is imported as `gpubox` (a public key, harmless once the run's private key is
 gone).
 
+Spot flavors (`-spot` in the name, at a fixed discount) are offered only with
+`--interruptible`, beside the others, cheapest first (a tie to the one that is not spot).
+Hyperstack deletes a spot VM without notice when it wants the capacity back: the box is
+then gone, which an interruptible launch takes without blame.
+
 Hyperstack keeps no expiry and a VM cannot delete itself without the account's key: only
-`down`, or a scheduled `reap`, ends a VM left behind (`up` says so). Not yet: spot
-flavors, private images, countries.
+`down`, or a scheduled `reap`, ends a VM left behind (`up` says so). Not yet: private
+images, countries.
 """
 
 from __future__ import annotations
@@ -92,7 +97,7 @@ class Hyperstack:
     default_spare = 1
     renewable = True  # its lease can be moved (relabel)
     requires = frozenset({"image", "price_cap"})
-    features = frozenset({"image", "price_cap", "any_gpu"})
+    features = frozenset({"image", "price_cap", "interruptible", "any_gpu"})
     searchable = True
     searches_lease = False
     lease_slack = 0  # its lease ends a box at the tag's expiry
@@ -175,8 +180,9 @@ class Hyperstack:
                 gpu, region = f.get("gpu"), f.get("region_name")
                 if not isinstance(gpu, str) or not gpu or not isinstance(f.get("name"), str):
                     continue
-                if "spot" in f["name"].lower() or "spot" in gpu.lower():
-                    continue  # interruptible: not yet
+                spot = "spot" in f["name"].lower() or "spot" in gpu.lower()
+                if spot and not spec.interruptible:
+                    continue  # Hyperstack may delete it at any time
                 if spec.gpus and not any(gpu_matches(m, gpu, f["name"]) for m in spec.gpus):
                     continue
                 unit = prices.get(gpu.lower())
@@ -189,15 +195,16 @@ class Hyperstack:
                     continue
                 if not self._fits(spec, f):
                     continue
-                found.append((unit * n, f["name"], gpu, region, image, cuda))
-        found.sort()
+                found.append((unit * n, spot, f["name"], gpu, region, image, cuda))
+        found.sort()  # cheapest first; at a tie, the flavor that is not spot
         offers = []
         for k in range(policy.max_live):
-            for price, flavor, gpu, region, image, cuda in found:
+            for price, spot, flavor, gpu, region, image, cuda in found:
                 offers.append({
                     "id": f"{flavor}:{region}#{k}", "machine_id": None,
                     "failure_domain": f"hyperstack/{region}", "dph_total": price,
-                    "geolocation": region, "gpu_name": gpu, "cuda_max_good": cuda,
+                    "geolocation": region + (" (spot)" if spot else ""),
+                    "gpu_name": gpu, "cuda_max_good": cuda,
                     "boot_s": BOOT_S, "_flavor": flavor, "_region": region,
                     "_env": envs[region], "_image": image,
                 })  # fmt: skip

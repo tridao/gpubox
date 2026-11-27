@@ -125,6 +125,23 @@ def test_offers_are_flavors_in_stock_in_a_region_with_a_docker_image_new_enough(
     }
 
 
+def test_spot_flavors_only_for_an_interruptible_box_and_then_beside_the_others():
+    p, _ = make()
+    spot = L.Spec(image="i", gpus=(), max_dph_per_gpu=1.0, interruptible=True)
+    offers = p.candidates(spot, {}, L.Policy(spare=0))[0]
+    assert [(o["_flavor"], o["geolocation"]) for o in offers] == [
+        ("n3-RTX-A6000x1", "CANADA-1"), ("n3-L40x1-spot", "CANADA-1 (spot)"),
+    ]  # fmt: skip
+    FLAVORS.append(flavor("n3-RTX-A6000x1-spot", "RTX-A6000-spot", "CANADA-1"))
+    PRICES.append({"name": "RTX-A6000-spot", "value": "0.5"})
+    try:  # at a tie, the flavor that is not spot first
+        offers = p.candidates(spot, {}, L.Policy(spare=0))[0]
+        assert [o["_flavor"] for o in offers][:2] == ["n3-RTX-A6000x1", "n3-RTX-A6000x1-spot"]
+    finally:
+        FLAVORS.pop()
+        PRICES.pop()
+
+
 def test_an_account_that_cannot_create_says_so_before_anything():
     p, api = make()
     api.credit = False

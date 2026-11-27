@@ -243,7 +243,9 @@ Docker" of the newest CUDA in the region. Hyperstack keeps no expiry and a
 VM cannot delete itself, so `up` warns: only `gpubox down`, or a scheduled
 `gpubox reap --provider hyperstack --namespace NS --destroy`, ends a VM left
 behind. Hyperstack needs a key pair at the create: if the environment has
-none, the run's public key is imported once as `gpubox`.
+none, the run's public key is imported once as `gpubox`. With
+`--interruptible`, its spot flavors are offered too, beside the others:
+Hyperstack deletes a spot VM without notice when it wants it back.
 
 ## Massed Compute
 
