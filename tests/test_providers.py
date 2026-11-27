@@ -72,3 +72,12 @@ def test_an_authenticated_call_is_not_redirected():
         assert exc.value.status == 302  # never read as anything, least of all a 404
     finally:
         server.shutdown()
+
+
+def test_a_model_is_matched_word_by_word_in_order():
+    from gpubox.providers.base import gpu_matches
+
+    assert gpu_matches("A100 40GB", "NVIDIA A100-SXM4-40GB")  # Verda's name, nvidia-smi's
+    assert gpu_matches("RTX 4090", "NVIDIA GeForce RTX 4090") and gpu_matches("rtx4090", "RTX 4090")
+    assert not gpu_matches("40GB A100", "NVIDIA A100-SXM4-40GB")
+    assert not gpu_matches("H100 SXM", "NVIDIA H100 80GB HBM3") and not gpu_matches("", "x")

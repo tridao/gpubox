@@ -109,7 +109,10 @@ def _compact(text) -> str:
 
 
 def gpu_matches(asked: str, *names) -> bool:
-    """A model asked for, as a person writes it ("RTX 4090", "H100 SXM"), against
-    RunPod's ids and names ("NVIDIA GeForce RTX 4090", "NVIDIA H100 80GB HBM3")."""
-    needle = _compact(asked)
-    return bool(needle) and any(needle in _compact(n) for n in names if n)
+    """A model asked for, as a person writes it ("RTX 4090", "A100 40GB"), against a
+    provider's names ("NVIDIA GeForce RTX 4090", "NVIDIA A100-SXM4-40GB"): every word of
+    it is in the name, in order, whatever lies between them. The gate (gate.py) matches
+    what nvidia-smi says the same way."""
+    words = re.findall(r"[a-z0-9]+", str(asked).lower())
+    pattern = re.compile(".*".join(map(re.escape, words)))
+    return bool(words) and any(pattern.search(_compact(n)) for n in names if n)

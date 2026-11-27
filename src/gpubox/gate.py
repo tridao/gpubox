@@ -72,8 +72,14 @@ def driver_cuda():
         return None
 
 def compact(name):
-    # As the providers' searches compare names: "rtx4090" is "NVIDIA GeForce RTX 4090".
     return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+def matches(model, name):
+    # As the providers' searches match names (base.gpu_matches): every word of the model
+    # in the name, in order: "rtx4090" is "NVIDIA GeForce RTX 4090", and "A100 40GB" is
+    # "NVIDIA A100-SXM4-40GB".
+    words = re.findall(r"[a-z0-9]+", model.lower())
+    return bool(words) and re.search(".*".join(map(re.escape, words)), compact(name)) is not None
 
 rows = smi()
 out["gpus"] = [r[1] for r in rows]
@@ -84,7 +90,7 @@ out["disk_free_gb"] = shutil.disk_usage("/").free >> 30
 if len(rows) != want["num_gpus"]:
     done("wrong_hardware", "expected %d GPUs, nvidia-smi lists %d" % (want["num_gpus"], len(rows)))
 for r in rows:
-    if want["gpus"] and not any(compact(model) in compact(r[1]) for model in want["gpus"]):
+    if want["gpus"] and not any(matches(model, r[1]) for model in want["gpus"]):
         done("wrong_hardware", "GPU %s is %r, not %s" % (r[0], r[1], " or ".join(want["gpus"])))
     if int(r[2]) < want["min_vram_mib"]:
         done("wrong_hardware", "GPU %s has %s MiB, need %d" % (r[0], r[2], want["min_vram_mib"]))

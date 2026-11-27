@@ -318,7 +318,7 @@ def real_gate(tmp_path, torch_source=None, want=WANT, driver_cuda="12.8"):
     """Run the real gate script against a stand-in nvidia-smi and, if given, a stand-in
     PyTorch package; the interpreter's own packages are out of reach (-S)."""
     bin_dir, lib = tmp_path / "bin", tmp_path / "lib"
-    bin_dir.mkdir()
+    bin_dir.mkdir(parents=True)
     lib.mkdir()
     (bin_dir / "nvidia-smi").write_text(SMI)
     (bin_dir / "nvidia-smi").chmod(0o755)
@@ -462,6 +462,9 @@ def test_the_remote_side_runs_the_script_by_its_interpreter_with_no_stdin(script
 
 
 def test_the_model_is_matched_as_the_searches_match_it(tmp_path):
-    want = {**WANT, "gpus": ["rtx5090"]}  # "NVIDIA GeForce RTX 5090" in the stand-in
-    ok, reason, detail, _ = real_gate(tmp_path, want=want)
-    assert (ok, reason) == (True, None), detail
+    # "NVIDIA GeForce RTX 5090" in the stand-in
+    for i, model in enumerate(("rtx5090", "GeForce 5090")):
+        ok, reason, detail, _ = real_gate(tmp_path / str(i), want={**WANT, "gpus": [model]})
+        assert (ok, reason) == (True, None), detail
+    ok, reason, _, _ = real_gate(tmp_path / "x", want={**WANT, "gpus": ["5090 RTX"]})
+    assert reason == "wrong_hardware"
