@@ -76,9 +76,13 @@ class Client:
             timeout,
         )
 
-    def call(self, method, path, *, body=None, query=None, retries=2, timeout=None, headers=None):
+    def call(
+        self, method, path, *, body=None, query=None, retries=2, timeout=None, headers=None,
+        text=False,
+    ):  # fmt: skip
         """The parsed JSON answer (None for an empty one), or `error(status, message)`.
-        `headers` are added to this call's (an idempotency key)."""
+        `headers` are added to this call's (an idempotency key). `text`: the answer as
+        text, for an API that answers some calls with a bare value (Verda's ids)."""
         timeout = self.timeout if timeout is None else max(0.5, min(self.timeout, timeout))
         url = f"{self.base}/{path}"
         if query:
@@ -95,6 +99,8 @@ class Client:
             try:
                 with OPENER.open(req, timeout=timeout) as resp:
                     raw = resp.read()
+                    if text:
+                        return raw.decode()
                     return json.loads(raw) if raw.strip() else None
             except urllib.error.HTTPError as exc:
                 try:

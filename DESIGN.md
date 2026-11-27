@@ -818,3 +818,49 @@ a P40 pod healthy 49 s after the create, an RTX 4090 46 s; jobs, `ssh` and
 nothing was left after any of them, and the one-time templates were gone
 with their pods. With `--interruptible`, a pod on a spot node (an RTX 5060
 Ti) was healthy 59 s after the create, its removal time exact.
+
+## 18. Verda
+
+Verda (formerly DataCrunch) rents VMs in Finland through a REST API whose
+credentials are an OAuth client: the client id and secret give a token for
+ten minutes, which the client renews before it runs out, and once more
+when a call is refused as unauthorized (nothing was done). A box is the VM
+box (section 15), booted with Verda's image "+ Docker" of the newest CUDA
+that the instance type supports (Ubuntu 24.04 at a tie), reached as
+`ubuntu`: root refuses keys. Verda requires an SSH key at the create; the
+run's key goes in with the startup script, so the key registered is a
+placeholder whose private half was thrown away, as on Hyperstack. The
+account is the project its token names.
+
+An offer is an instance type in a location where `/instance-availability`
+says it can be had, at that location's price for the whole VM. Spot VMs
+have their own availability and price (half), and with `--interruptible`
+are offered beside the others, cheapest first, a tie to the on-demand VM.
+Confidential-computing types, which need images of their own, are left out.
+The create is sent once and answers with the bare id (as text, not JSON);
+503 is no capacity there, a refusal like any other 4xx; one about the
+account (insufficient funds) stops the launch. The OS volume is at least
+50 GB (Verda refused 40). A spot VM's volume is created to be deleted when
+the VM is discontinued (Verda refuses that policy for an on-demand VM).
+
+The tag is a tag, key `gpubox`; renewing adds the new one before it removes
+the old, so a renewal cut short leaves a row with two of our tags, which is
+unreadable and fails a listing, rather than an untagged VM the reaper cannot
+see. A delete names the OS volume, to be deleted permanently. A deleted VM,
+spot or not, and an evicted spot VM, become `discontinued`: the listing no
+longer shows them, and a lookup does for minutes after, so `discontinued`
+counts as gone; the volume follows within about a minute. Verda keeps no
+expiry, so the lease is `down` and the reaper. Its balance is taken in
+pre-paid 10-minute steps, the unused part refunded later.
+
+**Measured**, November 2026, `python:3.12-slim`: an A100 40GB healthy 85 s
+after the create (spot) and 96 s (on demand); the VM ran 17 s after the
+create and answered SSH at about 50 s. Jobs, `ssh`, `renew` and `down`
+worked, as did `down --run-id` from an empty directory; nothing was left,
+instances or volumes.
+
+`--gpu` matches a model word by word, in order, wherever the words fall in
+the name (`base.gpu_matches`, and the gate the same way): "A100 40GB", as
+Verda names a type, is the "NVIDIA A100-SXM4-40GB" that nvidia-smi then
+shows. Seen live: the gate refused that box while it matched as one string.
+

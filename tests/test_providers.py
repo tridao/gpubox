@@ -22,7 +22,8 @@ def test_every_provider_says_what_it_can_do(name):
     assert kind.lease == "provider" or kind.lease_slack == 0  # only a provider's lease lags
     assert kind.features <= set(providers.FEATURES) and kind.requires <= kind.features
     assert type(kind.default_spare) is int and kind.default_spare >= 0
-    assert kind.credential is None or kind.credential.endswith("_KEY")
+    names = kind.credential if isinstance(kind.credential, tuple) else (kind.credential,)
+    assert kind.credential is None or all(n.endswith(("_KEY", "_ID", "_SECRET")) for n in names)
     for call in ("candidates", "create", "admit", "instance", "instances", "view", "destroy",
                  "relabel", "account", "expiry_command", "manual_hint", "describe",
                  "options", "from_options"):  # fmt: skip

@@ -1,8 +1,8 @@
 # gpubox
 
 Rent a GPU box from [Vast.ai](https://vast.ai), [RunPod](https://runpod.io),
-[Lium](https://lium.io) or the VM clouds behind [Shadeform](https://shadeform.ai),
-or take one from a Slurm cluster. gpubox checks that it works and manages its teardown.
+[Lium](https://lium.io), [Verda](https://verda.com) or the VM clouds behind
+[Shadeform](https://shadeform.ai), or take one from a Slurm cluster. gpubox checks that it works and manages its teardown.
 For CI jobs and dev boxes.
 
 Marketplace hosts are unreliable: some never finish pulling the image, some
@@ -30,7 +30,7 @@ key. To install unreleased changes, pin a Git commit instead:
 `pip install 'git+https://github.com/tridao/gpubox@<commit>'`.
 
 Keys are read from the environment (`VASTAI_API_KEY`, `RUNPOD_API_KEY`,
-`LIUM_API_KEY`, `SHADEFORM_API_KEY`), else from lines `NAME=value` in
+`LIUM_API_KEY`, `SHADEFORM_API_KEY`, `VERDA_CLIENT_ID` and `VERDA_CLIENT_SECRET`), else from lines `NAME=value` in
 `~/.config/gpu-cloud-query/keys.env`.
 
 ## A dev box
@@ -254,6 +254,31 @@ products have 6 CPUs and 32 GB: pass `--min-cpus 6`. Massed cannot rename an
 instance, so the lease set by `up --ttl-min` cannot be moved (`renew` is
 refused), and as on Hyperstack only `down` or a scheduled `reap` ends a VM
 left behind.
+
+## Verda
+
+```bash
+gpubox search --provider verda --gpu H100 --max-dph-per-gpu 3 --interruptible
+gpubox up --provider verda --gpu H100 --max-dph-per-gpu 3 --interruptible --image my/image:tag \
+    --namespace dev --name mybox --ttl-min 120
+gpubox ssh                     # a shell in the box's container
+```
+
+`--provider verda` rents Verda's (formerly DataCrunch) VMs in Finland, as
+boxes like Shadeform's: the image as a container on the VM, reached as
+`ubuntu` with SSH and `docker exec`, booted with Verda's image "+ Docker" of
+the newest CUDA the type supports. Its credentials are an OAuth client
+(`VERDA_CLIENT_ID`, `VERDA_CLIENT_SECRET`, from the console's Keys page).
+With `--interruptible`, spot VMs are offered too, at half the price, beside
+the others: Verda may evict one at any time, and it is then gone, its disk
+with it. A single H100, H200 or B200 is often to be had here.
+
+Verda keeps no expiry and a VM cannot delete itself, so as on Hyperstack only
+`gpubox down`, or a scheduled `gpubox reap --provider verda --namespace NS
+--destroy`, ends a VM left behind. The OS disk (at least 50 GB) is billed
+apart from the VM, so the price cap does not cover it; `down` deletes it with
+the VM. Verda takes its money in pre-paid 10-minute steps and refunds what is
+unused later, so the balance can dip by more than a short run costs.
 
 ## Lyceum
 

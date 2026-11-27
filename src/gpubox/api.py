@@ -140,9 +140,12 @@ class Settings:
                 "a Slurm cluster needs its login host (--login HOST): as `ssh HOST` "
                 "reaches it without a password prompt"
             )
-        return kind.from_options(
-            options, self.credential(kind.credential) if kind.credential else None
-        )
+        names = kind.credential
+        if isinstance(names, tuple):  # several (Verda's client id and secret)
+            key = tuple(self.credential(n) for n in names)
+        else:
+            key = self.credential(names) if names else None
+        return kind.from_options(options, key)
 
     def named_provider(self):
         """The provider these settings name (providers/base.py)."""

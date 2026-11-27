@@ -3,8 +3,9 @@
 Each provider class (base.py describes the calls) also says, as class attributes:
 
     name, noun        "runpod", "pod"
-    credential        the environment variable with its API key (None: it needs none),
-                      also read from the keys file (api.Settings.keys_file)
+    credential        the environment variable with its API key (None: it needs none; a
+                      tuple: several, given to `from_options` as a tuple), also read from
+                      the keys file (api.Settings.keys_file)
     access            how a box is reached: "ssh" (our sshd and the run's key), "srun"
                       (a step of a Slurm job), or "vm" (SSH to a VM, then docker exec
                       into the box's container; vmbox.py)
@@ -40,14 +41,14 @@ that every class declares the above.
 
 from __future__ import annotations
 
-from . import hyperstack, lium, lyceum, massed, runpod, shadeform, slurm, vast
+from . import hyperstack, lium, lyceum, massed, runpod, shadeform, slurm, vast, verda
 from ..errors import ConfigError
 
 KINDS = {
     k.name: k
     for k in (
         vast.VastProvider, slurm.Slurm, runpod.RunPod, shadeform.Shadeform, hyperstack.Hyperstack,
-        massed.Massed, lyceum.Lyceum, lium.Lium,
+        massed.Massed, lyceum.Lyceum, lium.Lium, verda.Verda,
     )
 }  # fmt: skip
 
