@@ -404,6 +404,7 @@ class VastProvider:
         {"image", "price_cap", "interruptible", "registry_login", "exclude_country", "ssh_config"}
     )
     searchable = True
+    searches_lease = True  # an offer's contract must outlast the lease
 
     def __init__(self, client):
         self.client = client

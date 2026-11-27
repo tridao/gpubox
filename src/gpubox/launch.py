@@ -196,6 +196,7 @@ class Attempt:
     status: str = ""
     msg: str = ""
     ssh_err: str = ""
+    lease_set: bool = False  # the provider's expiry, set again once the box ran (lease_on_start)
 
     @property
     def tag_name(self) -> str:
@@ -689,6 +690,15 @@ class Launch:
         ep = view.endpoint
         if ep is None:
             return None
+        if getattr(self.provider, "lease_on_start", False) and not a.lease_set:
+            # The provider resets a box's expiry when it starts (Lium): set it again
+            # before the box is admitted, and give up on a box whose lease is not confirmed.
+            try:
+                self.provider.relabel(a.instance_id, a.tag)
+            except (prov.ProviderError, ValueError) as exc:
+                self._fail(a, None, f"its lease could not be set once it ran: {exc}")
+                return None
+            a.lease_set = True
         a.timings.setdefault("running", self._elapsed(a))
         a.endpoint = ep
         a.check = self.prober.start_ready(ep)

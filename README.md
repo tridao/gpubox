@@ -182,14 +182,21 @@ machine's GPUs) at its own price per GPU, and a box is a pod on it, your image
 under gpubox's command. A node's CPUs, memory and disk are shared out in
 proportion to the GPUs rented, so `--min-cpus`, `--min-ram-gb` and `--disk-gb`
 are judged against that share; a node that rents only whole is offered only
-when `--num-gpus` is all its free GPUs. Spot nodes are left out.
+when `--num-gpus` is all its free GPUs. Spot nodes are left out, and so are
+nodes with no reliability score yet. Lium may rent at up to a cent per GPU-hour
+above the price offered, so that cent must fit under `--max-dph-per-gpu` too.
 
 The sshd is Lium's, which it adds to the image if it has none, with the run's
-key and no other. The lease is Lium's own: each pod is given a removal time at
-the end of the lease, which `renew` moves; a pod cannot delete itself, so
-`run --destroy-after` is refused. Lium answers a repeated rent with the first
-one's answer, so a rent whose answer was lost is sent again rather than given
-up on. The pod's `/root` is its volume, with the image's files in it.
+key (and without Lium's agent key; keys the image itself has are its own
+business). The lease is Lium's own: each pod's removal time, which `renew`
+moves; a pod cannot delete itself, so `run --destroy-after` is refused. Lium
+answers a repeated rent with the first one's answer, so a rent whose answer
+was lost is sent again rather than given up on. The pod's `/root` is its
+volume, with the image's files in it. A lease is at most 720 hours.
+
+Use a key whose pod visibility is `account` (the default). A key with `own`
+visibility sees only the pods it rented, and nothing tells gpubox which kind a
+key is: `down --run-id` or `reap` with another such key would find nothing.
 
 Not yet on Lium: `--interruptible` (spot nodes), `--registry-user` (private
 images), and machines are not recorded, so the blocklist does not apply.

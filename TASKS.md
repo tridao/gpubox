@@ -150,6 +150,8 @@ Providers to add, in this order.
   Checked live.
 - [x] Lium: a marketplace of nodes, pods as boxes with Lium's sshd, the rent retried under
   its idempotency key, the lease Lium's removal time. Checked live (DESIGN.md, 17).
+- [ ] Lium: detect a key whose pod visibility is `own` (its listing is not the account's)
+  once the API says which a key is; until then it is documented.
 - [ ] Lium: spot nodes (`--interruptible`), private images (a Docker credential per run),
   node ids for the blocklist once they are seen to mean the same machine across runs.
 - [ ] Radiant (Ori): decided to keep a table of Ori's list prices (Oct 2026, per GPU-hour:

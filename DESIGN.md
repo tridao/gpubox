@@ -717,12 +717,17 @@ proportion to the GPUs rented, which is what `--min-cpus`, `--min-ram-gb`
 and `--disk-gb` are judged against; seen live, a pod got exactly that
 memory and the node's listed CPUs. A node listed with no minimum GPU count
 rents only whole. Spot nodes, which can be taken back, are left out. A
-node is offered once per box it can hold, every node once before any
-again: the spares of a race hedge against a bad machine, which two boxes
-on one node would not. Nodes with frequent rent failures, a bad disk, a
-removal or maintenance notice within the lease, a reliability under
-`min_reliability`, or a download under the minimum are left out; a size or
-a time that is not stated does not meet a minimum.
+node is offered once per box it can hold (its free GPUs, and its free
+ports: each pod takes one), every node once before any again: the spares
+of a race hedge against a bad machine, which two boxes on one node would
+not. Nodes with frequent rent failures, a bad disk, a removal or
+maintenance that starts within the lease, a reliability under
+`min_reliability` or none yet, a download under the minimum, or no country
+when countries are excluded are left out: a size or a time that is not
+stated does not meet a minimum. The rent states the price offered, and
+Lium refuses it only if the node now asks more than a cent above that; so
+offers leave that cent within the cap. A node's provider is its host for
+the image rule: two of its nodes are one witness.
 
 **The box.** A rent names a template: an image, an entrypoint and a start
 command. Each attempt makes a private one-time template, which Lium
@@ -732,34 +737,53 @@ the form `bash -c '...'`, so the entrypoint is `/usr/bin/env` (which keeps
 the image's own ENTRYPOINT from running our command as its arguments) and
 the command is `bash -c` with the VM box's container command: save the
 environment, then wait. Lium's validator then puts an sshd in the
-container (installing one if the image has none) with the rent's keys:
-the run's key and, with `skip_add_agent_ssh_key`, no other. It adopts an
-sshd the image starts itself, so ours would race it; gpubox starts none.
-The pod shows `ssh root@HOST -p PORT` once running; anything else (a
-gateway's `-J`, another user) is not how gpubox gets in, and the box is
-given up on. The volume is `/root`, as Lium advises; the image's files in
-`/root` were seen in it.
+container (installing one if the image has none) and adds the rent's keys
+to root's: the run's key, and with `skip_add_agent_ssh_key` not Lium's
+agent key. It adopts an sshd the image starts itself, so ours would race
+it; gpubox starts none. Keys the image itself carries are not removed. The
+pod shows `ssh root@HOST -p PORT` once running; anything else (a gateway's
+`-J`, another user) is not how gpubox gets in, and the box is given up on.
+The volume is `/root`, as Lium advises; the image's files in `/root` were
+seen in it.
 
 **The rent.** The rent carries an `Idempotency-Key`, the tag: within a day,
 Lium answers the same key and body with the first answer (seen live,
-`Idempotent-Replayed: true`). So unlike every other create, it is retried
-after a lost answer or a 5xx; a refusal that says our own earlier request
-may still be running (`idempotency_in_progress`, `own_rent_in_progress`)
-is an unknown outcome, not a no. Errors carry a stable `error.code`, which
-is what is read: one about the account or the image stops the launch,
-since no other node would answer otherwise. The rent states the price
-offered, and Lium refuses it if the node now asks more.
+`Idempotent-Replayed: true`). So unlike every other create, it is sent
+again, the same body, while there is no answer (no reply, a 5xx, a
+redirect) or the first is still running (`idempotency_in_progress`,
+`own_rent_in_progress`), and after a 429. Once an answer was lost, only a
+pod id settles the rent: a refusal that follows may be Lium's answer to the
+repeat, not to the request that rented, so the attempt stays unanswered
+and keeps its slot. Errors carry a stable `error.code`, which is what is
+read: one about the account or the image stops the launch, since no other
+node would answer otherwise. A pod id is taken only from a successful
+answer, and not if a lookup shows that pod under another name.
 
-**The lease** is Lium's: a pod's `removal_scheduled_at`. The rent's own
-`termination_hours` is not used: it is whole hours from when the pod
-starts running, and it overwrote a removal time set while the pod was
-pending (seen live). Instead the removal time is set right after the
-rent, while the pod is pending, and it holds. A pod whose removal time
-cannot be set is deleted, and the attempt counts as unanswered, so the
-sweep looks for it by its tag. `renew` sets the removal time, then the
-name, and believes it once both read back. Lium shows times in UTC
-without an offset. A deleted pod is DELETING for some 40 s, then 404;
-billing stops at the delete request, so DELETING counts as gone.
+**The lease** is Lium's: a pod's `removal_scheduled_at`. The rent carries
+`termination_hours`, the lease rounded up to whole hours, as its backstop:
+Lium counts it from when the pod starts running, and at that moment it
+replaces any removal time set before (seen live). So the exact time is set
+twice: right after the rent, which covers a pod that never starts, and
+again once the pod runs, before it is admitted (`lease_on_start`: the
+launcher relabels it as soon as it shows an SSH address). A pod whose time
+cannot be confirmed then is given up on and deleted, as a box that fails
+its gate is. A pod left behind by a launch that died ends at the backstop:
+an hour at most after the lease, plus its start. `renew` sets the removal
+time, then the name, and believes it once both read back. Lium shows times
+in UTC without an offset. Lium takes `termination_hours` up to 720, so a
+longer lease is refused.
+
+**Gone.** A deleted pod is DELETING for some 40 s, then 404 with the code
+`pod_not_found`; billing stops at the delete request, so DELETING counts as
+gone. A 404 without that code (a gateway's, a route's) is an error, not
+absence.
+
+**Keys.** A key acts in its workspace, and the account gpubox pins is the
+user and that workspace. A key whose pod visibility is `own` lists and
+looks up only the pods it rented, and nothing in the API says which kind a
+key is (`/users/me` names its scopes, not its visibility). So a listing
+with such a key is not the account's, and tag-only cleanup with another
+key could find nothing: this is documented, not detected.
 
 **Measured**, November 2026, `python:3.12-slim` (sshd installed by Lium):
 a P40 pod healthy 49 s after the create, an RTX 4090 46 s; jobs, `ssh` and
@@ -768,4 +792,3 @@ a P40 pod healthy 49 s after the create, an RTX 4090 46 s; jobs, `ssh` and
 `down --run-id` from an empty directory found the run's pod by its name;
 nothing was left after any of them, and the one-time templates were gone
 with their pods.
-

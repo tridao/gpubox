@@ -899,7 +899,7 @@ def test_up_and_search_skip_offers_too_short_for_the_vast_lease(world, capsys):
 def test_search_does_not_ignore_ttl_min_on_other_providers(world, capsys):
     _, run = world
     assert run(["search", "--provider", "runpod", "--ttl-min", "480"]) == cli.EXIT_CONFIG
-    assert "search --ttl-min is only supported on Vast" in capsys.readouterr().out
+    assert "search --ttl-min means nothing on runpod" in capsys.readouterr().out
 
 
 def test_a_registry_login_takes_its_token_from_the_environment(world, monkeypatch):

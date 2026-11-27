@@ -496,8 +496,9 @@ def cmd_reap(args) -> int:
 
 
 def cmd_search(args) -> int:
-    if args.provider != "vast" and args.ttl_min is not None:
-        raise ConfigError("search --ttl-min is only supported on Vast")
+    kind = providers.kind(args.provider)
+    if args.ttl_min is not None and not getattr(kind, "searches_lease", False):
+        raise ConfigError(f"search --ttl-min means nothing on {kind.name}")
     spec = spec_from(args)
     offers, blocked = api.search(spec, settings=settings(args))
     if args.provider != "vast":

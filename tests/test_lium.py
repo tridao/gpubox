@@ -2,7 +2,7 @@
 
 `FakeApi` stands in for `lium.Client`: it answers `call(method, path, ...)` as the API
 does, from a list of nodes and a dict of pods, and `fail` makes chosen calls answer
-otherwise first.
+otherwise first (PASS: that call is answered as usual).
 """
 
 import shlex
@@ -24,6 +24,7 @@ RUN_ID = "dev.lium.0123456789ab"
 EXPIRY = int(time.time()) + 3600
 SPEC = L.Spec(image="img:1", gpus=("RTX 4090",), max_dph_per_gpu=1.0)
 KIB = 1024**2  # per GB
+PASS = object()
 
 
 def uid(n: int) -> str:
@@ -39,7 +40,7 @@ def node(n, gpu="NVIDIA GeForce RTX 4090", price=0.35, total=1, free=1, least=1,
         "frequent_rent_failures": False, "disk_health_ok": True, "is_slow_machine": False,
         "removal_at": None, "scheduled_notice": None, "reliability_score": 99.5,
         "effective_download_speed_mbps": 800.0, "max_cuda_version": 13.0,
-        "free_port_count": 99,
+        "free_port_count": 99, "provider_key": f"provider-{n}",
         "location": {"country_code": "US", "city": "Austin"},
         "specs": {
             "is_spot": False,
@@ -75,6 +76,11 @@ NODES = [
     node(15, price=0.20, free_port_count=0),
     node(16, price=0.20, ram={"total": 36 * KIB, "pod_reserve": 8 * KIB}),
     node(17, price=0.20, available_gpu_count=0),
+    node(18, price=0.995),  # within the cap, but not the cent Lium may add
+    node(19, price=0.20, reliability_score=None),  # a new node: not yet known to be reliable
+    node(20, price=0.20, removal_at="2026-01-01T00:00:00"),
+    node(21, price=0.20, location={"country_code": "", "city": "x"}),
+    node(22, price=0.20, total=8, hard_disk={"free": 300 * KIB}),  # 37 GB of it for one GPU
 ]
 
 
@@ -83,6 +89,8 @@ class FakeApi:
         self.nodes = list(NODES if nodes is None else nodes)
         self.pods, self.templates, self.calls, self.fail = {}, {}, [], {}
         self.full = set()  # nodes that refuse a rent: rented since the listing
+        self.stuck = set()  # nodes whose running pods refuse a removal time
+        self.lose = 0  # rents that rent, then lose their answer
         self.n = 0
 
     def call(self, method, path, *, body=None, query=None, retries=2, timeout=None, headers=None):
@@ -95,11 +103,12 @@ class FakeApi:
             answer = self.fail[key].pop(0)
             if isinstance(answer, Exception):
                 raise answer
-            return answer
+            if answer is not PASS:
+                return answer
         if path == "executors":
             return self.nodes
         if path == "users/me":
-            return {"id": uid(999), "balance": 10.0}
+            return {"id": uid(999), "balance": 10.0, "workspace": {"id": uid(998)}}
         if path == "templates" and method == "POST":
             self.n += 1
             self.templates[uid(5000 + self.n)] = body
@@ -108,19 +117,7 @@ class FakeApi:
             self.templates.pop(parts[1], None)
             return {"success": True}
         if parts[0] == "executors" and parts[2] == "rent":
-            if parts[1] in self.full:
-                raise err(400, "node_unavailable")
-            for p in self.pods.values():  # the same key and body: the first answer
-                if p["key"] == headers["Idempotency-Key"]:
-                    return {"success": True, "pod_id": p["id"]}
-            self.n += 1
-            pid = uid(9000 + self.n)
-            self.pods[pid] = {
-                "id": pid, "pod_name": body["pod_name"], "status": "RUNNING", "node": parts[1],
-                "ssh_connect_cmd": f"ssh root@203.0.113.{self.n} -p {20000 + self.n}",
-                "removal_scheduled_at": None, "key": headers["Idempotency-Key"], "body": body,
-            }  # fmt: skip
-            return {"success": True, "pod_id": pid, "phase": "queued"}
+            return self.rent(parts[1], body, headers["Idempotency-Key"])
         if path == "pods" and method == "GET":
             return [dict(p) for p in self.pods.values()]
         pid = parts[1]
@@ -128,11 +125,17 @@ class FakeApi:
             raise err(404, "pod_not_found")
         pod = self.pods[pid]
         if parts[-1] == "schedule-removal":
-            pod["removal_scheduled_at"] = body["removal_scheduled_at"].rstrip(
-                "Z"
-            )  # as Lium shows it
+            if pod["status"] == "RUNNING" and pod["node"] in self.stuck:
+                raise err(500, "internal_error")
+            pod["removal_scheduled_at"] = body["removal_scheduled_at"].rstrip("Z")  # as shown
             return dict(pod)
         if method == "GET":
+            pod["gets"] += 1
+            if pod["status"] == "PENDING" and pod["gets"] > 1:
+                # It starts after the rent's own lookup, and Lium sets its removal time then.
+                hours = pod["body"]["termination_hours"]
+                pod["status"] = "RUNNING"
+                pod["removal_scheduled_at"] = lm.rfc3339(int(time.time()) + hours * 3600)[:-1]
             return dict(pod)
         if method == "DELETE":
             pod["status"] = "DELETING"
@@ -141,6 +144,26 @@ class FakeApi:
             pod["pod_name"] = body["pod_name"]
             return dict(pod)
         raise AssertionError((method, path))
+
+    def rent(self, nid, body, key):
+        if nid in self.full:
+            raise err(400, "node_unavailable")
+        for p in self.pods.values():  # the same key: the first answer, for the same body
+            if p["key"] == key:
+                if p["body"] != body:
+                    raise err(422, "idempotency_key_reused")
+                return {"success": True, "pod_id": p["id"]}
+        self.n += 1
+        pid = uid(9000 + self.n)
+        self.pods[pid] = {
+            "id": pid, "pod_name": body["pod_name"], "status": "PENDING", "node": nid,
+            "ssh_connect_cmd": f"ssh root@203.0.113.{self.n} -p {20000 + self.n}",
+            "removal_scheduled_at": None, "key": key, "body": body, "gets": 0,
+        }  # fmt: skip
+        if self.lose:
+            self.lose -= 1
+            raise lm.LiumError(0, "POST: timed out")
+        return {"success": True, "pod_id": pid, "phase": "queued"}
 
 
 def err(status, code):
@@ -158,6 +181,11 @@ def rents(api):
     return [c for c in api.calls if c[1].endswith("/rent")]
 
 
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(lm.time, "sleep", lambda s: None)
+
+
 # ------------------------------------------------------------------ offers
 
 
@@ -173,6 +201,12 @@ def test_offers_are_nodes_that_can_take_the_box_cheapest_first_each_once_per_slo
     assert o["machine_id"] == uid(2) and o["cuda_max_good"] == 13.0
     assert o["geolocation"] == "Austin, US" and o["gpu_name"] == "NVIDIA GeForce RTX 4090"
     assert (o["cpu_cores_effective"], o["cpu_ram"] / 1024) == (24, 64)  # a quarter of the node
+    assert o["host_id"] == "provider-2"  # the image rule's witness
+
+
+def test_a_node_offers_no_more_boxes_than_it_has_free_ports():
+    p, _ = make(FakeApi([node(2, total=4, free=3, free_port_count=1)]))
+    assert len(p.candidates(SPEC, {}, L.Policy(spare=2))[0]) == 1
 
 
 def test_a_node_that_rents_only_whole_is_offered_only_for_all_its_free_gpus():
@@ -183,22 +217,43 @@ def test_a_node_that_rents_only_whole_is_offered_only_for_all_its_free_gpus():
     assert offer["dph_total"] == 0.7
 
 
+def test_the_disk_is_judged_by_the_share_of_the_gpus_rented():
+    p, _ = make(FakeApi([node(22, total=8, hard_disk={"free": 300 * KIB})]))
+    assert p.candidates(SPEC, {}, L.Policy())[0] == []  # 300 GB, of which 37 for one GPU
+    small = L.Spec(image="i", gpus=("4090",), max_dph_per_gpu=1.0, disk_gb=30)
+    assert len(p.candidates(small, {}, L.Policy())[0]) == 1
+
+
 def test_what_is_not_stated_does_not_meet_a_minimum():
     nodes = [node(1, max_cuda_version=None), node(2, location={}),
-             node(3, price_per_gpu="cheap"), node(4, ram=None)]  # fmt: skip
-    nodes.append({**node(5), "specs": None})
+             node(3, price_per_gpu="cheap"), node(4, ram=None),
+             node(5, reliability_score=None), node(6, scheduled_notice={})]  # fmt: skip
+    nodes.append({**node(7), "specs": None})
     p, _ = make(FakeApi(nodes))
     assert p.candidates(SPEC, {}, L.Policy())[0] == []
+    # Without a minimum, an unknown reliability or country is no reason to leave one out.
+    spec = L.Spec(image="i", gpus=(), max_dph_per_gpu=1.0, min_reliability=0,
+                  exclude_countries=())  # fmt: skip
+    assert {o["_node"] for o in p.candidates(spec, {}, L.Policy())[0]} == {uid(2), uid(5)}
+
+
+def test_a_removal_or_maintenance_after_the_lease_is_no_reason_to_leave_a_node_out():
+    later = lm.rfc3339(int(time.time()) + 6 * 3600)
+    nodes = [node(1, removal_at=later), node(2, scheduled_notice={"starting_at": later})]
+    p, _ = make(FakeApi(nodes))
+    assert len(p.candidates(SPEC, {}, L.Policy(spare=0))[0]) == 2
+    long = L.Spec(image="i", gpus=("4090",), max_dph_per_gpu=1.0, ttl_min=8 * 60)
+    assert p.candidates(long, {}, L.Policy())[0] == []
 
 
 def test_any_model_without_gpu_and_countries_as_asked():
     p, _ = make()
     spec = L.Spec(image="i", gpus=(), max_dph_per_gpu=1.0, exclude_countries=("US",))
     (only,) = p.candidates(spec, {}, L.Policy())[0]  # all in the US, but one in CN
-    assert only["_node"] == uid(9)
+    assert only["_node"] == uid(9)  # and one that does not say where it is: left out
     spec = L.Spec(image="i", gpus=(), max_dph_per_gpu=1.0, exclude_countries=())
     found = {o["_node"] for o in p.candidates(spec, {}, L.Policy())[0]}
-    assert {uid(3), uid(9)} <= found
+    assert {uid(3), uid(9), uid(21)} <= found
 
 
 # ------------------------------------------------------------------ the rent
@@ -217,18 +272,31 @@ def test_a_pod_is_rented_with_a_template_of_the_image_the_runs_key_and_its_lease
     assert path == f"executors/{uid(2)}/rent" and body["pod_name"] == tag
     assert body["user_public_key"] == ["ssh-ed25519 AAAA gpubox"] and body["gpu_count"] == 1
     assert body["skip_add_agent_ssh_key"] is True and body["expected_price_per_gpu_hour"] == 0.30
-    assert body["template_id"] in api.templates and "termination_hours" not in body
-    # Lium answers a repeat of the key with the first answer: so the rent is retried.
-    assert headers == {"Idempotency-Key": tag} and retries == 2
+    assert body["template_id"] in api.templates
+    # The backstop the rent carries: the lease in whole hours, from when the pod runs.
+    assert body["termination_hours"] == 1
+    assert headers == {"Idempotency-Key": tag} and retries == 0  # sent again by create
     assert lm.same_time(api.pods[pid]["removal_scheduled_at"], EXPIRY)
 
 
-def test_a_rent_repeated_under_its_key_is_the_same_pod():
+def test_a_rent_whose_answer_was_lost_is_sent_again_and_is_the_same_pod(no_sleep):
     p, api = make()
+    api.lose = 1
     offer = p.candidates(SPEC, {}, L.Policy())[0][0]
-    tag = make_tag(RUN_ID, 1, EXPIRY)
-    assert p.create(offer, SPEC, tag, "k", EXPIRY) == p.create(offer, SPEC, tag, "k", EXPIRY)
-    assert len(api.pods) == 1
+    pid = p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
+    first, again = rents(api)
+    assert first[2] == again[2] and first[4] == again[4]  # the same body, the same key
+    assert list(api.pods) == [pid] and len(api.templates) == 1
+
+
+def test_once_an_answer_was_lost_a_refusal_does_not_show_that_nothing_was_rented(no_sleep):
+    p, api = make()
+    api.lose = 1
+    api.fail["POST executors rent"] = [PASS, err(429, "rate_limited"), err(400, "node_unavailable")]
+    offer = p.candidates(SPEC, {}, L.Policy())[0][0]
+    with pytest.raises(prov.CreateUnknown, match="not settled"):
+        p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
+    assert len(api.pods) == 1 and len(api.templates) == 1  # it holds the template
 
 
 @pytest.mark.parametrize(
@@ -236,10 +304,12 @@ def test_a_rent_repeated_under_its_key_is_the_same_pod():
     [
         (err(400, "node_unavailable"), prov.CreateRefused),
         (err(409, "price_changed"), prov.CreateRefused),
+        (err(429, "rate_limited"), prov.CreateRefused),
         (err(409, "idempotency_in_progress"), prov.CreateUnknown),
         (err(409, "idempotency_outcome_unknown"), prov.CreateUnknown),
         (err(400, "own_rent_in_progress"), prov.CreateUnknown),
         (err(500, "internal_error"), prov.CreateUnknown),
+        (lm.LiumError(302, "redirect refused"), prov.CreateUnknown),
         (lm.LiumError(0, "timed out"), prov.CreateUnknown),
         (err(401, "unauthorized"), ConfigError),
         (err(402, "account_unfunded"), ConfigError),
@@ -250,26 +320,44 @@ def test_a_rent_repeated_under_its_key_is_the_same_pod():
         ({"success": True, "pod_id": "not-a-pod"}, prov.CreateUnknown),
     ],
 )
-def test_a_pod_id_only_from_an_explicit_yes(answer, outcome):
+def test_a_pod_id_only_from_an_explicit_yes(answer, outcome, no_sleep):
     p, api = make()
-    api.fail["POST executors rent"] = [answer]
+    api.fail["POST executors rent"] = [answer] * lm.RENT_TRIES
     offer = p.candidates(SPEC, {}, L.Policy())[0][0]
     with pytest.raises(outcome):
         p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
-    if outcome is prov.CreateRefused:
+    if outcome is not prov.CreateUnknown:
         assert api.templates == {}  # nothing was rented from it
-    elif outcome is prov.CreateUnknown and not isinstance(answer, dict):
+    elif not isinstance(answer, dict):
         assert len(api.templates) == 1  # a pod may hold it
 
 
-def test_a_pod_whose_lease_cannot_be_set_is_deleted_and_its_rent_counts_as_unanswered():
+def test_a_rent_that_names_another_pod_is_not_taken_and_that_pod_is_not_touched():
+    p, api = make()
+    api.pods[uid(7)] = {"id": uid(7), "pod_name": "someone-else", "status": "RUNNING",
+                        "node": uid(2), "removal_scheduled_at": None, "gets": 0}  # fmt: skip
+    api.fail["POST executors rent"] = [{"success": True, "pod_id": uid(7)}]
+    offer = p.candidates(SPEC, {}, L.Policy())[0][0]
+    with pytest.raises(prov.CreateUnknown, match="someone-else"):
+        p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
+    assert api.pods[uid(7)]["removal_scheduled_at"] is None
+
+
+def test_a_removal_time_refused_at_the_rent_leaves_the_backstop():
     p, api = make()
     api.fail["POST pods schedule-removal"] = [err(500, "internal_error")]
     offer = p.candidates(SPEC, {}, L.Policy())[0][0]
-    with pytest.raises(prov.CreateUnknown, match="removal time"):
-        p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
-    (pod,) = api.pods.values()
-    assert pod["status"] == "DELETING"
+    pid = p.create(offer, SPEC, make_tag(RUN_ID, 1, EXPIRY), "k", EXPIRY)
+    assert api.pods[pid]["body"]["termination_hours"] == 1
+
+
+def test_a_lease_longer_than_lium_keeps_a_pod_is_refused():
+    p, api = make()
+    offer = p.candidates(SPEC, {}, L.Policy())[0][0]
+    far = int(time.time()) + 721 * 3600
+    with pytest.raises(ConfigError, match="720 hours"):
+        p.create(offer, SPEC, make_tag(RUN_ID, 1, far), "k", far)
+    assert api.templates == {}
 
 
 def test_a_node_that_failed_in_this_launch_is_not_rented_again():
@@ -300,12 +388,13 @@ def test_a_template_lium_refuses_stops_the_launch_and_a_lost_one_rents_nothing()
 def test_a_pod_being_deleted_is_gone_and_an_error_never_is():
     p, api = make()
     assert p.instance(uid(1)) is None
-    api.pods[uid(1)] = {"id": uid(1), "pod_name": "n", "status": "RUNNING"}
+    api.pods[uid(1)] = {"id": uid(1), "pod_name": "n", "status": "RUNNING", "gets": 0}
     assert p.instance(uid(1))["label"] == "n"
     api.pods[uid(1)]["status"] = "DELETING"  # billing stops at the delete request
     assert p.instance(uid(1)) is None
     for answer in (err(500, "internal_error"), lm.LiumError(0, "x"), {"id": uid(2)},
-                   {"id": uid(1), "pod_name": "n", "status": "WEIRD"}, []):  # fmt: skip
+                   {"id": uid(1), "pod_name": "n", "status": "WEIRD"}, [],
+                   err(404, "not_found"), lm.LiumError(404, "<html>")):  # fmt: skip
         api.fail[f"GET pods {uid(1)}"] = [answer]
         with pytest.raises(lm.LiumError):
             p.instance(uid(1))
@@ -334,15 +423,24 @@ def test_the_listing_is_every_pod_or_an_error():
 def test_deleting_a_pod_that_is_gone_is_not_an_error_and_a_refusal_is():
     p, api = make()
     p.destroy(uid(1))
-    api.fail[f"DELETE pods {uid(1)}"] = [err(400, "pod_state_conflict")]
+    for answer in (err(400, "pod_state_conflict"), err(404, "not_found")):
+        api.fail[f"DELETE pods {uid(1)}"] = [answer]
+        with pytest.raises(lm.LiumError):
+            p.destroy(uid(1))
+
+
+def test_the_account_is_the_user_and_its_workspace():
+    p, api = make()
+    assert p.account() == f"{uid(999)}/{uid(998)}"
+    api.fail["GET users me"] = [{"id": uid(999)}]
     with pytest.raises(lm.LiumError):
-        p.destroy(uid(1))
+        p.account()
 
 
 def test_a_relabel_moves_liums_removal_time_and_is_believed_once_read_back():
     p, api = make()
-    api.pods[uid(1)] = {"id": uid(1), "pod_name": "old", "status": "RUNNING",
-                        "removal_scheduled_at": None}  # fmt: skip
+    api.pods[uid(1)] = {"id": uid(1), "pod_name": "old", "status": "RUNNING", "node": uid(1),
+                        "removal_scheduled_at": None, "gets": 0}  # fmt: skip
     tag = make_tag(RUN_ID, 1, EXPIRY + 600)
     p.relabel(uid(1), tag)
     assert api.pods[uid(1)]["pod_name"] == tag
@@ -354,11 +452,21 @@ def test_a_relabel_moves_liums_removal_time_and_is_believed_once_read_back():
         p.relabel(uid(1), make_tag(RUN_ID, 1, EXPIRY + 900))
 
 
-def test_liums_times_without_an_offset_are_utc():
+@pytest.fixture
+def far_from_utc(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_liums_times_without_an_offset_are_utc(far_from_utc):
     t = 1795502400  # 2026-11-24T06:40:00Z
     assert lm.same_time("2026-11-24T06:40:00", t) and lm.same_time("2026-11-24T06:40:00.4", t)
     assert lm.same_time("2026-11-24T08:40:00+02:00", t)
     assert not lm.same_time("2026-11-24T06:41:00", t) and not lm.same_time(None, t)
+    assert lm._after("2026-11-24T06:40:01", t) and not lm._after("2026-11-24T06:39:59", t)
 
 
 def test_a_pod_is_running_for_us_once_lium_shows_how_root_gets_in_directly():
@@ -370,7 +478,7 @@ def test_a_pod_is_running_for_us_once_lium_shows_how_root_gets_in_directly():
     assert p.view(row).state == "loading"  # no address yet
     row["ssh_connect_cmd"] = "ssh root@203.0.113.5 -p 20010"
     assert (p.view(row).state, p.view(row).endpoint) == ("running", ("203.0.113.5", 20010))
-    for cmd in ("ssh -J root@gw.example root@10.0.0.1", "ssh ubuntu@203.0.113.5 -p 22",
+    for cmd in ("ssh -J root@gw.example root@198.51.100.1", "ssh ubuntu@203.0.113.5 -p 22",
                 "ssh root@203.0.113.5 -p 22 -o ProxyCommand=x"):  # fmt: skip
         row["ssh_connect_cmd"] = cmd
         assert (p.view(row).state, p.view(row).problem) == ("exited", "machine")
@@ -410,9 +518,9 @@ class PodProber:
         return 0
 
 
-def launch(tmp_path, api=None, **kw):
+def launch(tmp_path, api=None, expiry=EXPIRY, **kw):
     p, api = make(api)
-    state = State.begin(tmp_path, RUN_ID, EXPIRY, None, {"provider": "lium"})
+    state = State.begin(tmp_path, RUN_ID, expiry, None, {"provider": "lium"})
     policy = L.Policy(**{**FAST.__dict__, **kw})
     return L.Launch(p, SPEC, policy, state, PodProber()), p, api, state
 
@@ -426,6 +534,23 @@ def test_a_launch_rents_a_pod_skips_a_node_rented_since_and_keeps_the_winner(tmp
     assert box["id"] == w.instance_id and box["host"].startswith("203.0.113.")
 
 
+def test_a_pods_removal_time_is_set_again_once_it_runs_before_it_is_admitted(tmp_path):
+    soon = int(time.time()) + 1800  # half an hour: the backstop is a whole one
+    run, p, api, state = launch(tmp_path, spare=0, expiry=soon)
+    (w,) = run.run({}).winners
+    # Lium replaced it with the backstop when the pod started; the launcher set it back.
+    assert lm.same_time(api.pods[w.instance_id]["removal_scheduled_at"], soon)
+
+
+def test_a_pod_whose_removal_time_cannot_be_set_once_it_runs_is_not_admitted(tmp_path):
+    run, p, api, state = launch(tmp_path, spare=0)
+    api.stuck.add(uid(2))
+    (w,) = run.run({}).winners
+    assert api.pods[w.instance_id]["node"] == uid(1)
+    (lost,) = [x for x in api.pods.values() if x["node"] == uid(2)]
+    assert lost["status"] == "DELETING"
+
+
 def test_down_deletes_by_id_and_by_tag(tmp_path):
     run, p, api, state = launch(tmp_path)
     run.run({})
@@ -433,7 +558,7 @@ def test_down_deletes_by_id_and_by_tag(tmp_path):
     stray = p.create(offer, SPEC, make_tag(RUN_ID, 9, EXPIRY), "k", EXPIRY)
     other = p.create(offer, SPEC, make_tag("dev.other.0123456789ab", 1, EXPIRY), "k", EXPIRY)
     assert L.down(p, state, FAST) == []
-    assert api.pods[stray]["status"] == "DELETING" and api.pods[other]["status"] == "RUNNING"
+    assert api.pods[stray]["status"] == "DELETING" and api.pods[other]["status"] != "DELETING"
 
 
 def test_renew_moves_liums_removal_time_and_touches_nothing_on_the_box(tmp_path):
@@ -462,15 +587,18 @@ def test_lium_needs_an_image_and_a_price_and_refuses_what_it_cannot_do(tmp_path,
         assert "not on lium" in (out := capsys.readouterr().out) or "not for lium" in out
 
 
-def test_lium_search_lists_the_nodes_up_would_try(tmp_path, capsys, monkeypatch):
-    api = FakeApi()
+def test_lium_search_lists_the_nodes_up_would_try_for_the_lease(tmp_path, capsys, monkeypatch):
+    later = lm.rfc3339(int(time.time()) + 6 * 3600)
+    api = FakeApi([*NODES, node(30, price=0.25, removal_at=later)])
     monkeypatch.setenv("LIUM_API_KEY", "k")
     monkeypatch.setattr(lm, "Client", lambda key: api)
     argv = ["search", "--provider", "lium", "--gpu", "RTX 4090", "--max-dph-per-gpu", "1",
             "--state-dir", str(tmp_path)]  # fmt: skip
     assert cli.main(argv) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0] == "2 offer(s)" and uid(2) in lines[1] and uid(1) in lines[2]
+    assert lines[0] == "3 offer(s)" and uid(30) in lines[1] and uid(2) in lines[2]
+    assert cli.main([*argv, "--ttl-min", str(8 * 60)]) == 0  # node 30 leaves before then
+    assert capsys.readouterr().out.splitlines()[0] == "2 offer(s)"
 
 
 def test_the_key_goes_in_its_header_and_an_error_says_its_code():
