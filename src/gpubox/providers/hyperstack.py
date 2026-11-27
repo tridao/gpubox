@@ -196,7 +196,7 @@ class Hyperstack:
             for price, flavor, gpu, region, image, cuda in found:
                 offers.append({
                     "id": f"{flavor}:{region}#{k}", "machine_id": None,
-                    "host_id": f"hyperstack/{region}", "dph_total": price,
+                    "failure_domain": f"hyperstack/{region}", "dph_total": price,
                     "geolocation": region, "gpu_name": gpu, "cuda_max_good": cuda,
                     "boot_s": BOOT_S, "_flavor": flavor, "_region": region,
                     "_env": envs[region], "_image": image,

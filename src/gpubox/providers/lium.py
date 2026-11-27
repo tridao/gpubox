@@ -509,8 +509,8 @@ def _fit(x, spec, horizon: float) -> dict | None:
         return None
     city = loc.get("city") if isinstance(loc.get("city"), str) else ""
     return {
-        # Two nodes of one provider are one witness against an image (launch.py).
-        "machine_id": x["id"], "host_id": _host(x),
+        # A provider's nodes may fail together: one witness against an image (launch.py).
+        "machine_id": x["id"], "failure_domain": _operator(x),
         "dph_total": round(price * n, 6), "geolocation": ", ".join(w for w in (city, country) if w),
         "gpu_name": name, "cuda_max_good": cuda,
         "cpu_cores_effective": cpus, "cpu_ram": ram_gb * 1024,
@@ -530,8 +530,8 @@ def _after(when, horizon: float) -> bool:
     return t.timestamp() > horizon
 
 
-def _host(x: dict) -> str | None:
-    """The provider behind a node, as its listing names it."""
+def _operator(x: dict) -> str | None:
+    """The provider who runs a node, as its listing names them."""
     for key in ("provider_key", "miner_hotkey"):
         if isinstance(x.get(key), str) and x[key]:
             return x[key]

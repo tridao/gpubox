@@ -159,7 +159,7 @@ def write_summary(spec: Spec, result: Result, kind=None) -> None:
         "",
         head,
         "",
-        "| machine | host | location | $/hr | result | seconds | detail |",
+        "| machine | failure domain | location | $/hr | result | seconds | detail |",
         "|---|---|---|---|---|---|---|",
     ]
     for a in result.attempts:
@@ -167,7 +167,7 @@ def write_summary(spec: Spec, result: Result, kind=None) -> None:
         secs = a.timings.get("healthy") or a.timings.get("ssh") or ""
         detail = a.detail.replace("|", "/").replace("\n", " ")[:160]
         lines.append(
-            f"| {a.machine_id} | {a.host_id} | {a.geo} | {a.dph:.2f} | {outcome} | {secs} | {detail} |"
+            f"| {a.machine_id} | {a.failure_domain} | {a.geo} | {a.dph:.2f} | {outcome} | {secs} | {detail} |"
         )
     with open(path, "a") as f:
         f.write("\n".join(lines) + "\n")

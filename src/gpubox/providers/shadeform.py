@@ -160,7 +160,7 @@ class Shadeform:
             for price, t, gpu, region, (os_name, cuda), boot in found:
                 offers.append({
                     "id": f"{t['cloud']}:{t['shade_instance_type']}:{region}#{k}",
-                    "machine_id": None, "host_id": f"{t['cloud']}/{region}",
+                    "machine_id": None, "failure_domain": f"{t['cloud']}/{region}",
                     "dph_total": price, "geolocation": f"{t['cloud']} {region}",
                     "gpu_name": gpu, "cuda_max_good": cuda,
                     "boot_s": boot if type(boot) is int and 0 < boot < 7200 else 600,

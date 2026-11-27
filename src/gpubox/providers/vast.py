@@ -421,6 +421,8 @@ class VastProvider:
         if not spec.gpus:
             raise ValueError("a Vast search needs at least one GPU model")
         offers, found, allowed = candidates(self.client, spec, blocked, policy.max_live)
+        # A host's machines share its network, its disks and its operator.
+        offers = [{**o, "failure_domain": o.get("host_id")} for o in offers]
         note = (
             f"{len(offers)} candidate host(s) for {spec.gpu_text} with at least "
             f"{spec.ttl_min} min of Vast lifetime "

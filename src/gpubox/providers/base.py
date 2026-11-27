@@ -8,7 +8,14 @@ see only this:
     noun                      what one box is called there: "instance" or "job"
     candidates(spec, blocked, policy) -> (offers, note)
                               what may be rented, in the order to try it, and a
-                              few words on how they were chosen
+                              few words on how they were chosen. An offer is a
+                              dict: `id`, `dph_total`, `machine_id` (None where the
+                              provider names no machine), `failure_domain` (what
+                              its box shares with others' so that they may fail
+                              together: a Vast host, a cloud's region, a Lium node's
+                              provider; None if not known), and where known
+                              `geolocation`, `gpu_name`, `cuda_max_good`, `boot_s`;
+                              Vast's also carry `host_id`, which observations record
     create(offer, spec, label, pubkey, expiry, avoid) -> id
                               rent one box, labelled with its tag, carrying its
                               lease. An id only from an explicit yes, CreateRefused

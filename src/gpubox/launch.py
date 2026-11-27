@@ -165,7 +165,7 @@ class Attempt:
     tag: str
     # Vast: the offer's machine. Slurm: the node, once the job is running (None before).
     machine_id: int | str | None
-    host_id: int | None
+    host_id: int | None  # Vast's host, which observations record
     offer_id: int
     dph: float
     geo: str = ""
@@ -196,6 +196,10 @@ class Attempt:
     status: str = ""
     msg: str = ""
     ssh_err: str = ""
+    # What the box shares with other offers' boxes, so that they may fail together (a
+    # Vast host, a cloud's region, a Lium node's provider; None: not known). Two boxes
+    # in one are one witness against an image.
+    failure_domain: object = None
     admitted: bool = False  # the provider's `admit` was done, once the box ran
 
     @property
@@ -433,8 +437,8 @@ class Launch:
                     said = self._advance(a)
                     if said is not None:
                         image_said = said
-                        if a.host_id is not None:  # two boxes of one host are one witness
-                            image_errors[a.host_id] = said
+                        if a.failure_domain is not None:  # one domain, one witness
+                            image_errors[a.failure_domain] = said
             self._destroy_failed()
             offers = self._drop_old_drivers(offers)
             # A box that ran our start-up command shows the image works, whatever
@@ -768,6 +772,7 @@ class Launch:
                 tag=make_tag(state.run, seq, state.expiry),
                 machine_id=o["machine_id"],
                 host_id=o.get("host_id"),
+                failure_domain=o.get("failure_domain"),
                 offer_id=o["id"],
                 dph=float(o["dph_total"]),
                 geo=str(o.get("geolocation") or ""),

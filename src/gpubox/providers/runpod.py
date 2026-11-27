@@ -117,7 +117,7 @@ class RunPod:
             for price, cloud, gid, dc in found:
                 tier = cloud.lower()
                 offers.append({
-                    "id": f"{gid}@{tier}/{dc or 'any'}#{k}", "machine_id": None, "host_id": None,
+                    "id": f"{gid}@{tier}/{dc or 'any'}#{k}", "machine_id": None, "failure_domain": None,
                     "dph_total": price, "geolocation": f"{tier}/{dc}" if dc else tier,
                     "gpu_name": gid, "_gpu": gid, "_dc": dc, "_cloud": cloud,
                 })  # fmt: skip

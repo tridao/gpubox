@@ -201,7 +201,7 @@ def test_offers_are_nodes_that_can_take_the_box_cheapest_first_each_once_per_slo
     assert o["machine_id"] == uid(2) and o["cuda_max_good"] == 13.0
     assert o["geolocation"] == "Austin, US" and o["gpu_name"] == "NVIDIA GeForce RTX 4090"
     assert (o["cpu_cores_effective"], o["cpu_ram"] / 1024) == (24, 64)  # a quarter of the node
-    assert o["host_id"] == "provider-2"  # the image rule's witness
+    assert o["failure_domain"] == "provider-2"  # the image rule's witness
 
 
 def test_a_node_offers_no_more_boxes_than_it_has_free_ports():

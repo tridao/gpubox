@@ -147,10 +147,13 @@ not changed for `--stall-timeout` (300 s); or when the gate says so.
 **The image is the problem** when a host says it cannot be pulled, or when a
 box is running and its sshd refuses the run's key (our own sshd is started
 with that key, so the image must be running something else). Either fails
-that box, blamed on nobody. When two different hosts have shown it, the
-launch stops as a configuration error (exit 2): with a wrong tag that is
-about 45 s in, and one misconfigured host is simply replaced. Boxes whose
-host the offer does not name do not count as different hosts. Once any box
+that box, blamed on nobody. When boxes in two different failure domains
+have shown it, the launch stops as a configuration error (exit 2): with a
+wrong tag that is about 45 s in, and one misconfigured host is simply
+replaced. A failure domain is what an offer's box shares with others' so
+that they may fail together (a broken mirror, stale credentials): a Vast
+host, a VM cloud's region, a Lium node's provider. Boxes whose offer names
+no domain do not count as different ones. Once any box
 of the launch has answered SSH with the run's key, the image is known to
 work, and what hosts say about it no longer stops the launch.
 
@@ -731,8 +734,8 @@ maintenance that starts within the lease, a reliability under
 when countries are excluded are left out: a size or a time that is not
 stated does not meet a minimum. The rent states the price offered, and
 Lium refuses it only if the node now asks more than a cent above that; so
-offers leave that cent within the cap. A node's provider is its host for
-the image rule: two of its nodes are one witness.
+offers leave that cent within the cap. A node's failure domain is the
+provider who runs it: two of their nodes are one witness against an image.
 
 **The box.** A rent names a template: an image, an entrypoint and a start
 command. Each attempt makes a private one-time template, which Lium

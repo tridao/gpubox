@@ -201,7 +201,7 @@ class Massed:
             for price, product, desc, region in found:
                 offers.append({
                     "id": f"{product}:{region}#{k}", "machine_id": None,
-                    "host_id": f"massed/{region}", "dph_total": price, "geolocation": region,
+                    "failure_domain": f"massed/{region}", "dph_total": price, "geolocation": region,
                     "gpu_name": re.sub(r"^\d+x\s*", "", desc) or product, "boot_s": BOOT_S,
                     "_product": product, "_region": region, "_image": image,
                 })  # fmt: skip

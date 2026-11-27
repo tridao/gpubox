@@ -350,7 +350,7 @@ class Slurm:
     def candidates(self, spec, blocked: dict, policy) -> tuple[list[dict], str]:
         """No offers to choose from: Slurm chooses the node. One request per attempt."""
         offers = [
-            {"id": i, "machine_id": None, "host_id": None, "dph_total": 0.0}
+            {"id": i, "machine_id": None, "failure_domain": None, "dph_total": 0.0}
             for i in range(1, policy.attempts + 1)
         ]
         where = f"partition {self.partition}" if self.partition else "the default partition"

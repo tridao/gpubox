@@ -118,7 +118,7 @@ def test_offers_are_types_in_regions_with_a_shade_os_new_enough_cheapest_first()
     o = offers[0]
     assert o["_os"] == "ubuntu22.04_cuda13.0_shade_os" and o["cuda_max_good"] == 13.0
     assert o["boot_s"] == 480 and o["dph_total"] == 0.57 and o["machine_id"] is None
-    assert o["host_id"] == "massedcompute/kansascity-usa-1" and "Shadeform" in note
+    assert o["failure_domain"] == "massedcompute/kansascity-usa-1" and "Shadeform" in note
     older = L.Spec(image="i", gpus=("A6000",), max_dph_per_gpu=1.0, min_cuda=12.8)
     clouds = [o["_cloud"] for o in p.candidates(older, {}, L.Policy(spare=0))[0]]
     assert clouds == ["hyperstack", "massedcompute"]

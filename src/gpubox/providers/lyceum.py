@@ -110,7 +110,7 @@ class Lyceum:
         for k in range(policy.max_live):
             for price, name, gpu in found:
                 offers.append({
-                    "id": f"{name}#{k}", "machine_id": None, "host_id": f"lyceum/{name}",
+                    "id": f"{name}#{k}", "machine_id": None, "failure_domain": f"lyceum/{name}",
                     "dph_total": price, "geolocation": "lyceum", "gpu_name": gpu,
                     "boot_s": BOOT_S, "_profile": name, "_gpu": gpu,
                 })  # fmt: skip
