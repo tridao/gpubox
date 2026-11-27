@@ -162,3 +162,8 @@ Providers to add, in this order.
   matching tag with GitHub OIDC (DESIGN.md, section 16).
 - [ ] Register the Trusted Publishers, rehearse `0.1.0` on TestPyPI, and publish
   the same tag to PyPI.
+
+## 14. Vast offer lifetime
+
+- [x] Filter Vast offers by the requested lease, and skip any whose end date
+  is missing or too early. Let `search --ttl-min` preview the same filter.

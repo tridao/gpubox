@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
-from fakes import FAST, FakeProber, FakeVast, foreign_untouched
+from fakes import FAST, FakeProber, FakeVast, foreign_untouched, offer
 from test_cli import LocalSsh
 
 import gpubox
@@ -284,12 +284,11 @@ def test_a_cancelled_follow_starts_no_new_connection():
 
 def test_search_shows_the_bids_up_would_make(world, tmp_path):
     world._offers[:] = [
-        {"id": 1001, "machine_id": 1, "host_id": 1, "dph_total": 0.11, "min_bid": 0.10},
-        {"id": 1002, "machine_id": 2, "host_id": 2, "dph_total": 1.10, "min_bid": 1.0},
+        {**offer(1, dph=0.11), "min_bid": 0.10},
+        {**offer(2, dph=1.10), "min_bid": 1.0},
+        {**offer(3, dph=0.05), "min_bid": 0.04},
     ]
     world.live[8000] = {"id": 8000, "label": None, "machine": 3}
-    world._offers.append({"id": 1003, "machine_id": 3, "host_id": 3, "dph_total": 0.05,
-                          "min_bid": 0.04})  # fmt: skip
     bids = gpubox.Spec(image="img", gpus=("RTX 5090",), max_dph_per_gpu=1.25, interruptible=True)
     offers, _ = gpubox.search(bids, state_dir=tmp_path)
     assert [(o["machine_id"], o["_bid"]) for o in offers] == [(1, 0.125)]  # 2 over cap, 3 ours

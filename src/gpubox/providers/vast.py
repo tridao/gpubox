@@ -237,6 +237,7 @@ def offer_query(spec) -> dict:
         "reliability": {"gte": spec.min_reliability},
         "verified": {"eq": True},
         "rentable": {"eq": True},
+        "duration": {"gte": spec.ttl_min * 60},
         "direct_port_count": {"gte": 1},
         "inet_down": {"gte": spec.min_inet_down_mbps},
         # By default, cores for a compile pool on top of one worker per GPU.
@@ -362,8 +363,15 @@ def priced_bids(vast, spec, found: list[dict]) -> list[dict]:
 
 def candidates(vast, spec, blocked: dict[int, dict], want: int):
     """(offers to try, in order; the offers within the price cap; those also in an allowed
-    country). What `up` rents from and `search` shows."""
-    found = vast.offers(offer_query(spec))
+    country). All must cover the lease. What `up` rents from and `search` shows."""
+    min_end = int(time.time()) + spec.ttl_min * 60
+    # The search may return an offer that cannot cover the lease. Vast sets the
+    # contract's end date from the offer, independent of our cleanup timer.
+    found = [
+        o
+        for o in vast.offers(offer_query(spec))
+        if type(end := o.get("end_date")) in (int, float) and min_end <= end < math.inf
+    ]
     if spec.interruptible:
         found = priced_bids(vast, spec, found)
     # The search is asked for the price cap and the order; neither is taken
@@ -412,7 +420,8 @@ class VastProvider:
             raise ValueError("a Vast search needs at least one GPU model")
         offers, found, allowed = candidates(self.client, spec, blocked, policy.max_live)
         note = (
-            f"{len(offers)} candidate host(s) for {spec.gpu_text} "
+            f"{len(offers)} candidate host(s) for {spec.gpu_text} with at least "
+            f"{spec.ttl_min} min of Vast lifetime "
             f"({len(blocked)} machine(s) blocked, {len(found) - len(allowed)} offer(s) in "
             "excluded countries)"
         )

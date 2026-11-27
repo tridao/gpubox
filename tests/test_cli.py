@@ -191,7 +191,7 @@ def test_the_quack_ci_flags_send_what_the_reference_launcher_sent(world):
         assert run(QUACK_CI) == 0
     finally:
         FakeProber.pubkey = saved
-    assert vast.queries == [REFERENCE["search"]["body"]]
+    assert vast.queries == [{**REFERENCE["search"]["body"], "duration": {"gte": 3600}}]
     from test_vast import same_but_for_the_timer
 
     assert vast.payloads
@@ -880,6 +880,26 @@ def test_several_models_cpus_and_ram_reach_the_search(world):
     assert (q["cpu_cores_effective"], q["cpu_ram"]) == ({"gte": 12}, {"gte": 64 * 1024})
     assert vast.probers[0].wants[0].gpus == ("RTX 5090", "RTX 4090")
     assert run(["down"]) == 0
+
+
+def test_up_and_search_skip_offers_too_short_for_the_vast_lease(world, capsys):
+    vast, run = world
+    vast._offers[0].update(dph_total=0.5, end_date=time.time() + 4 * 3600)
+    vast._offers[1].update(dph_total=0.75, end_date=time.time() + 12 * 3600)
+    search = ["search", "--gpu", "RTX 5090", "--max-dph-per-gpu", "1.25"]
+    assert run([*search, "--ttl-min", "480"]) == 0
+    assert "1 host(s) with at least 480 min of Vast lifetime" in capsys.readouterr().out
+    assert vast.creates == 0
+    assert run([*UP, "--ttl-min", "480"]) == 0
+    assert vast.names("create") == [("create", 2)]
+    assert [q["duration"] for q in vast.queries] == [{"gte": 28800}] * 2
+    assert run(["down"]) == 0
+
+
+def test_search_does_not_ignore_ttl_min_on_other_providers(world, capsys):
+    _, run = world
+    assert run(["search", "--provider", "runpod", "--ttl-min", "480"]) == cli.EXIT_CONFIG
+    assert "search --ttl-min is only supported on Vast" in capsys.readouterr().out
 
 
 def test_a_registry_login_takes_its_token_from_the_environment(world, monkeypatch):

@@ -47,6 +47,7 @@ def offer(machine, host=None, dph=1.0, gpu="RTX 5090", cuda=None):
         "host_id": host or machine,
         "dph_total": dph,
         "gpu_name": gpu,
+        "end_date": int(time.time()) + 86400,
     }
     if cuda is not None:
         o["cuda_max_good"] = cuda

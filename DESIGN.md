@@ -25,8 +25,9 @@ lease that ends it without help.
 
 `gpubox up`:
 
-1. Search offers. Drop excluded countries, offers above the price cap and
-   recently failed machines; take the cheapest first, one machine per host.
+1. Search offers. Drop excluded countries, offers above the price cap,
+   offers that cannot cover the lease and recently failed machines; take
+   the cheapest first, one machine per host.
 2. Rent up to `--count + --spare` boxes at once (2 by default). Each has to
    boot, answer SSH and pass the health gate. One that fails is destroyed and
    replaced, up to `--max-attempts` rentals (`2 * count + 4`, so 6 for one
@@ -63,7 +64,10 @@ Not assumed, because being wrong is expensive or the check is small:
 - **The provider's answers may be malformed.** Each is read strictly; a
   listing is complete or it is an error.
 - **The search may return what was not asked for.** The price cap and the
-  cheapest-first order are applied again locally.
+  cheapest-first order are applied again locally. Vast's search requests
+  `duration >= --ttl-min` (converted to seconds), then checks each offer's
+  absolute `end_date` against the requested lifetime as of the search start.
+  Offers with no usable end date are skipped.
 - **One host may be wrong about the image** (section 5).
 - **A box may die just after its gate.** It is looked up once more before
   the hand-off.
@@ -99,6 +103,9 @@ refused, the reaper still goes by the old expiry and the box can end early,
 not late. If the relabel took effect but its answer was lost, or the state
 file could not be written, the box is renewed while the directory shows the
 old expiry; `renew` says so, and running it again settles it.
+
+Vast can stop a box at its contract end date, independently of our lease.
+`renew` does not extend the Vast contract.
 
 Not covered: a box whose container never starts (stuck pulling its image)
 has no timer, so only `down` and the reaper end it. Nothing finds a box that

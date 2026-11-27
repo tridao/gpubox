@@ -203,7 +203,7 @@ def _spec_from(args, image: str = "") -> Spec:
         interruptible=getattr(args, "interruptible", False),
         bid_markup=getattr(args, "bid_markup", 1.25),
         gate_timeout=getattr(args, "gate_timeout", 600),
-        ttl_min=getattr(args, "ttl_min", 90),
+        ttl_min=getattr(args, "ttl_min", None) or 90,
     )
 
 
@@ -495,14 +495,20 @@ def cmd_reap(args) -> int:
 
 
 def cmd_search(args) -> int:
-    offers, blocked = api.search(spec_from(args), settings=settings(args))
+    if args.provider != "vast" and args.ttl_min is not None:
+        raise ConfigError("search --ttl-min is only supported on Vast")
+    spec = spec_from(args)
+    offers, blocked = api.search(spec, settings=settings(args))
     if args.provider != "vast":
         print(f"{len(offers)} offer(s)")
         for o in offers:
             what = str(o.get("id", "")).split("#")[0]  # the offer, once per race slot
             print(f"  ${o['dph_total']:6.2f}/hr  {o.get('gpu_name') or '?':<28} {what}")
         return 0
-    print(f"{len(offers)} host(s); {len(blocked)} machine(s) blocked")
+    print(
+        f"{len(offers)} host(s) with at least {spec.ttl_min} min of Vast lifetime; "
+        f"{len(blocked)} machine(s) blocked"
+    )
     for o in offers:
         note = blocked.get(o.get("machine_id"), {}).get("reason", "")
         print(
@@ -664,7 +670,10 @@ def main(argv=None) -> int:
         "--overall-timeout", type=number(float, 0, exclusive=True), default=DEFAULTS.overall_timeout
     )
     s.add_argument(
-        "--ttl-min", type=number(int, 1), default=90, help="the box destroys itself after this"
+        "--ttl-min",
+        type=number(int, 1),
+        default=90,
+        help="cleanup lease in minutes (default 90); on Vast, also the minimum offer lifetime",
     )
     s.add_argument(
         "--registry-user",
@@ -790,6 +799,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("search")
     spec_args(s)
     provider_args(s)
+    s.add_argument(
+        "--ttl-min", type=number(int, 1), help="Vast only: minimum offer lifetime (default 90 min)"
+    )
     s.set_defaults(fn=cmd_search)
 
     args = p.parse_args(argv)

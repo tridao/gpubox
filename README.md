@@ -47,6 +47,11 @@ gpubox down
 `--ssh-config` adds a `Host mybox` entry to `~/.ssh/gpubox_config` and one
 `Include` line at the top of `~/.ssh/config`. `down` removes the entry.
 
+On Vast, `up --ttl-min 480` only tries offers that advertise at least eight
+hours of remaining lifetime. Pass the same `--ttl-min` to `gpubox search` to
+preview those offers without renting. `renew` moves gpubox's cleanup timer,
+not Vast's contract end time.
+
 `--gpu` can be repeated to accept any of several models (the cheapest offer
 goes first). `--min-cpus` and `--min-ram-gb` are for the whole box; by
 default it gets max(16, 8 per GPU) CPUs and 32 GB of RAM per GPU.

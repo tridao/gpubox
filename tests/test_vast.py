@@ -444,7 +444,7 @@ def test_the_wire_requests_equal_the_reference_launchers(wire):
     vast.create(123, v.create_payload(SPEC, "LABEL", "KEY", 1795400000))
     (m1, u1, b1), (m2, u2, b2) = w.requests
     assert (m1, u1) == ("POST", v.API_BASE + ref["search"]["path"])
-    assert json.loads(b1) == ref["search"]["body"]
+    assert json.loads(b1) == {**ref["search"]["body"], "duration": {"gte": 3600}}
     assert (m2, u2) == ("PUT", v.API_BASE + ref["create"]["path"].format(offer_id=123))
     assert same_but_for_the_timer(json.loads(b2), ref["create"]["body"])
 
@@ -487,6 +487,19 @@ def test_offer_query_scales_with_gpu_count():
     q = v.offer_query(Spec(image="i", gpus=("RTX 5090",), num_gpus=4, max_dph_per_gpu=1.25))
     assert q["num_gpus"] == {"eq": 4} and q["dph_total"] == {"lte": 5.0}
     assert q["cpu_cores_effective"] == {"gte": 32} and q["cpu_ram"] == {"gte": 4 * 32 * 1024}
+
+
+@pytest.mark.parametrize("end_date", [None, True, "1795500000", float("nan"), float("inf")])
+def test_offers_without_a_usable_end_date_are_skipped(wire, monkeypatch, end_date):
+    now = 1795400000
+    monkeypatch.setattr(v.time, "time", lambda: now)
+    base = {"machine_id": 2, "dph_total": 0.5}
+    good = {**base, "id": 1, "end_date": now + 3600}
+    bad = {**base, "id": 2, "end_date": end_date}
+    missing = {**base, "id": 3}
+    wire({"offers": [bad, missing, good]})
+    selected, within_cap, _ = v.candidates(v.Vast("k"), SPEC, {}, want=2)
+    assert selected == within_cap == [good]
 
 
 class BrokenBody(io.BytesIO):
